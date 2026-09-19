@@ -1,5 +1,4 @@
-# SpicyChat QOL Android
-
+# SpicyChat QOL Android v0.1.0
 ## What changed
 
 - Updated the bundled SpicyChat QOL extension.
