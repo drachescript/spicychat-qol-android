@@ -1,104 +1,179 @@
-﻿param(
-    [switch]$SkipBuild
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Version,
+
+    [int]$VersionCode = 0,
+
+    [switch]$Push
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BuildScript = Join-Path $Root "build_android.ps1"
-$OutputDir = Join-Path $Root "output"
-$VersionFile = Join-Path $OutputDir "current-version.txt"
-$UpdateJson = Join-Path $OutputDir "update.json"
-$ShaFile = Join-Path $OutputDir "SHA256SUMS.txt"
+$Pubspec = Join-Path $Root "android_app\pubspec.yaml"
 $NotesFile = Join-Path $Root "release-notes.md"
 
-function Stop-WithMessage([string]$Message) {
+function Fail([string]$Message) {
     throw $Message
 }
 
-function Get-VersionValue {
+function Invoke-Git {
     param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][string[]]$Lines
+        [Parameter(Mandatory = $true)]
+        [string[]]$Args
     )
 
-    $Prefix = "$Name="
-    $Line = $Lines |
-        Where-Object { $_.StartsWith($Prefix) } |
-        Select-Object -First 1
-
-    if (-not $Line) {
-        Stop-WithMessage "Could not find '$Name' in output\current-version.txt."
-    }
-
-    return $Line.Substring($Prefix.Length).Trim()
-}
-
-if (-not (Test-Path -LiteralPath $BuildScript)) {
-    Stop-WithMessage "Missing build_android.ps1."
-}
-
-if (-not $SkipBuild) {
-    & $BuildScript
-}
-
-if (-not (Test-Path -LiteralPath $VersionFile)) {
-    Stop-WithMessage "Missing output\current-version.txt. Run a successful build first."
-}
-
-$VersionLines = Get-Content -LiteralPath $VersionFile
-$Version = Get-VersionValue -Name "version" -Lines $VersionLines
-$Tag = Get-VersionValue -Name "tag" -Lines $VersionLines
-$ApkFileName = Get-VersionValue -Name "apk" -Lines $VersionLines
-$Apk = Join-Path $OutputDir $ApkFileName
-
-foreach ($RequiredFile in @($Apk, $UpdateJson, $ShaFile, $NotesFile)) {
-    if (-not (Test-Path -LiteralPath $RequiredFile)) {
-        Stop-WithMessage "Required release file is missing: $RequiredFile"
+    & git @Args
+    if ($LASTEXITCODE -ne 0) {
+        Fail "git $($Args -join ' ') failed."
     }
 }
 
-$ReleaseFolder = Join-Path $OutputDir "release-upload\$Tag"
-if (Test-Path -LiteralPath $ReleaseFolder) {
-    Remove-Item -LiteralPath $ReleaseFolder -Recurse -Force
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Fail "Git was not found in PATH."
 }
-New-Item -ItemType Directory -Path $ReleaseFolder -Force | Out-Null
 
-Copy-Item -LiteralPath $Apk -Destination $ReleaseFolder -Force
-Copy-Item -LiteralPath $UpdateJson -Destination $ReleaseFolder -Force
-Copy-Item -LiteralPath $ShaFile -Destination $ReleaseFolder -Force
-Copy-Item -LiteralPath $NotesFile -Destination $ReleaseFolder -Force
+if (-not (Test-Path -LiteralPath $Pubspec)) {
+    Fail "Missing android_app\pubspec.yaml."
+}
 
-$Instructions = @"
-SpicyChat QOL Android release prepared
+if (-not (Test-Path -LiteralPath $NotesFile)) {
+    Fail "Missing release-notes.md. Write the stable release notes before tagging."
+}
 
-Tag: $Tag
-Release title: SpicyChat QOL Android $Tag
-APK: $ApkFileName
+$Match = [regex]::Match(
+    $Version.Trim(),
+    '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$'
+)
 
-GitHub Desktop / browser workflow:
-1. Open GitHub Desktop.
-2. Review the source changes, commit them, and click Push origin.
-3. Open the repository on GitHub in your browser.
-4. Open Releases and choose Draft a new release.
-5. Create/select tag: $Tag
-6. Use title: SpicyChat QOL Android $Tag
-7. Paste the contents of release-notes.md into the description.
-8. Upload every file from this folder.
-9. Publish the release.
+if (-not $Match.Success) {
+    Fail "Version must use MAJOR.MINOR.PATCH, for example 0.1.0."
+}
 
-The APK and release-output folder are intentionally excluded from normal Git commits.
+$Major = [int]$Match.Groups[1].Value
+$Minor = [int]$Match.Groups[2].Value
+$Patch = [int]$Match.Groups[3].Value
+
+if ($Major -gt 100 -or $Minor -gt 99 -or $Patch -gt 99) {
+    Fail "Version must be between 0.0.0 and 100.99.99."
+}
+
+$Version = "$Major.$Minor.$Patch"
+$Tag = "v$Version"
+
+$Branch = (& git branch --show-current).Trim()
+if ($LASTEXITCODE -ne 0) {
+    Fail "Could not determine the current Git branch."
+}
+if ($Branch -ne "main") {
+    Fail "Android stable releases must be created from main. Current branch: $Branch"
+}
+
+$Dirty = (& git status --porcelain) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    Fail "Could not read Git status."
+}
+if (-not [string]::IsNullOrWhiteSpace($Dirty)) {
+    Fail @"
+The repository has uncommitted changes.
+
+Commit/push your Android source and release-notes.md first, then run this script.
 "@
+}
 
-Set-Content `
-    -LiteralPath (Join-Path $ReleaseFolder "UPLOAD_INSTRUCTIONS.txt") `
-    -Value $Instructions `
-    -Encoding utf8
+& git rev-parse -q --verify "refs/tags/$Tag" *> $null
+if ($LASTEXITCODE -eq 0) {
+    Fail "Local tag $Tag already exists."
+}
+
+& git ls-remote --exit-code --tags origin "refs/tags/$Tag" *> $null
+if ($LASTEXITCODE -eq 0) {
+    Fail "Remote tag $Tag already exists."
+}
+
+$Notes = [System.IO.File]::ReadAllText(
+    $NotesFile,
+    [System.Text.UTF8Encoding]::new($false)
+)
+if ([string]::IsNullOrWhiteSpace($Notes)) {
+    Fail "release-notes.md is empty."
+}
+
+$PubspecText = [System.IO.File]::ReadAllText(
+    $Pubspec,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+$VersionPattern = '(?m)^version:\s*(\d+)\.(\d+)\.(\d+)\+(\d+)\s*$'
+$PubspecMatch = [regex]::Match($PubspecText, $VersionPattern)
+if (-not $PubspecMatch.Success) {
+    Fail "Could not read the version line in android_app\pubspec.yaml."
+}
+
+$CurrentCode = [int]$PubspecMatch.Groups[4].Value
+
+if ($VersionCode -le 0) {
+    $VersionCode = $CurrentCode + 1
+}
+
+if ($VersionCode -le $CurrentCode) {
+    Fail "versionCode must increase. Current: $CurrentCode; requested: $VersionCode"
+}
+
+$UpdatedPubspec = [regex]::Replace(
+    $PubspecText,
+    $VersionPattern,
+    "version: $Version+$VersionCode",
+    1
+)
+
+[System.IO.File]::WriteAllText(
+    $Pubspec,
+    $UpdatedPubspec,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+# Keep the release notes title aligned with the tag when it uses the normal
+# SpicyChat QOL Android heading.
+$UpdatedNotes = [regex]::Replace(
+    $Notes,
+    '(?m)^#\s+SpicyChat QOL Android(?:\s+v?\d+\.\d+\.\d+)?\s*$',
+    "# SpicyChat QOL Android $Tag",
+    1
+)
+[System.IO.File]::WriteAllText(
+    $NotesFile,
+    $UpdatedNotes,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+Invoke-Git -Args @("add", "android_app/pubspec.yaml", "release-notes.md")
+Invoke-Git -Args @("commit", "-m", "Release $Tag")
+Invoke-Git -Args @("tag", "-a", $Tag, "-m", "SpicyChat QOL Android $Tag")
 
 Write-Host ""
-Write-Host "Release files are ready:" -ForegroundColor Green
-Write-Host $ReleaseFolder
+Write-Host "Stable Android release prepared." -ForegroundColor Green
+Write-Host "Version: $Version"
+Write-Host "versionCode: $VersionCode"
+Write-Host "Tag: $Tag"
 Write-Host ""
-Write-Host "Next: commit/push the source with GitHub Desktop, then create the GitHub Release in your browser." -ForegroundColor Cyan
 
-Start-Process explorer.exe $ReleaseFolder
+if ($Push) {
+    Write-Host "Pushing main..." -ForegroundColor Cyan
+    Invoke-Git -Args @("push", "origin", "main")
+
+    Write-Host "Pushing $Tag..." -ForegroundColor Cyan
+    Invoke-Git -Args @("push", "origin", $Tag)
+
+    Write-Host ""
+    Write-Host "Done. GitHub Actions will build and publish the APK release automatically." -ForegroundColor Green
+}
+else {
+    Write-Host "Nothing has been pushed yet." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Review the commit/tag, then run:" -ForegroundColor Cyan
+    Write-Host "  git push origin main"
+    Write-Host "  git push origin $Tag"
+    Write-Host ""
+    Write-Host "Or rerun this script on a clean pre-release state with -Push next time."
+}

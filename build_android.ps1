@@ -1,4 +1,11 @@
-﻿$ErrorActionPreference = "Stop"
+param(
+    [string]$ExtensionSourceRoot = "",
+    [switch]$NoVersionBump,
+    [string]$ExpectedVersion = "",
+    [int]$ExpectedVersionCode = 0
+)
+
+$ErrorActionPreference = "Stop"
 
 
 
@@ -25,7 +32,7 @@ $AndroidManifest = Join-Path $Project "android\app\src\main\AndroidManifest.xml"
 $MainActivity = Join-Path $Project "android\app\src\main\kotlin\uk\drache\spicychatqol\MainActivity.kt"
 $LegacyMainActivity = Join-Path $Project "android\app\src\main\kotlin\com\dragonscript\dragonscript_app\MainActivity.kt"
 
-$ExtensionSourceRoot = "D:\Documents\extentions\spicychat-qol"
+
 
 
 
@@ -34,6 +41,72 @@ $GitHubRepository = "drachescript/spicychat-qol-android"
 $AndroidPackageName = "uk.drache.spicychatqol"
 
 $MinimumAndroidSdk = 24
+
+function Resolve-ExtensionSourceRoot {
+    param(
+        [string]$RequestedPath
+    )
+
+    $Candidates = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        $Candidates.Add($RequestedPath)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:SPICYCHAT_QOL_EXTENSION_ROOT)) {
+        $Candidates.Add($env:SPICYCHAT_QOL_EXTENSION_ROOT)
+    }
+
+    # Preferred repo layout:
+    # parent\
+    #   spicychat-qol-android\
+    #   spicychat-qol-extension\
+    $Parent = Split-Path -Parent $Root
+    $Candidates.Add((Join-Path $Parent "spicychat-qol-extension"))
+
+    # Existing local checkout, retained as a compatibility fallback.
+    $Candidates.Add("D:\Documents\extentions\spicychat-qol")
+
+    foreach ($Candidate in ($Candidates | Select-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($Candidate)) {
+            continue
+        }
+
+        try {
+            $Resolved = (Resolve-Path -LiteralPath $Candidate -ErrorAction Stop).Path
+        }
+        catch {
+            continue
+        }
+
+        $Manifest = Join-Path $Resolved "manifest.json"
+        if (Test-Path -LiteralPath $Manifest) {
+            return $Resolved
+        }
+    }
+
+    $Tried = (($Candidates | Select-Object -Unique) | ForEach-Object {
+        "  - $_"
+    }) -join "`r`n"
+
+    throw @"
+Could not locate the SpicyChat QoL extension source.
+
+Pass it explicitly:
+  .\build_android.ps1 -ExtensionSourceRoot "D:\path\to\spicychat-qol-extension"
+
+or set:
+  SPICYCHAT_QOL_EXTENSION_ROOT
+
+The source folder must contain manifest.json.
+
+Paths tried:
+$Tried
+"@
+}
+
+$ExtensionSourceRoot = Resolve-ExtensionSourceRoot -RequestedPath $ExtensionSourceRoot
+
 
 
 
@@ -242,78 +315,54 @@ function Assert-ApkPackageIdentity {
 }
 
 function Get-NextVersion {
-
     param(
-
         [int]$Major,
-
         [int]$Minor,
-
         [int]$Patch
-
     )
 
+    if ($Major -lt 0 -or $Major -gt 100) {
+        Fail "Android version major must be between 0 and 100."
+    }
+    if ($Minor -lt 0 -or $Minor -gt 99) {
+        Fail "Android version minor must be between 0 and 99."
+    }
+    if ($Patch -lt 0 -or $Patch -gt 99) {
+        Fail "Android version patch must be between 0 and 99."
+    }
 
-
-    # 0.0.1 ... 0.0.9 -> 0.1 -> 0.1.1 ... 0.1.9 -> 0.2
-
-    if ($Patch -lt 9) {
-
+    if ($Patch -lt 99) {
         $Patch++
-
     }
-
-    else {
-
+    elseif ($Minor -lt 99) {
         $Minor++
-
         $Patch = 0
-
     }
-
-
+    elseif ($Major -lt 100) {
+        $Major++
+        $Minor = 0
+        $Patch = 0
+    }
+    else {
+        Fail "Maximum supported Android version 100.99.99 has been reached."
+    }
 
     return @{
-
         Major = $Major
-
         Minor = $Minor
-
         Patch = $Patch
-
     }
-
 }
-
-
 
 function Get-DisplayVersion {
-
     param(
-
         [int]$Major,
-
         [int]$Minor,
-
         [int]$Patch
-
     )
 
-
-
-    if ($Patch -eq 0) {
-
-        return "$Major.$Minor"
-
-    }
-
-
-
     return "$Major.$Minor.$Patch"
-
 }
-
-
 
 if (-not (Get-Command flutter -ErrorAction SilentlyContinue)) {
 
@@ -347,6 +396,9 @@ Write-Host ""
 
 
 
+Write-Host "Extension source: $ExtensionSourceRoot" -ForegroundColor DarkGray
+Write-Host ""
+
 # Always perform the complete extension -> Android sync before compiling.
 
 & $UpdateScript -SourceRoot $ExtensionSourceRoot
@@ -375,83 +427,82 @@ Write-Host ""
 
 
 
-$OriginalPubspec = [System.IO.File]::ReadAllText($Pubspec, [System.Text.UTF8Encoding]::new($false))
+$OriginalPubspec = [System.IO.File]::ReadAllText(
+    $Pubspec,
+    [System.Text.UTF8Encoding]::new($false)
+)
 
 $VersionPattern = '(?m)^version:\s*(\d+)\.(\d+)\.(\d+)\+(\d+)\s*$'
-
 $VersionMatch = [regex]::Match($OriginalPubspec, $VersionPattern)
 
-
-
 if (-not $VersionMatch.Success) {
-
     Fail "Could not read the Flutter version line in android_app\pubspec.yaml."
-
 }
 
-
-
 $CurrentMajor = [int]$VersionMatch.Groups[1].Value
-
 $CurrentMinor = [int]$VersionMatch.Groups[2].Value
-
 $CurrentPatch = [int]$VersionMatch.Groups[3].Value
-
 $CurrentCode = [int]$VersionMatch.Groups[4].Value
 
+$PubspecChangedByBuild = $false
 
+if ($NoVersionBump) {
+    $NextMajor = $CurrentMajor
+    $NextMinor = $CurrentMinor
+    $NextPatch = $CurrentPatch
+    $NextCode = $CurrentCode
+}
+else {
+    $Next = Get-NextVersion `
+        -Major $CurrentMajor `
+        -Minor $CurrentMinor `
+        -Patch $CurrentPatch
 
-$Next = Get-NextVersion -Major $CurrentMajor -Minor $CurrentMinor -Patch $CurrentPatch
-
-
-
-$NextMajor = [int]$Next.Major
-
-$NextMinor = [int]$Next.Minor
-
-$NextPatch = [int]$Next.Patch
-
-$NextCode = $CurrentCode + 1
-
-
+    $NextMajor = [int]$Next.Major
+    $NextMinor = [int]$Next.Minor
+    $NextPatch = [int]$Next.Patch
+    $NextCode = $CurrentCode + 1
+}
 
 $FlutterVersion = "$NextMajor.$NextMinor.$NextPatch"
+$DisplayVersion = Get-DisplayVersion `
+    -Major $NextMajor `
+    -Minor $NextMinor `
+    -Patch $NextPatch
 
-$DisplayVersion = Get-DisplayVersion -Major $NextMajor -Minor $NextMinor -Patch $NextPatch
+if (
+    -not [string]::IsNullOrWhiteSpace($ExpectedVersion) -and
+    $DisplayVersion -ne $ExpectedVersion
+) {
+    Fail "Expected Android version $ExpectedVersion, but pubspec/build resolved $DisplayVersion."
+}
 
-
+if (
+    $ExpectedVersionCode -gt 0 -and
+    $NextCode -ne $ExpectedVersionCode
+) {
+    Fail "Expected Android versionCode $ExpectedVersionCode, but pubspec/build resolved $NextCode."
+}
 
 $Tag = "v$DisplayVersion"
-
 $ApkFileName = "SpicyChat-QOL-Android-$Tag.apk"
 
+if (-not $NoVersionBump) {
+    $UpdatedPubspec = [regex]::Replace(
+        $OriginalPubspec,
+        $VersionPattern,
+        "version: $FlutterVersion+$NextCode",
+        1
+    )
 
+    [System.IO.File]::WriteAllText(
+        $Pubspec,
+        $UpdatedPubspec,
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
-$UpdatedPubspec = [regex]::Replace(
-
-    $OriginalPubspec,
-
-    $VersionPattern,
-
-    "version: $FlutterVersion+$NextCode",
-
-    1
-
-)
-
-
-
-[System.IO.File]::WriteAllText(
-
-    $Pubspec,
-
-    $UpdatedPubspec,
-
-    [System.Text.UTF8Encoding]::new($false)
-
-)
-
-
+    $PubspecChangedByBuild = $true
+}
 
 $BuildSucceeded = $false
 
@@ -660,22 +711,14 @@ try {
 
 finally {
 
-    if (-not $BuildSucceeded) {
-
+    if (-not $BuildSucceeded -and $PubspecChangedByBuild) {
         [System.IO.File]::WriteAllText(
-
             $Pubspec,
-
             $OriginalPubspec,
-
             [System.Text.UTF8Encoding]::new($false)
-
         )
 
-
-
         Write-Host "Previous version restored because the build did not complete." -ForegroundColor Yellow
-
     }
 
 }

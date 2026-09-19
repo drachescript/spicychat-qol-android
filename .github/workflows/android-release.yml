@@ -1,0 +1,173 @@
+name: Android Stable Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Android tag
+        uses: actions/checkout@v4
+
+      - name: Checkout SpicyChat QoL extension main
+        uses: actions/checkout@v4
+        with:
+          repository: drachescript/spicychat-qol-extension
+          ref: main
+          path: spicychat-qol-extension
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate tag and pubspec version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "Release tag must use vMAJOR.MINOR.PATCH. Got: $tag"
+          }
+
+          $version = $tag.Substring(1)
+          $parts = $version.Split('.')
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          $patch = [int]$parts[2]
+
+          if ($major -gt 100 -or $minor -gt 99 -or $patch -gt 99) {
+            throw "Release version is outside supported range 0.0.0 to 100.99.99."
+          }
+
+          $pubspec = Get-Content -LiteralPath "android_app\pubspec.yaml" -Raw
+          $match = [regex]::Match(
+            $pubspec,
+            '(?m)^version:\s*(\d+\.\d+\.\d+)\+(\d+)\s*$'
+          )
+
+          if (-not $match.Success) {
+            throw "Could not read Android version from android_app/pubspec.yaml."
+          }
+
+          if ($match.Groups[1].Value -ne $version) {
+            throw "Tag $tag does not match pubspec version $($match.Groups[1].Value)."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "versionCode=$($match.Groups[2].Value)" >> $env:GITHUB_OUTPUT
+
+      - name: Validate signing secrets
+        shell: pwsh
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          $required = @{
+            ANDROID_KEYSTORE_BASE64 = $env:ANDROID_KEYSTORE_BASE64
+            ANDROID_KEYSTORE_PASSWORD = $env:ANDROID_KEYSTORE_PASSWORD
+            ANDROID_KEY_ALIAS = $env:ANDROID_KEY_ALIAS
+            ANDROID_KEY_PASSWORD = $env:ANDROID_KEY_PASSWORD
+          }
+
+          foreach ($item in $required.GetEnumerator()) {
+            if ([string]::IsNullOrWhiteSpace($item.Value)) {
+              throw "Missing GitHub Actions secret: $($item.Key)"
+            }
+          }
+
+      - name: Restore Android signing files
+        shell: pwsh
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          $androidDir = Join-Path $env:GITHUB_WORKSPACE "android_app\android"
+          $keystore = Join-Path $androidDir "upload-keystore.jks"
+          $keyProperties = Join-Path $androidDir "key.properties"
+
+          [System.IO.File]::WriteAllBytes(
+            $keystore,
+            [Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64)
+          )
+
+          $properties = @(
+            "storePassword=$env:ANDROID_KEYSTORE_PASSWORD"
+            "keyPassword=$env:ANDROID_KEY_PASSWORD"
+            "keyAlias=$env:ANDROID_KEY_ALIAS"
+            "storeFile=../upload-keystore.jks"
+          ) -join "`r`n"
+
+          [System.IO.File]::WriteAllText(
+            $keyProperties,
+            $properties + "`r`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Build exact tagged Android release
+        shell: pwsh
+        run: |
+          .\build_android.ps1 `
+            -ExtensionSourceRoot "$env:GITHUB_WORKSPACE\spicychat-qol-extension" `
+            -NoVersionBump `
+            -ExpectedVersion "${{ steps.version.outputs.version }}" `
+            -ExpectedVersionCode ${{ steps.version.outputs.versionCode }}
+
+      - name: Verify generated release metadata
+        shell: pwsh
+        run: |
+          $metadata = Get-Content -LiteralPath "output\update.json" -Raw |
+            ConvertFrom-Json
+
+          if ($metadata.versionName -ne "${{ steps.version.outputs.version }}") {
+            throw "update.json versionName does not match the release tag."
+          }
+
+          if ([int]$metadata.versionCode -ne [int]"${{ steps.version.outputs.versionCode }}") {
+            throw "update.json versionCode does not match pubspec."
+          }
+
+          if ($metadata.tag -ne "${{ github.ref_name }}") {
+            throw "update.json tag does not match the pushed tag."
+          }
+
+          $apk = "output\SpicyChat-QOL-Android-${{ github.ref_name }}.apk"
+          if (-not (Test-Path -LiteralPath $apk)) {
+            throw "Expected release APK was not generated: $apk"
+          }
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SpicyChat QOL Android ${{ github.ref_name }}
+          body_path: release-notes.md
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            output/SpicyChat-QOL-Android-${{ github.ref_name }}.apk
+            output/SpicyChat-QOL-Android-${{ github.ref_name }}.apk.sha256
+            output/SHA256SUMS.txt
+            output/update.json
