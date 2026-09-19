@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$SourceRoot = "D:\Documents\extentions\spicychat-qol"
 )
 
@@ -462,9 +462,16 @@ $RoboArgs = @(
 )
 
 & robocopy @RoboArgs | Out-Null
-if ($LASTEXITCODE -ge 8) {
-    Fail "Could not mirror the extension folder. Robocopy exit code: $LASTEXITCODE"
+$RoboCopyExitCode = $LASTEXITCODE
+
+if ($RoboCopyExitCode -ge 8) {
+    Fail "Could not mirror the extension folder. Robocopy exit code: $RoboCopyExitCode"
 }
+
+# Robocopy uses non-zero success codes (for example 1 means files were copied).
+# GitHub Actions' PowerShell wrapper propagates the final native-process
+# LASTEXITCODE, so a successful sync could otherwise be reported as exit code 1.
+$global:LASTEXITCODE = 0
 
 # 2) Copy every JS content script from every manifest content_scripts block.
 New-Item -ItemType Directory -Path $AndroidJs -Force | Out-Null
