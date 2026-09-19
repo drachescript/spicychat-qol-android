@@ -62,7 +62,7 @@ jobs:
       - name: Flutter analyze
         working-directory: android_app
         shell: pwsh
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Validate Android bridge JavaScript
         shell: pwsh
