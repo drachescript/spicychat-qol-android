@@ -1,0 +1,32 @@
+# Android/Gradle local generated state
+/.gradle/
+/.kotlin/
+/.cxx/
+/.externalNativeBuild/
+/captures/
+/local.properties
+
+/app/build/
+/app/.cxx/
+/app/debug/
+/app/profile/
+/app/release/
+
+GeneratedPluginRegistrant.java
+
+# Signing / credentials - never commit these
+/key.properties
+key.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pfx
+**/*.pem
+**/*.key
+
+# IMPORTANT:
+# Do NOT ignore the Gradle wrapper. These files should be committed:
+#   gradlew
+#   gradlew.bat
+#   gradle/wrapper/gradle-wrapper.jar
+#   gradle/wrapper/gradle-wrapper.properties

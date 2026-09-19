@@ -1,0 +1,111 @@
+# ============================================================
+# SpicyChat QoL Android - repository ignore rules
+# ============================================================
+
+# Local synced extension checkout
+# The extension has its own repository. update_android.ps1 may mirror/sync
+# files here locally, but the Android repository should not publish a second
+# copy of that source tree.
+extension/
+
+# Build / release output
+archive/
+output/
+release-upload/
+logs/
+dev_build/
+
+*.apk
+*.aab
+*.apks
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.gz
+
+# Generated local source/build manifests
+SOURCE_MANIFEST.sha256
+
+# Flutter / Dart generated state
+android_app/.dart_tool/
+android_app/.packages
+android_app/.flutter-plugins
+android_app/.flutter-plugins-dependencies
+android_app/build/
+android_app/coverage/
+
+# Keep android_app/pubspec.lock committed for reproducible application builds.
+
+# Android / Gradle generated state
+android_app/android/.gradle/
+android_app/android/.kotlin/
+android_app/android/.cxx/
+android_app/android/.externalNativeBuild/
+android_app/android/app/.cxx/
+android_app/android/app/build/
+android_app/android/app/debug/
+android_app/android/app/profile/
+android_app/android/app/release/
+android_app/android/captures/
+android_app/android/local.properties
+
+# Generated plugin registrants
+**/GeneratedPluginRegistrant.java
+
+# IMPORTANT:
+# The Gradle wrapper IS source and should be committed:
+#   android_app/android/gradlew
+#   android_app/android/gradlew.bat
+#   android_app/android/gradle/wrapper/gradle-wrapper.jar
+#   android_app/android/gradle/wrapper/gradle-wrapper.properties
+
+# Signing keys / credentials / local secrets
+**/key.properties
+**/upload-keystore
+upload-keystore
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.crt
+
+.env
+.env.*
+!.env.example
+
+*.secret
+*.secrets
+secrets/
+credentials/
+
+# Python / helper-script local state
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / editor files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS / logs / temporary files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+android_app/android/key.properties.example
