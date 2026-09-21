@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - "android_app/pubspec.yaml"
+      - ".github/workflows/android-release.yml"
+      - "build_android.ps1"
+      - "update_android.ps1"
   workflow_dispatch:
 
 permissions:
@@ -28,6 +31,8 @@ jobs:
       - name: Read Android release version
         id: version
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $text = Get-Content -LiteralPath "android_app\pubspec.yaml" -Raw
           $m = [regex]::Match(
@@ -44,25 +49,57 @@ jobs:
           $tag = "v$version"
 
           git fetch --tags --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "git fetch --tags failed."
+          }
 
-          git rev-parse -q --verify "refs/tags/$tag" *> $null
-          $tagExists = ($LASTEXITCODE -eq 0)
+          # git tag --list succeeds even when the tag does not exist.
+          # Do NOT use git rev-parse here: a missing tag intentionally returns
+          # exit code 1, which caused the previous v0.1.1 workflow to fail.
+          $matchingTags = @(git tag --list $tag)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect existing Git tags."
+          }
+          $tagExists = $matchingTags.Count -gt 0
+
+          # Treat an existing GitHub Release as the completed state. This also
+          # lets a rerun recover if a tag was created but release publishing
+          # failed afterward.
+          $releaseExists = $false
+          try {
+            gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName *> $null
+            $releaseExists = ($LASTEXITCODE -eq 0)
+          }
+          catch {
+            $releaseExists = $false
+          }
+
+          # gh returns a non-zero code when no release exists. That is expected.
+          # Explicit outputs + exit 0 prevent that probe from failing this step.
+          $needsTag = -not $tagExists
+          $shouldRelease = -not $releaseExists
 
           "version=$version" >> $env:GITHUB_OUTPUT
           "version_code=$versionCode" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
-          "should_release=$((-not $tagExists).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "needs_tag=$($needsTag.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "should_release=$($shouldRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-          Write-Host "pubspec: $version+$versionCode"
-          Write-Host "tag:     $tag"
-          Write-Host "exists:  $tagExists"
+          Write-Host "pubspec:         $version+$versionCode"
+          Write-Host "tag:             $tag"
+          Write-Host "tag exists:      $tagExists"
+          Write-Host "release exists:  $releaseExists"
+          Write-Host "needs tag:       $needsTag"
+          Write-Host "should release:  $shouldRelease"
+
+          exit 0
 
       - name: No new release needed
         if: steps.version.outputs.should_release != 'true'
         shell: pwsh
         run: |
-          Write-Host "${{ steps.version.outputs.tag }} already exists."
-          Write-Host "This was a normal push; no APK release will be created."
+          Write-Host "${{ steps.version.outputs.tag }} already has a published GitHub Release."
+          Write-Host "Nothing to build or publish."
 
       - name: Check out current SpicyChat QoL extension
         if: steps.version.outputs.should_release == 'true'
@@ -114,18 +151,12 @@ jobs:
             [Convert]::FromBase64String($base64)
           )
 
-          $properties = @(
-            "storePassword=$env:ANDROID_KEYSTORE_PASSWORD"
-            "keyPassword=$env:ANDROID_KEY_PASSWORD"
-            "keyAlias=$env:ANDROID_KEY_ALIAS"
-            "storeFile=../upload-keystore.jks"
-          ) -join "`r`n"
-
-          [System.IO.File]::WriteAllText(
-            $propertiesPath,
-            $properties + "`r`n",
-            [System.Text.UTF8Encoding]::new($false)
-          )
+          @"
+          storePassword=$env:ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$env:ANDROID_KEY_PASSWORD
+          keyAlias=$env:ANDROID_KEY_ALIAS
+          storeFile=../upload-keystore.jks
+          "@ | Set-Content -LiteralPath $propertiesPath -Encoding UTF8
 
       - name: Build signed Android APK
         if: steps.version.outputs.should_release == 'true'
@@ -166,7 +197,7 @@ jobs:
           }
 
       - name: Create release tag on this commit
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_release == 'true' && steps.version.outputs.needs_tag == 'true'
         shell: pwsh
         env:
           ANDROID_TAG: ${{ steps.version.outputs.tag }}
