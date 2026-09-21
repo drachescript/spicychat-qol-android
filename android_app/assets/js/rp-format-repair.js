@@ -13,6 +13,8 @@
   let lastSettingsHash = "";
   let initializedRoute = "";
   const pendingMessages = new Set();
+  const PENDING_CHUNK_SIZE = 8;
+  let deferredFlushTimer = null;
   let flushScheduled = false;
 
   const ACTION_VERBS = [
@@ -355,20 +357,46 @@
     ensureToggleButton(message, contentHost, output, s);
   }
 
+  function historyBatchBusy() {
+    return !!DS.state?.bulkChatHistoryLoadActive || Date.now() < Number(DS.state?.chatHistoryBatchUntil || 0);
+  }
+
+  function schedulePendingFlush(delay = 0) {
+    if (flushScheduled || deferredFlushTimer) return;
+    if (delay > 0) {
+      deferredFlushTimer = setTimeout(() => {
+        deferredFlushTimer = null;
+        schedulePendingFlush();
+      }, delay);
+      return;
+    }
+    flushScheduled = true;
+    requestAnimationFrame(flushPending);
+  }
+
   function flushPending() {
     flushScheduled = false;
-    const items = [...pendingMessages];
-    pendingMessages.clear();
+    if (!pendingMessages.size) return;
+    if (historyBatchBusy()) {
+      const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+      counters.rpFormatHistoryDeferrals = Number(counters.rpFormatHistoryDeferrals || 0) + 1;
+      const wait = Math.max(140, Number(DS.state?.chatHistoryBatchUntil || 0) - Date.now() + 100);
+      schedulePendingFlush(Math.min(1700, wait));
+      return;
+    }
+    const items = [...pendingMessages].slice(0, PENDING_CHUNK_SIZE);
+    items.forEach(message => pendingMessages.delete(message));
     items.forEach(message => processMessage(message));
+    const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+    counters.rpFormatChunkPasses = Number(counters.rpFormatChunkPasses || 0) + 1;
+    counters.rpFormatChunkMessages = Number(counters.rpFormatChunkMessages || 0) + items.length;
+    if (pendingMessages.size) schedulePendingFlush();
   }
 
   function queueMessage(message) {
     if (!message || !isAiMessage(message)) return;
     pendingMessages.add(message);
-    if (!flushScheduled) {
-      flushScheduled = true;
-      requestAnimationFrame(flushPending);
-    }
+    schedulePendingFlush();
   }
 
   function messageFromNode(node) {
@@ -401,6 +429,8 @@
     observer?.disconnect();
     observer = null;
     pendingMessages.clear();
+    clearTimeout(deferredFlushTimer);
+    deferredFlushTimer = null;
     flushScheduled = false;
   }
 
@@ -438,7 +468,8 @@
     // The module observer handles individual message edits/streaming after the
     // initial pass. Avoid walking every old message again on each global QoL run.
     if (force || !initializedRoute) {
-      document.querySelectorAll(MESSAGE_SELECTOR).forEach(message => {
+      const loaded = DS.getLoadedMessageRoots?.() || Array.from(document.querySelectorAll(MESSAGE_SELECTOR));
+      loaded.forEach(message => {
         if (!isAiMessage(message)) return;
         processMessage(message, true);
       });

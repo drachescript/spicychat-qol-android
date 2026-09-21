@@ -349,8 +349,8 @@
       const host = card.querySelector("a[href*='/creator/']")?.parentElement || card;
       host.appendChild(badge);
     }
-    DS.setTextIfChanged?.(badge, `QoL: ${LANGUAGE_NAMES[code] || code}`);
-    DS.setAttributeIfChanged?.(badge, "title", "Language detected locally from the bot description/greeting; this does not edit the creator's SpicyChat tags.");
+    badge.textContent = `QoL: ${LANGUAGE_NAMES[code] || code}`;
+    badge.title = "Language detected locally from the bot description/greeting; this does not edit the creator's SpicyChat tags.";
   }
 
   function getDescriptionCandidates(card) {
@@ -440,9 +440,9 @@
     applyDetectedLanguageBadge(card, !explicit ? (localDetected.code || cachedCode) : "");
 
     if (card?.dataset) {
-      DS.setDatasetIfChanged?.(card, "dsLanguageDescriptionPresent", description ? "1" : "0");
-      DS.setDatasetIfChanged?.(card, "dsLanguageDescriptionSignature", description ? `${description.length}:${description.slice(0, 90)}` : "");
-      DS.setDatasetIfChanged?.(card, "dsDetectedLanguage", code || "");
+      card.dataset.dsLanguageDescriptionPresent = description ? "1" : "0";
+      card.dataset.dsLanguageDescriptionSignature = description ? `${description.length}:${description.slice(0, 90)}` : "";
+      card.dataset.dsDetectedLanguage = code || "";
     }
 
     if (card) languageReasonCache.set(card, { rawText, settingsKey, reason });

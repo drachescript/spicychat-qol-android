@@ -819,6 +819,7 @@
     messageTextRevision: 0,
     messageDirtyRoots: new Set(),
     messageLaneRoots: null,
+    loadedMessageRootsCache: { route: "", revision: -1, roots: [] },
     cardCache: null,
     cardCacheRevision: -1,
     cardCacheUrl: "",
@@ -853,6 +854,28 @@
   DS.getCurrentMessageLaneRoots = function getCurrentMessageLaneRoots() {
     const roots = Array.isArray(DS.state?.messageLaneRoots) ? DS.state.messageLaneRoots : [];
     return roots.filter(root => root?.isConnected && !DS.isMessageEditPending?.(root));
+  };
+
+  DS.getLoadedMessageRoots = function getLoadedMessageRoots(options = {}) {
+    if (!DS.isSingleChatPage?.()) return [];
+    const route = String(location.pathname || "");
+    const revision = Number(DS.state.domRevision || 0);
+    const cache = DS.state.loadedMessageRootsCache || (DS.state.loadedMessageRootsCache = { route: "", revision: -1, roots: [] });
+    const cachedRoots = Array.isArray(cache.roots) ? cache.roots : [];
+    const reusable = !options.fresh && cache.route === route && cache.revision === revision && cachedRoots.every(root => root?.isConnected);
+    if (reusable) {
+      const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+      counters.loadedMessageRootCacheHits = Number(counters.loadedMessageRootCacheHits || 0) + 1;
+      return cachedRoots;
+    }
+    const roots = Array.from(document.querySelectorAll("div[id^='message-']"))
+      .filter(root => !root.parentElement?.closest?.("div[id^='message-']"));
+    cache.route = route;
+    cache.revision = revision;
+    cache.roots = roots;
+    const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+    counters.loadedMessageRootCacheMisses = Number(counters.loadedMessageRootCacheMisses || 0) + 1;
+    return roots;
   };
 
   DS.markMessageRootDirty = function markMessageRootDirty(root) {
@@ -948,6 +971,7 @@
 
   DS.bumpDomRevision = function bumpDomRevision() {
     DS.state.domRevision = Number(DS.state.domRevision || 0) + 1;
+    if (DS.state.loadedMessageRootsCache) DS.state.loadedMessageRootsCache.revision = -1;
     DS.state.cardCache = null;
     DS.state.cardCacheRevision = -1;
     DS.state.cardCacheUrl = "";

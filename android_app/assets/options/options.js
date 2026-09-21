@@ -4314,8 +4314,16 @@ function setupSettingsSearch() {
   const host = $("settingsSearchResults");
   const toggle = $("settingsSearchToggle");
   if (!input || !host) return;
-  setSettingsSearchExpanded(!!input.value.trim());
-  if (!input.dataset.dsSearchIndexReady) {
+
+  // The first activation lazily builds the cross-tab search index. Keep the
+  // user's expanded state while that second-stage setup runs; otherwise an
+  // empty search box immediately collapses again after the first click.
+  const firstSetup = !input.dataset.dsSearchIndexReady;
+  if (firstSetup) {
+    setSettingsSearchExpanded(!!input.value.trim());
+  }
+
+  if (firstSetup) {
     input.dataset.dsSearchIndexReady = "1";
     const activate = () => {
       if (input.dataset.dsSearchActivating === "1") return;

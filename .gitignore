@@ -109,3 +109,5 @@ desktop.ini
 *.swo
 *~
 android_app/android/key.properties.example
+android_app/android/key.properties copy.example
+PATCH_CONTENTS.txt

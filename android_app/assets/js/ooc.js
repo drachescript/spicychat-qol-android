@@ -691,16 +691,16 @@
     if (!select || !insertButton) return;
 
     const singleTemplate = templates.length <= 1;
-    select.hidden = singleTemplate;
-    insertButton.textContent = singleTemplate ? "Insert OOC" : "Insert";
-    insertButton.title = singleTemplate
+    if (select.hidden !== singleTemplate) select.hidden = singleTemplate;
+    DS.setTextIfChanged?.(insertButton, singleTemplate ? "Insert OOC" : "Insert");
+    DS.setAttributeIfChanged?.(insertButton, "title", singleTemplate
       ? `Insert ${templateLabel(templates[0], 0)}`
-      : "Insert selected OOC template";
+      : "Insert selected OOC template");
 
     if (singleTemplate) {
-      select.value = "0";
+      if (select.value !== "0") select.value = "0";
       writeSelectedOocIndex(0);
-      select.dataset.dsTemplateSignature = signature;
+      DS.setDatasetIfChanged?.(select, "dsTemplateSignature", signature);
       return;
     }
 

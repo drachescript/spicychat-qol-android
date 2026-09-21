@@ -259,7 +259,8 @@
   const contextWarningState = { route: "", dismissedAtPercent: 0, lastBrowserNoticeKey: "" };
 
   function currentChatRecords() {
-    const visibleIds = [...document.querySelectorAll("[id^='message-']")].map(root => String(root.id || "").replace(/^message-/, "")).filter(Boolean);
+    const loadedRoots = DS.getLoadedMessageRoots?.() || [...document.querySelectorAll("[id^='message-']")];
+    const visibleIds = loadedRoots.map(root => String(root.id || "").replace(/^message-/, "")).filter(Boolean);
     const visible = visibleIds.map(id => records[id]).filter(Boolean);
     const conversationId = [...visible].reverse().find(record => record?.conversationId)?.conversationId || null;
 
@@ -304,7 +305,8 @@
       estimated = visible.reduce((sum, rootRecord) => sum + Math.max(0, Number(rootRecord?.estimatedTokens) || 0), 0);
     }
     if (!estimated) {
-      for (const root of document.querySelectorAll("[id^='message-']")) estimated += estimateMessageTokens(messageBodyText(root));
+      const loadedRoots = DS.getLoadedMessageRoots?.() || document.querySelectorAll("[id^='message-']");
+      for (const root of loadedRoots) estimated += estimateMessageTokens(messageBodyText(root));
     }
     // Bot definition, memory, lorebook matches and formatting add prompt overhead that
     // is not represented by chat-message text. A small safety margin intentionally
@@ -495,17 +497,30 @@
     initializedRoute = route;
     lastDisplaySignature = displaySignature;
 
+    const laneRoots = DS.getCurrentMessageLaneRoots?.() || [];
+    const historyBusy = !!DS.state?.bulkChatHistoryLoadActive || Date.now() < Number(DS.state?.chatHistoryBatchUntil || 0);
     if (force) {
-      document.querySelectorAll("[id^='message-']").forEach(root => applyToMessage(root, settings));
-    } else {
+      const loadedRoots = DS.getLoadedMessageRoots?.() || document.querySelectorAll("[id^='message-']");
+      loadedRoots.forEach(root => applyToMessage(root, settings));
+    } else if (laneRoots.length) {
+      laneRoots.forEach(root => applyToMessage(root, settings));
+      const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+      counters.generationMetadataScopedPasses = Number(counters.generationMetadataScopedPasses || 0) + 1;
+      counters.generationMetadataScopedMessages = Number(counters.generationMetadataScopedMessages || 0) + laneRoots.length;
+    } else if (!historyBusy) {
       document.querySelectorAll("[id^='message-']:not([data-ds-generation-metadata-ready='1'])").forEach(root => applyToMessage(root, settings));
+    } else {
+      const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+      counters.generationMetadataHistoryDeferrals = Number(counters.generationMetadataHistoryDeferrals || 0) + 1;
+    }
+    if (!historyBusy) {
       for (const id of dirtyRecordIds) {
         const root = document.getElementById(`message-${id}`);
         if (root) applyToMessage(root, settings);
       }
+      dirtyRecordIds.clear();
+      applyContextWarning(settings);
     }
-    dirtyRecordIds.clear();
-    applyContextWarning(settings);
   };
 
   DS.removeGenerationMetadata = function removeGenerationMetadata() { cleanup(); removeContextWarning(); };

@@ -7,7 +7,7 @@ import 'package:flutter/services.dart';
 class JsBundleService {
   String _cssContent = '';
   String _jsBundle = '';
-  String _extensionVersion = '0.1.9.928';
+  String _extensionVersion = '0.2.0';
 
   String get cssContent => _cssContent;
   String get jsBundle => _jsBundle;

@@ -201,6 +201,7 @@
   }
 
   function roots() {
+    if (typeof DS.getLoadedMessageRoots === "function") return DS.getLoadedMessageRoots();
     return Array.from(document.querySelectorAll(MESSAGE_SELECTOR))
       .filter(root => !root.parentElement?.closest?.(MESSAGE_SELECTOR));
   }

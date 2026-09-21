@@ -24,6 +24,8 @@
 
   const state = {
     inspectorActiveUntil: 0,
+    lastKnownVersion: "",
+    lastKnownTechnicalVersion: "",
     inspectorVersion: "",
     inspectorSessionId: "",
     metricsTimer: null,
@@ -44,14 +46,17 @@
 
   function manifestInfo() {
     try {
-      const manifest = chrome?.runtime?.getManifest?.() || {};
-      return {
-        version: String(manifest.version_name || manifest.version || "unknown"),
-        technicalVersion: String(manifest.version || "unknown")
-      };
-    } catch {
-      return { version: "unknown", technicalVersion: "unknown" };
-    }
+      const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime || null;
+      const manifest = runtime?.getManifest?.() || {};
+      const version = String(manifest.version_name || manifest.version || "").trim();
+      const technicalVersion = String(manifest.version || "").trim();
+      if (version && version !== "unknown") state.lastKnownVersion = version;
+      if (technicalVersion && technicalVersion !== "unknown") state.lastKnownTechnicalVersion = technicalVersion;
+    } catch {}
+    return {
+      version: state.lastKnownVersion || "unknown",
+      technicalVersion: state.lastKnownTechnicalVersion || "unknown"
+    };
   }
 
   function browserName() {
@@ -226,6 +231,12 @@
         "listingNonCardCriticalSkips", "listingScheduleDeferrals", "slowStepThrottleSkips",
         "blockedBotMutationSkips", "blockedBotRefreshDeferrals", "blockedBotRefreshFlushes",
         "cardTokenBackgroundAuthSkips", "cardTokenHiddenQueuePauses"
+      ]),
+      chat: pick([
+        "historyBatches", "historyBatchDeferrals", "messageCountIncrementalUpdates", "messageCountIncrementalRoots",
+        "loadedMessageRootCacheHits", "loadedMessageRootCacheMisses", "messageLaneDirtyRoots",
+        "rpFormatHistoryDeferrals", "rpFormatChunkPasses", "rpFormatChunkMessages",
+        "generationMetadataScopedPasses", "generationMetadataScopedMessages", "generationMetadataHistoryDeferrals"
       ]),
       storage: pick([
         "storageWriteRequests", "storageWriteBatches", "storageWriteKeys", "storageWriteMergedKeys",
@@ -494,8 +505,8 @@
     const versions = manifestInfo();
     const page = pageState();
     DS.setDatasetIfChanged?.(root, "dsQolDiagnosticProtocol", PROTOCOL);
-    DS.setDatasetIfChanged?.(root, "dsQolVersion", versions.version);
-    DS.setDatasetIfChanged?.(root, "dsQolTechnicalVersion", versions.technicalVersion);
+    if (versions.version !== "unknown" || !root.dataset.dsQolVersion) DS.setDatasetIfChanged?.(root, "dsQolVersion", versions.version);
+    if (versions.technicalVersion !== "unknown" || !root.dataset.dsQolTechnicalVersion) DS.setDatasetIfChanged?.(root, "dsQolTechnicalVersion", versions.technicalVersion);
     DS.setDatasetIfChanged?.(root, "dsQolBuild", String(page?.build?.id || "full"));
     DS.setDatasetIfChanged?.(root, "dsQolPageSession", sessionId);
   }
@@ -519,6 +530,15 @@
   publishDiscoveryMarkers();
   startPresenceHeartbeat();
   setTimeout(() => sendHandshake("startup"), 0);
+  // Firefox/early document_start can briefly expose the page before the
+  // extension runtime manifest is reachable. Retry a few cheap discovery-only
+  // publishes so the marker recovers instead of staying `unknown` for the
+  // entire page session.
+  [250, 1000, 3000].forEach(delay => setTimeout(() => {
+    const before = manifestInfo();
+    publishDiscoveryMarkers();
+    if (before.version !== "unknown" || before.technicalVersion !== "unknown") sendHandshake("version-recovery");
+  }, delay));
 
   // A tiny discovery marker lets the Inspector know which protocol to ask for
   // without exposing settings, page content, auth, or any saved user data.

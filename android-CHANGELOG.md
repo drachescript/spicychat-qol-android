@@ -2,6 +2,18 @@
 
 ## Recent
 
+### QoL 0.2.1 / mobile compatibility follow-up
+- Added a process-wide single-instance gate for **Android Options** so repeated taps during a lag/stall cannot stack multiple Options routes. Delayed duplicate open requests are ignored until the existing Options screen closes.
+- Added a matching single-instance guard for the native Android QoL quick menu so repeated top-bar/gear taps cannot stack multiple bottom sheets either.
+- Added **Focus / Immersive Mode** directly to the native Android QoL quick menu while on an individual chat, using the existing shared QoL Focus Mode state instead of creating a second Android-only implementation.
+- Kept the mobile generation/model picker owned by the shared QoL runtime. The current extension-side compact/WebView fix leaves SpicyChat's native model rows intact and only uses the native generation/Sparkles entry point, avoiding the mobile picker collapsing to only Available Models / Explore All Models / Generation Settings.
+- Kept the newer Persona Manager / JumJam-inspired in-chat persona picker shared with the extension (All / Favorites / Unsorted / folders and Persona Manager ordering) so Android receives it through normal extension synchronization and the existing Android storage bridge.
+- Android release builds continue to sync the current extension `main` before packaging the embedded fallback, so shared QoL fixes do not need separate Flutter copies.
+
+### Android release helper
+- Added a one-command next-release helper: it increments Android `versionName` using the public `0.1.0` → `0.1.1` scheme, increments `versionCode`, stages the current Android changes together with the version bump, creates one release commit and matching `v<version>` tag, then pushes both.
+- A normal manual Git commit still performs validation only; the APK build/release is triggered by the version tag created by the release helper.
+
 ### Android diagnostics, performance & runtime bridge
 - Fixed Android Options diagnostics and performance reports being unable to reach the live SpicyChat WebView.
 - Added Android content-runtime message dispatch so extension listeners such as `DS_GET_PAGE_DIAGNOSTICS` can respond inside the dedicated WebView.

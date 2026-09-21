@@ -118,11 +118,15 @@
     allInputs().forEach(input => { if (input.value !== query) input.value = query; });
     allScopes().forEach(select => { if (select.value !== scope) select.value = scope; });
     const counterText = matches.length && currentIndex >= 0 ? `${currentIndex + 1} / ${matches.length}` : `0 / ${matches.length}`;
-    allCounters().forEach(counter => { counter.textContent = counterText; });
+    allCounters().forEach(counter => { DS.setTextIfChanged?.(counter, counterText) ?? (counter.textContent = counterText); });
     const disabled = !matches.length;
-    allPreviousButtons().forEach(button => button.toggleAttribute("disabled", disabled));
-    allNextButtons().forEach(button => button.toggleAttribute("disabled", disabled));
-    allErrorHosts().forEach(host => { host.textContent = error; host.hidden = !error; });
+    allPreviousButtons().forEach(button => { if (button.disabled !== disabled) button.disabled = disabled; });
+    allNextButtons().forEach(button => { if (button.disabled !== disabled) button.disabled = disabled; });
+    allErrorHosts().forEach(host => {
+      DS.setTextIfChanged?.(host, error) ?? (host.textContent = error);
+      const hidden = !error;
+      if (host.hidden !== hidden) host.hidden = hidden;
+    });
     syncAdvancedControls();
   }
   function clearHighlights() { document.querySelectorAll(`.${MATCH_CLASS}, .${CURRENT_CLASS}`).forEach(root => root.classList.remove(MATCH_CLASS, CURRENT_CLASS)); }
@@ -231,7 +235,14 @@
   function updateLoadOlderButtons() {
     const available = !!(isEnabled() && findLoadPreviousMessagesButton());
     const until = optionState().loadUntilMatch && !!query;
-    allLoadOlderButtons().forEach(button => { button.hidden = !available; button.textContent = until ? "Find older match" : "Load older"; button.title = until ? "Keep loading older SpicyChat message batches until this search finds a match or history runs out" : "Load the next batch of older SpicyChat messages and search again"; });
+    allLoadOlderButtons().forEach(button => {
+      const hidden = !available;
+      if (button.hidden !== hidden) button.hidden = hidden;
+      const text = until ? "Find older match" : "Load older";
+      DS.setTextIfChanged?.(button, text) ?? (button.textContent = text);
+      const title = until ? "Keep loading older SpicyChat message batches until this search finds a match or history runs out" : "Load the next batch of older SpicyChat messages and search again";
+      DS.setAttributeIfChanged?.(button, "title", title) ?? (button.title = title);
+    });
   }
   async function clickLoadPrevious() {
     const button = findLoadPreviousMessagesButton(); if (!button) return false;

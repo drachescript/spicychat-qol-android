@@ -1,3 +1,10 @@
+## v0.2.0
+
+- Public release of the 0.1.9.x testing line under the shorter **SpicyChat QoL** name.
+- Focused on local-first customization, creator tools, saved-list organization, chat helpers, Memory/Lorebook workflows, backups, and long-chat performance.
+- Chrome and Firefox use the same feature code; Android wrapper-specific behavior remains in the separate Android project.
+- Detailed test-build history is kept below so older bug reports and feature additions are still traceable.
+
 ## 0.1.9.118 v0.2 release candidate
 
 - Stability/performance pass only; no new feature batch.
@@ -248,12 +255,11 @@ Everything is optional. Fresh installs keep the main extension switch on, while 
 
 ## Roadmap
 
-### v0.2
-- Public source release.
+### v0.2 — complete
+- Public source/release package prepared.
 - Display name updated to **SpicyChat QoL**.
-- Stable Chrome and Firefox packages.
-- Website and documentation update.
-- Migration and release notes.
+- Chrome and Firefox release packages share the same tested feature code.
+- Documentation, migration notes, and release notes updated for v0.2.
 
 
 ## Planned

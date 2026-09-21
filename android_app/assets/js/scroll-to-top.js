@@ -407,8 +407,11 @@
       const needsRefresh = !!DS.state.bulkChatHistoryLoadNeedsRefresh;
       DS.state.bulkChatHistoryLoadNeedsRefresh = false;
       if (needsRefresh && currentChatKey() === chatKey) {
-        DS.scheduleRun?.({ priority: "critical", immediate: true, source: "older-history-load-finished" });
-        setTimeout(() => DS.scheduleRun?.({ priority: "slow", source: "older-history-load-finished" }), 240);
+        DS.bumpDomRevision?.();
+        // Run one scoped message pass after the full prepend finishes. Normal
+        // mode routes this through the critical lane; adaptive modes can use the
+        // dirty roots collected during loading and defer cosmetics until quiet.
+        DS.scheduleMessageLane?.("older-history-load-finished");
       }
     }
 

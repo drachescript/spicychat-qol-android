@@ -296,19 +296,21 @@
   function scheduleChatHistoryBatchRefresh() {
     const counters = runtimeCounters();
     if (!chatHistoryBatchTimer) counters.historyBatches = Number(counters.historyBatches || 0) + 1;
-    DS.state.chatHistoryBatchUntil = Date.now() + 900;
+    const quietMs = loadedChatMessageCount() >= 250 ? 1450 : 1100;
+    DS.state.chatHistoryBatchUntil = Date.now() + quietMs;
+    counters.historyBatchDeferrals = Number(counters.historyBatchDeferrals || 0) + 1;
     document.documentElement.classList.add("ds-qol-history-loading");
     clearTimeout(chatHistoryBatchTimer);
     chatHistoryBatchTimer = setTimeout(() => {
       chatHistoryBatchTimer = null;
       DS.state.chatHistoryBatchUntil = 0;
       if (!DS.state.bulkChatHistoryLoadActive) document.documentElement.classList.remove("ds-qol-history-loading");
-      invalidateLoadedChatMessageCount();
       DS.bumpDomRevision?.();
-      DS.scheduleRun?.({ priority: "critical", source: "history-batch-settled" });
+      // One message-lane wake is enough here. In Normal mode it routes through
+      // the critical lane; adaptive modes process the dirty message roots
+      // directly and schedule the slower cosmetic lane after the chat is quiet.
       DS.scheduleMessageLane?.("history-batch-settled");
-      DS.scheduleRun?.({ priority: "slow", source: "history-batch-settled" });
-    }, 980);
+    }, quietMs + 90);
   }
 
   function isVisible(el) {
@@ -625,6 +627,45 @@
     chatMessageCountCache.dirty = true;
   }
 
+  function messageRootMutationSets(mutations) {
+    const added = new Set();
+    const removed = new Set();
+    const collect = (node, target) => {
+      if (!(node instanceof Element)) return;
+      if (node.matches?.("[id^='message-']")) target.add(node);
+      node.querySelectorAll?.("[id^='message-']").forEach(root => target.add(root));
+    };
+    for (const mutation of mutations || []) {
+      for (const node of mutation.addedNodes || []) collect(node, added);
+      for (const node of mutation.removedNodes || []) collect(node, removed);
+    }
+    // React can move the exact same node in one observer delivery. A move does
+    // not change the number of loaded messages.
+    for (const root of [...added]) {
+      if (removed.has(root)) {
+        added.delete(root);
+        removed.delete(root);
+      }
+    }
+    return { added, removed };
+  }
+
+  function updateLoadedChatMessageCountFromMutations(mutations) {
+    if (!DS.isSingleChatPage?.()) return;
+    const route = String(location.pathname || "");
+    if (chatMessageCountCache.route !== route) {
+      chatMessageCountCache = { route, count: 0, dirty: true };
+      return;
+    }
+    if (chatMessageCountCache.dirty) return;
+    const { added, removed } = messageRootMutationSets(mutations);
+    if (!added.size && !removed.size) return;
+    chatMessageCountCache.count = Math.max(0, Number(chatMessageCountCache.count || 0) + added.size - removed.size);
+    const counters = runtimeCounters();
+    counters.messageCountIncrementalUpdates = Number(counters.messageCountIncrementalUpdates || 0) + 1;
+    counters.messageCountIncrementalRoots = Number(counters.messageCountIncrementalRoots || 0) + added.size + removed.size;
+  }
+
   function recordPerformanceWindow(name, started, ended) {
     if (!started || !ended || ended < started) return;
     const windows = DS.state.performanceWindows || (DS.state.performanceWindows = []);
@@ -771,6 +812,7 @@
 
       await runStep("performance mode", () => DS.applyPerformanceMode?.());
       if (messageQuickActionsEnabled(settings) || DS.state.messageOptionsWasActive) await runStep("message options", () => DS.applyMessageOptions?.());
+      if (generationMetadataWanted(settings) || !!document.querySelector(".ds-generation-metadata,#ds-context-window-warning")) await runStep("generation metadata", () => DS.applyGenerationMetadata?.());
       if (settings.enableMessageBookmarks || DS.state.chatBookmarksWasActive) await runStep("chat bookmarks", () => DS.applyChatBookmarks?.());
       if (settings.showChatSearch || DS.state.chatSearchWasActive) await runStep("chat search", () => DS.applyChatSearch?.());
       if (DS.isRpFormatRepairEnabledForCurrentCharacter?.() || settings.enableRpFormatRepair || DS.state.rpFormatRepairWasActive) await runStep("RP format repair", () => DS.applyRpFormatRepair?.());
@@ -2021,7 +2063,7 @@
         }
       }
 
-      if (messageRootsChanged) invalidateLoadedChatMessageCount();
+      if (messageRootsChanged) updateLoadedChatMessageCountFromMutations(mutations);
 
       // Loading previous chat history can prepend dozens of message roots in a
       // burst. Debounce QoL work until that batch settles instead of rescanning
@@ -2042,8 +2084,10 @@
       }
 
       if (DS.state.bulkChatHistoryLoadActive) {
+        // The bulk loader deliberately pauses broad reconciliation. Keep the
+        // dirty message roots/counts, but collapse structural cache invalidation
+        // to one revision bump when the full load finishes.
         DS.state.bulkChatHistoryLoadNeedsRefresh = true;
-        if (messageRootsChanged) DS.bumpDomRevision?.();
         return;
       }
 

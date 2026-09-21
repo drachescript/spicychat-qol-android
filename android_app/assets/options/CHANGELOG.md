@@ -1,3 +1,44 @@
+## 0.2.0
+
+This is the first v0.2 release after the long 0.1.9.x testing cycle. The detailed test-build notes are still kept below.
+
+### Chat & roleplay
+- Added Context Keeper, Internal Day Tracker / Storydate, RP State Tracker, RP Format Repair, chat search/bookmarks, message tools, formatting helpers, and richer chat export options.
+- Storydate and RP State are kept per conversation, and regenerated timeline messages no longer keep adding the same day transition again.
+- Improved long-chat behavior by reducing repeated full-chat scans and doing less work while older messages are loading.
+
+### Memory, Personas & Lorebooks
+- Added Memory Manager tools for loading, selecting, copying, exporting, and importing memories through SpicyChat's normal Memory UI.
+- Expanded Persona organization/backups and fixed several folder, startup, and narrow-layout issues.
+- Added Lorebook entry management, backup/history tools, multi-entry editing, consistency helpers, and Wiki/Web import with pasted-text fallback.
+
+### Creator tools
+- Added chatbot backup/history tools, Draft History, Save & Stay / Save & Chat helpers, Creation Audit, My Creations filters, remembered image prompts, and the optional Creator Writing Assistant.
+- Backup restores fill the normal editor for review instead of silently saving or publishing changes.
+- Fixed creator-editor navigation/history issues, including Save & Stay returning to a bad route after a no-change save.
+
+### Discovery, saved bots & blocking
+- Added Saved Bots Hub, Bot Organizer, Recently Seen, Favorite/Later/Opened tools, Smart Filter presets, language include/exclude filtering, exact message counts, and more listing filters.
+- Blocking/dislike controls are grouped together, and dislike-on-block is opt-in instead of happening automatically.
+- Fixed Home Opened/Favorites/Later filters being hidden again by conflicting QoL hide rules.
+
+### Performance & compatibility
+- Fixed **Find a setting** collapsing again immediately after the first click while its search index was being prepared.
+- Reduced repeated DOM rewrites and listing/chat rescans, including large My Creations pages and history loading in long chats.
+- Added Opera-specific compatibility work and continued Firefox/Chromium compatibility fixes.
+- Added optional compatibility markers for **Dragon's SpicyChat Diagnostic Extension** so performance captures can separate confirmed QoL work from native SpicyChat activity more reliably.
+
+### Data & backup
+- Expanded selective backup/import coverage and added safer restore/migration handling for newer backup schemas.
+- Added data-health checks, storage summaries, support-report downloads, and performance baselines without copying chat text or private saved content into diagnostics.
+
+## 0.1.9.129
+
+- Reduced extra QoL work while older chat messages are loading, especially on long chats, and cut a few more unchanged chat-control rewrites.
+- RP Format Repair now waits for large history batches to settle and catches up in smaller chunks instead of processing everything at once.
+- Generation details and chat trackers now reuse/scoped loaded-message data to avoid repeated full-chat scans where possible.
+- Improved compatibility with **Dragon's SpicyChat Diagnostic Extension** so QoL version/build markers can recover instead of sometimes staying `unknown`.
+
 ## 0.1.9.128
 
 - Fixed **Save & Stay** being able to send you back to a bad/404 editor route after SpicyChat reported **No changes detected** and you used Back.

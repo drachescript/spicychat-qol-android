@@ -2,34 +2,70 @@ name: Android Stable Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
+    paths:
+      - "android_app/pubspec.yaml"
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing release tag to build/publish, e.g. v0.1.0"
-        required: true
-        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: android-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  group: android-stable-release
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 30
 
     steps:
-      - name: Checkout Android source
+      - name: Check out Android repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Checkout SpicyChat QoL extension main
+      - name: Read Android release version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content -LiteralPath "android_app\pubspec.yaml" -Raw
+          $m = [regex]::Match(
+            $text,
+            '(?m)^version:\s*(\d+\.\d+\.\d+)\+(\d+)\s*$'
+          )
+
+          if (-not $m.Success) {
+            throw "Could not parse version from android_app\pubspec.yaml."
+          }
+
+          $version = $m.Groups[1].Value
+          $versionCode = $m.Groups[2].Value
+          $tag = "v$version"
+
+          git fetch --tags --force
+
+          git rev-parse -q --verify "refs/tags/$tag" *> $null
+          $tagExists = ($LASTEXITCODE -eq 0)
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "version_code=$versionCode" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "should_release=$((-not $tagExists).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+          Write-Host "pubspec: $version+$versionCode"
+          Write-Host "tag:     $tag"
+          Write-Host "exists:  $tagExists"
+
+      - name: No new release needed
+        if: steps.version.outputs.should_release != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "${{ steps.version.outputs.tag }} already exists."
+          Write-Host "This was a normal push; no APK release will be created."
+
+      - name: Check out current SpicyChat QoL extension
+        if: steps.version.outputs.should_release == 'true'
         uses: actions/checkout@v4
         with:
           repository: drachescript/spicychat-qol-extension
@@ -37,102 +73,21 @@ jobs:
           path: spicychat-qol-extension
 
       - name: Set up Java 17
+        if: steps.version.outputs.should_release == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Set up Flutter
+        if: steps.version.outputs.should_release == 'true'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Resolve and validate release version
-        id: version
-        shell: pwsh
-        run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $tag = "${{ inputs.release_tag }}".Trim()
-          } else {
-            $tag = "${{ github.ref_name }}".Trim()
-          }
-
-          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
-            throw "Release tag must use vMAJOR.MINOR.PATCH. Got: $tag"
-          }
-
-          $version = $tag.Substring(1)
-          $parts = $version.Split('.')
-          $major = [int]$parts[0]
-          $minor = [int]$parts[1]
-          $patch = [int]$parts[2]
-
-          if ($major -gt 100 -or $minor -gt 99 -or $patch -gt 99) {
-            throw "Release version is outside supported range 0.0.0 to 100.99.99."
-          }
-
-          # For a manual retry, make sure the requested tag already exists.
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            git fetch --tags --force
-            git rev-parse -q --verify "refs/tags/$tag" *> $null
-            if ($LASTEXITCODE -ne 0) {
-              throw "Tag $tag does not exist in this repository."
-            }
-
-            # Build exactly the tagged Android source, not whatever happens to
-            # be on main when the retry is started.
-            git checkout --force $tag
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not checkout $tag."
-            }
-          }
-
-          $pubspec = Get-Content -LiteralPath "android_app\pubspec.yaml" -Raw
-          $match = [regex]::Match(
-            $pubspec,
-            '(?m)^version:\s*(\d+\.\d+\.\d+)\+(\d+)\s*$'
-          )
-
-          if (-not $match.Success) {
-            throw "Could not read Android version from android_app/pubspec.yaml."
-          }
-
-          if ($match.Groups[1].Value -ne $version) {
-            throw "Tag $tag does not match pubspec version $($match.Groups[1].Value)."
-          }
-
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "versionCode=$($match.Groups[2].Value)" >> $env:GITHUB_OUTPUT
-
-          Write-Host "Release tag: $tag"
-          Write-Host "Android version: $version"
-          Write-Host "Android versionCode: $($match.Groups[2].Value)"
-
-      - name: Validate signing secrets
-        shell: pwsh
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          $required = @{
-            ANDROID_KEYSTORE_BASE64 = $env:ANDROID_KEYSTORE_BASE64
-            ANDROID_KEYSTORE_PASSWORD = $env:ANDROID_KEYSTORE_PASSWORD
-            ANDROID_KEY_ALIAS = $env:ANDROID_KEY_ALIAS
-            ANDROID_KEY_PASSWORD = $env:ANDROID_KEY_PASSWORD
-          }
-
-          foreach ($item in $required.GetEnumerator()) {
-            if ([string]::IsNullOrWhiteSpace($item.Value)) {
-              throw "Missing GitHub Actions secret: $($item.Key)"
-            }
-          }
-
       - name: Restore Android signing files
+        if: steps.version.outputs.should_release == 'true'
         shell: pwsh
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -140,13 +95,23 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          $androidDir = Join-Path $env:GITHUB_WORKSPACE "android_app\android"
-          $keystore = Join-Path $androidDir "upload-keystore.jks"
-          $keyProperties = Join-Path $androidDir "key.properties"
+          if (
+            [string]::IsNullOrWhiteSpace($env:ANDROID_KEYSTORE_BASE64) -or
+            [string]::IsNullOrWhiteSpace($env:ANDROID_KEYSTORE_PASSWORD) -or
+            [string]::IsNullOrWhiteSpace($env:ANDROID_KEY_ALIAS) -or
+            [string]::IsNullOrWhiteSpace($env:ANDROID_KEY_PASSWORD)
+          ) {
+            throw "One or more Android signing secrets are missing."
+          }
 
+          $androidDir = Join-Path $env:GITHUB_WORKSPACE "android_app\android"
+          $keystorePath = Join-Path $androidDir "upload-keystore.jks"
+          $propertiesPath = Join-Path $androidDir "key.properties"
+
+          $base64 = $env:ANDROID_KEYSTORE_BASE64 -replace '\s', ''
           [System.IO.File]::WriteAllBytes(
-            $keystore,
-            [Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64)
+            $keystorePath,
+            [Convert]::FromBase64String($base64)
           )
 
           $properties = @(
@@ -157,117 +122,78 @@ jobs:
           ) -join "`r`n"
 
           [System.IO.File]::WriteAllText(
-            $keyProperties,
+            $propertiesPath,
             $properties + "`r`n",
             [System.Text.UTF8Encoding]::new($false)
           )
 
-          if (-not (Test-Path -LiteralPath $keystore)) {
-            throw "Keystore reconstruction failed."
-          }
-
-      - name: Sync current extension into embedded fallback
-        shell: pwsh
-        run: |
-          .\update_android.ps1 `
-            -SourceRoot "$env:GITHUB_WORKSPACE\spicychat-qol-extension"
-
-      - name: Resolve Flutter dependencies
-        working-directory: android_app
-        shell: pwsh
-        run: flutter pub get
-
-      - name: Build signed release APK
-        working-directory: android_app
+      - name: Build signed Android APK
+        if: steps.version.outputs.should_release == 'true'
         shell: pwsh
         env:
-          CI: "true"
+          ANDROID_VERSION: ${{ steps.version.outputs.version }}
+          ANDROID_VERSION_CODE: ${{ steps.version.outputs.version_code }}
         run: |
-          # CI intentionally does NOT run flutter clean and does NOT retry the
-          # whole build. GitHub runners are already fresh, and a retry only hid
-          # the real failure while roughly doubling release time.
-          flutter build apk `
-            --release `
-            --no-pub `
-            --android-skip-build-dependency-validation
+          $extensionRoot = Join-Path $env:GITHUB_WORKSPACE "spicychat-qol-extension"
+
+          & ".\build_android.ps1" `
+            -ExtensionSourceRoot $extensionRoot `
+            -NoVersionBump `
+            -ExpectedVersion $env:ANDROID_VERSION `
+            -ExpectedVersionCode ([int]$env:ANDROID_VERSION_CODE)
 
           if ($LASTEXITCODE -ne 0) {
-            throw "flutter build apk --release failed."
+            exit $LASTEXITCODE
           }
 
-          $apk = "build\app\outputs\flutter-apk\app-release.apk"
-          if (-not (Test-Path -LiteralPath $apk)) {
-            throw "Flutter completed without producing app-release.apk."
-          }
-
-      - name: Stage release files
+      - name: Verify release files
+        if: steps.version.outputs.should_release == 'true'
         shell: pwsh
+        env:
+          ANDROID_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          $tag = "${{ steps.version.outputs.tag }}"
-          $version = "${{ steps.version.outputs.version }}"
-          $versionCode = [int]"${{ steps.version.outputs.versionCode }}"
-          $packageName = "uk.drache.spicychatqol"
-          $minimumAndroidSdk = 24
-
-          $sourceApk = "android_app\build\app\outputs\flutter-apk\app-release.apk"
-          $outputDir = "output"
-          $apkName = "SpicyChat-QOL-Android-$tag.apk"
-          $apkPath = Join-Path $outputDir $apkName
-
-          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-          Copy-Item -LiteralPath $sourceApk -Destination $apkPath -Force
-
-          $hash = (Get-FileHash -LiteralPath $apkPath -Algorithm SHA256).Hash.ToLowerInvariant()
-
-          [System.IO.File]::WriteAllText(
-            "$apkPath.sha256",
-            "$hash  $apkName`r`n",
-            [System.Text.Encoding]::ASCII
+          $required = @(
+            "output\SpicyChat-QOL-Android-$env:ANDROID_TAG.apk",
+            "output\SpicyChat-QOL-Android-$env:ANDROID_TAG.apk.sha256",
+            "output\SHA256SUMS.txt",
+            "output\update.json"
           )
 
-          [System.IO.File]::WriteAllText(
-            (Join-Path $outputDir "SHA256SUMS.txt"),
-            "$hash  $apkName`r`n",
-            [System.Text.Encoding]::ASCII
-          )
-
-          $downloadUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/$apkName"
-          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/$tag"
-
-          $metadata = [ordered]@{
-            app = "SpicyChat QOL"
-            packageName = $packageName
-            versionName = $version
-            versionCode = $versionCode
-            tag = $tag
-            apkFile = $apkName
-            apkUrl = $downloadUrl
-            releaseUrl = $releaseUrl
-            sha256 = $hash
-            minimumAndroidSdk = $minimumAndroidSdk
-            publishedAt = [DateTime]::UtcNow.ToString("o")
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Missing release output: $path"
+            }
           }
 
-          $json = $metadata | ConvertTo-Json -Depth 5
-          [System.IO.File]::WriteAllText(
-            (Join-Path $outputDir "update.json"),
-            $json + "`r`n",
-            [System.Text.UTF8Encoding]::new($false)
-          )
+      - name: Create release tag on this commit
+        if: steps.version.outputs.should_release == 'true'
+        shell: pwsh
+        env:
+          ANDROID_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          Write-Host "APK: $apkPath"
-          Write-Host "SHA-256: $hash"
+          git tag -a $env:ANDROID_TAG $env:GITHUB_SHA -m "SpicyChat QOL Android $env:ANDROID_TAG"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          git push origin "refs/tags/$env:ANDROID_TAG"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Publish GitHub Release
+        if: steps.version.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: SpicyChat QOL Android ${{ steps.version.outputs.tag }}
-          body_path: release-notes.md
-          make_latest: true
-          fail_on_unmatched_files: true
+          generate_release_notes: true
           files: |
             output/SpicyChat-QOL-Android-${{ steps.version.outputs.tag }}.apk
             output/SpicyChat-QOL-Android-${{ steps.version.outputs.tag }}.apk.sha256
             output/SHA256SUMS.txt
             output/update.json
+            output/current-version.txt

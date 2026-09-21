@@ -18,6 +18,33 @@ import '../models/android_chat_tab.dart';
 import 'options_screen.dart';
 import 'android_settings_screen.dart';
 
+class _AndroidOptionsRouteGate {
+  static bool _openOrOpening = false;
+  static DateTime? _lastRequestAt;
+
+  static bool tryAcquire() {
+    final now = DateTime.now();
+    final last = _lastRequestAt;
+
+    // A process-wide guard prevents duplicate Options routes even if a laggy
+    // WebView dispatches the same request through more than one bridge path or
+    // WebViewScreen instance. Keep a tiny cooldown for delayed duplicate taps.
+    if (_openOrOpening ||
+        (last != null &&
+            now.difference(last) < const Duration(milliseconds: 750))) {
+      return false;
+    }
+
+    _openOrOpening = true;
+    _lastRequestAt = now;
+    return true;
+  }
+
+  static void release() {
+    _openOrOpening = false;
+  }
+}
+
 class _NativeFilePayload {
   final String filename;
   final Uint8List bytes;
@@ -39,6 +66,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   bool _isLoading = true;
   double _progress = 0;
   bool _optionsPageOpen = false;
+  bool _quickMenuOpen = false;
   Key _webViewKey = UniqueKey();
   WebUri _initialWebUri = WebUri('https://spicychat.ai/');
   Timer? _healthTimer;
@@ -2054,10 +2082,28 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _openOptionsPage() async {
-    if (!mounted || _optionsPageOpen) return;
+  bool _requestOpenOptionsPage() {
+    if (!mounted || _optionsPageOpen) return false;
+    if (!_AndroidOptionsRouteGate.tryAcquire()) {
+      if (_shouldPersistDiagnostic('android-options-duplicate-open')) {
+        unawaited(
+          _appLog.log(
+            'AndroidOptions',
+            'Ignored duplicate Android Options open request',
+          ),
+        );
+      }
+      return false;
+    }
 
+    // Lock synchronously before Navigator can push anything. Repeated taps
+    // during a UI/WebView stall therefore collapse into one Options route.
     _optionsPageOpen = true;
+    unawaited(_openOptionsPageLocked());
+    return true;
+  }
+
+  Future<void> _openOptionsPageLocked() async {
     String? requestedSpicyChatUrl;
 
     try {
@@ -2071,9 +2117,34 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           ),
         ),
       );
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'AndroidOptions',
+          'Android Options route failed to open',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
     } finally {
       _optionsPageOpen = false;
-      await _pushSettingsToWebView();
+      _AndroidOptionsRouteGate.release();
+      if (mounted) {
+        try {
+          await _pushSettingsToWebView();
+        } catch (e, stackTrace) {
+          unawaited(
+            _appLog.log(
+              'AndroidOptions',
+              'Could not refresh settings after Android Options closed',
+              level: 'WARN',
+              error: e,
+              stackTrace: stackTrace,
+            ),
+          );
+        }
+      }
     }
 
     if (!mounted ||
@@ -2110,6 +2181,82 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           'Navigation',
           'Could not open SpicyChat URL returned by Android Options: $target',
           level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleAndroidFocusMode() async {
+    final controller = _webController;
+    if (!mounted || controller == null) return;
+
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r"""(() => {
+  const DS = window.DragonScriptQoL;
+  if (!DS?.toggleFocusMode || !DS?.isFocusModeActive) {
+    return JSON.stringify({ ok: false, error: "focus-mode-unavailable" });
+  }
+
+  const settings = DS.state?.settings || {};
+  const onChat = !!DS.isSingleChatPage?.();
+  const enabled = !!settings.enabled && !!settings.enableFocusMode && onChat;
+
+  DS.toggleFocusMode();
+
+  return JSON.stringify({
+    ok: true,
+    enabled,
+    onChat,
+    active: !!DS.isFocusModeActive?.()
+  });
+})()""",
+      );
+
+      dynamic decoded = raw;
+      if (raw is String && raw.isNotEmpty) {
+        try {
+          decoded = jsonDecode(raw);
+        } catch (_) {}
+      }
+
+      if (!mounted) return;
+
+      if (decoded is! Map || decoded['ok'] != true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Focus Mode is not available in this QoL build.'),
+          ),
+        );
+        return;
+      }
+
+      if (decoded['enabled'] != true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Enable Focus / Immersive Mode in QoL Options first.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final active = decoded['active'] == true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(active ? 'Focus Mode enabled' : 'Focus Mode disabled'),
+          duration: const Duration(seconds: 1),
+        ),
+      );
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'AndroidFocusMode',
+          'Could not toggle Focus / Immersive Mode from Android',
+          level: 'WARN',
           error: e,
           stackTrace: stackTrace,
         ),
@@ -2243,7 +2390,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       handlerName: 'openOptions',
       callback: (args) async {
         if (!await _isCurrentUrlTrusted(controller)) return null;
-        _openOptionsPage();
+        _requestOpenOptionsPage();
         return null;
       },
     );
@@ -2444,7 +2591,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     switch (type) {
       case 'DS_OPEN_OPTIONS':
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _openOptionsPage();
+          _requestOpenOptionsPage();
         });
         return {'ok': true};
 
@@ -3588,22 +3735,27 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   // ── Quick Menu ─────────────────────────────────────────────
 
-  void _showQuickMenu() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF1A1A2E),
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (sheetContext) {
+  Future<void> _showQuickMenu() async {
+    if (!mounted || _quickMenuOpen) return;
+    _quickMenuOpen = true;
+
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: const Color(0xFF1A1A2E),
+        isScrollControlled: true,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        builder: (sheetContext) {
         final tabsService = Provider.of<AndroidTabsService>(
           context,
           listen: false,
         );
         return _QuickMenuSheet(
-        tabsEnabled: tabsService.enabled,
-        onAndroidSettings: () {
+          tabsEnabled: tabsService.enabled,
+          isChatPage: _isChatUrl(_lastKnownUrl),
+          onAndroidSettings: () {
           Navigator.pop(sheetContext);
           _openAndroidSettingsPage();
         },
@@ -3615,9 +3767,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           Navigator.pop(sheetContext);
           _openAndroidCommandPalette();
         },
+        onFocusMode: () {
+          Navigator.pop(sheetContext);
+          _toggleAndroidFocusMode();
+        },
         onSettings: () {
           Navigator.pop(sheetContext);
-          _openOptionsPage();
+          _requestOpenOptionsPage();
         },
         onExportChat: () {
           Navigator.pop(sheetContext);
@@ -3665,16 +3821,21 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           _webController?.reload();
         },
       );
-      },
-    );
+        },
+      );
+    } finally {
+      _quickMenuOpen = false;
+    }
   }
 }
 
 class _QuickMenuSheet extends StatelessWidget {
   final bool tabsEnabled;
+  final bool isChatPage;
   final VoidCallback onAndroidSettings;
   final VoidCallback onChatTabs;
   final VoidCallback onCommandPalette;
+  final VoidCallback onFocusMode;
   final VoidCallback onSettings;
   final VoidCallback onExportChat;
   final VoidCallback onBlockCurrentBot;
@@ -3687,9 +3848,11 @@ class _QuickMenuSheet extends StatelessWidget {
 
   const _QuickMenuSheet({
     required this.tabsEnabled,
+    required this.isChatPage,
     required this.onAndroidSettings,
     required this.onChatTabs,
     required this.onCommandPalette,
+    required this.onFocusMode,
     required this.onSettings,
     required this.onExportChat,
     required this.onBlockCurrentBot,
@@ -3747,6 +3910,12 @@ class _QuickMenuSheet extends StatelessWidget {
             label: 'Command Palette',
             onTap: onCommandPalette,
           ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.center_focus_strong,
+              label: 'Focus / Immersive Mode',
+              onTap: onFocusMode,
+            ),
           _QuickMenuItem(
             icon: Icons.settings,
             label: 'QOL Options',
