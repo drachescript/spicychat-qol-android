@@ -420,10 +420,26 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         (isDomain('discord.com') && url.path.contains('oauth2'));
   }
 
-  /// Verify the current WebView URL is allowed to access the native JS bridge
+  /// Verify the current WebView URL is allowed to access the native JS bridge.
+  ///
+  /// Most bridge calls originate from scripts that are already running inside
+  /// the current SpicyChat document. Use the Flutter-side route cache first so
+  /// opening a native control does not have to wait for WebView.getUrl().
+  /// Long active chats can keep the renderer busy enough for getUrl() to take
+  /// noticeably longer than it does on lightweight pages.
   Future<bool> _isCurrentUrlTrusted(InAppWebViewController controller) async {
+    final cached = Uri.tryParse(_lastKnownUrl);
+    if (cached != null && _isSpicyChat(cached)) {
+      return true;
+    }
+
     final url = await controller.getUrl();
-    return url != null && _isSpicyChat(url);
+    if (url == null || !_isSpicyChat(url)) {
+      return false;
+    }
+
+    _lastKnownUrl = url.toString();
+    return true;
   }
 
   Future<void> _syncAndroidChatHeaderGear() async {
@@ -672,7 +688,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         if (!shouldOpen) return;
 
         window.flutter_inappwebview
-          ?.callHandler("androidOpenQuickMenu")
+          ?.callHandler("androidOpenQuickMenu", {
+            tappedAt: Date.now(),
+            route: location.pathname,
+            kind: currentKind()
+          })
           .catch(error => {
             console.warn(
               "[DS Android] Could not open native QoL menu",
@@ -693,7 +713,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         // from pointerup and this synthetic click must never reach SpicyChat.
         if (event.detail === 0) {
           window.flutter_inappwebview
-            ?.callHandler("androidOpenQuickMenu")
+            ?.callHandler("androidOpenQuickMenu", {
+            tappedAt: Date.now(),
+            route: location.pathname,
+            kind: currentKind()
+          })
             .catch(() => {});
         }
       }, true);
@@ -1390,7 +1414,14 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 heroTag: 'android-qol-menu',
                 mini: true,
                 backgroundColor: Colors.deepPurple.withValues(alpha: 0.9),
-                onPressed: _showQuickMenu,
+                onPressed: () {
+                  unawaited(
+                    _showQuickMenu(
+                      requestedAt: DateTime.now(),
+                      source: 'floating-fab',
+                    ),
+                  );
+                },
                 child: const Icon(Icons.settings, color: Colors.white, size: 20),
               ),
           ],
@@ -2365,10 +2396,61 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     controller.addJavaScriptHandler(
       handlerName: 'androidOpenQuickMenu',
       callback: (args) async {
-        if (!await _isCurrentUrlTrusted(controller) || !mounted) return false;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _showQuickMenu();
-        });
+        final bridgeReceivedAt = DateTime.now();
+        DateTime? tappedAt;
+        String reportedRoute = _normalizedSpicyChatPath(_lastKnownUrl);
+        String reportedKind = _isChatUrl(_lastKnownUrl) ? 'chat' : 'other';
+
+        if (args.isNotEmpty && args.first is Map) {
+          final payload = Map<String, dynamic>.from(args.first as Map);
+          final tappedAtRaw = payload['tappedAt'];
+          final tappedAtMs = tappedAtRaw is num
+              ? tappedAtRaw.toInt()
+              : int.tryParse(tappedAtRaw?.toString() ?? '');
+
+          if (tappedAtMs != null && tappedAtMs > 0) {
+            tappedAt = DateTime.fromMillisecondsSinceEpoch(tappedAtMs);
+          }
+
+          final route = (payload['route'] ?? '').toString().trim();
+          if (route.isNotEmpty) {
+            reportedRoute = route;
+          }
+
+          final kind = (payload['kind'] ?? '').toString().trim();
+          if (kind.isNotEmpty) {
+            reportedKind = kind;
+          }
+        }
+
+        if (!mounted || !await _isCurrentUrlTrusted(controller)) {
+          return false;
+        }
+
+        final tapToBridgeMs = tappedAt == null
+            ? null
+            : bridgeReceivedAt.millisecondsSinceEpoch -
+                tappedAt.millisecondsSinceEpoch;
+
+        unawaited(
+          _appLog.log(
+            'QuickMenuTiming',
+            'Native gear bridge received: '
+                'route=$reportedRoute kind=$reportedKind '
+                'tapToBridgeMs=${tapToBridgeMs ?? 'unknown'}',
+          ),
+        );
+
+        // Do not wait for another Flutter frame before starting the native
+        // route. The old post-frame hop was unnecessary and made a busy chat
+        // page feel even slower.
+        unawaited(
+          _showQuickMenu(
+            requestedAt: tappedAt ?? bridgeReceivedAt,
+            bridgeReceivedAt: bridgeReceivedAt,
+            source: 'header-gear',
+          ),
+        );
         return true;
       },
     );
@@ -3735,9 +3817,25 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   // ── Quick Menu ─────────────────────────────────────────────
 
-  Future<void> _showQuickMenu() async {
+  Future<void> _showQuickMenu({
+    DateTime? requestedAt,
+    DateTime? bridgeReceivedAt,
+    String source = 'native',
+  }) async {
     if (!mounted || _quickMenuOpen) return;
+
+    final route = _normalizedSpicyChatPath(_lastKnownUrl);
+    final openStartedAt = DateTime.now();
     _quickMenuOpen = true;
+
+    final requestToOpenMs = requestedAt == null
+        ? null
+        : openStartedAt.millisecondsSinceEpoch -
+            requestedAt.millisecondsSinceEpoch;
+    final bridgeToOpenMs = bridgeReceivedAt == null
+        ? null
+        : openStartedAt.millisecondsSinceEpoch -
+            bridgeReceivedAt.millisecondsSinceEpoch;
 
     try {
       await showModalBottomSheet<void>(
@@ -3748,6 +3846,22 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
         ),
         builder: (sheetContext) {
+        final sheetBuiltAt = DateTime.now();
+        final openToBuildMs =
+            sheetBuiltAt.millisecondsSinceEpoch -
+            openStartedAt.millisecondsSinceEpoch;
+
+        unawaited(
+          _appLog.log(
+            'QuickMenuTiming',
+            'Native QoL menu built: '
+                'source=$source route=$route '
+                'requestToOpenMs=${requestToOpenMs ?? 'unknown'} '
+                'bridgeToOpenMs=${bridgeToOpenMs ?? 'unknown'} '
+                'openToBuildMs=$openToBuildMs',
+          ),
+        );
+
         final tabsService = Provider.of<AndroidTabsService>(
           context,
           listen: false,

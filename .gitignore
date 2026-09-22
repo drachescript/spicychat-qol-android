@@ -111,3 +111,5 @@ desktop.ini
 android_app/android/key.properties.example
 android_app/android/key.properties copy.example
 PATCH_CONTENTS.txt
+APPLY_ANDROID_BATCH.bat
+apply_webview_quick_menu_fix.ps1

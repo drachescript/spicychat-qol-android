@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/android_tabs_service.dart';
 import '../services/android_ui_service.dart';
+import '../services/android_update_service.dart';
 
 class AndroidSettingsScreen extends StatelessWidget {
   const AndroidSettingsScreen({super.key});
@@ -34,10 +37,102 @@ class AndroidSettingsScreen extends StatelessWidget {
         false;
   }
 
+  String _formatLastChecked(DateTime? value) {
+    if (value == null) return 'Never';
+
+    final local = value.toLocal();
+    final now = DateTime.now();
+    final difference = now.difference(local);
+
+    if (difference.inSeconds < 60) return 'Just now';
+    if (difference.inMinutes < 60) {
+      final minutes = difference.inMinutes;
+      return '$minutes minute${minutes == 1 ? '' : 's'} ago';
+    }
+    if (difference.inHours < 24) {
+      final hours = difference.inHours;
+      return '$hours hour${hours == 1 ? '' : 's'} ago';
+    }
+
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)} '
+        '${two(local.hour)}:${two(local.minute)}';
+  }
+
+  String _updateStatusText(AndroidUpdateService updates) {
+    if (updates.checking) return 'Checking for updates…';
+
+    switch (updates.status) {
+      case AndroidUpdateStatus.updateAvailable:
+        final latest = updates.latest;
+        return latest == null
+            ? 'A newer Android app version is available.'
+            : 'Update available: v${latest.versionName}';
+      case AndroidUpdateStatus.upToDate:
+        return 'You are up to date.';
+      case AndroidUpdateStatus.error:
+        return updates.errorMessage ?? 'The update check failed.';
+      case AndroidUpdateStatus.checking:
+        return 'Checking for updates…';
+      case AndroidUpdateStatus.idle:
+        return 'No manual update check has been run yet.';
+    }
+  }
+
+  Future<void> _runManualUpdateCheck(
+    BuildContext context,
+    AndroidUpdateService updates,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    await updates.checkForUpdates(manual: true);
+
+    if (!context.mounted) return;
+
+    if (updates.updateAvailable) {
+      final latest = updates.latest;
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            latest == null
+                ? 'Android update available.'
+                : 'Android update available: v${latest.versionName}',
+          ),
+          action: SnackBarAction(
+            label: 'OPEN',
+            onPressed: () {
+              unawaited(updates.openLatestUpdatePage());
+            },
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (updates.status == AndroidUpdateStatus.upToDate) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('You already have the latest Android app version.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    if (updates.status == AndroidUpdateStatus.error) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(updates.errorMessage ?? 'Update check failed.'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final tabs = context.watch<AndroidTabsService>();
     final androidUi = context.watch<AndroidUiService>();
+    final updates = context.watch<AndroidUpdateService>();
 
     return Scaffold(
       appBar: AppBar(
@@ -55,6 +150,127 @@ class AndroidSettingsScreen extends StatelessWidget {
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
                 letterSpacing: 1.1,
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(
+                        Icons.system_update_alt,
+                        color: Colors.deepPurpleAccent,
+                      ),
+                      SizedBox(width: 10),
+                      Text(
+                        'Android app updates',
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    updates.currentVersionCode > 0
+                        ? 'Installed: v${updates.currentVersionName} '
+                            '(${updates.currentVersionCode})'
+                        : 'Installed: v${updates.currentVersionName}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Automatic checks: every 12 hours',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Last checked: ${_formatLastChecked(updates.lastCheckedAt)}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.04),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      _updateStatusText(updates),
+                      style: TextStyle(
+                        color: updates.status ==
+                                AndroidUpdateStatus.updateAvailable
+                            ? Colors.amberAccent
+                            : updates.status == AndroidUpdateStatus.error
+                                ? Colors.redAccent
+                                : Colors.white70,
+                        fontSize: 13,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: updates.checking
+                            ? null
+                            : () => _runManualUpdateCheck(
+                                  context,
+                                  updates,
+                                ),
+                        icon: updates.checking
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.refresh),
+                        label: Text(
+                          updates.checking
+                              ? 'Checking…'
+                              : 'Check for updates now',
+                        ),
+                      ),
+                      if (updates.updateAvailable)
+                        OutlinedButton.icon(
+                          onPressed: () {
+                            unawaited(updates.openLatestUpdatePage());
+                          },
+                          icon: const Icon(Icons.open_in_new),
+                          label: const Text('Open update'),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Manual checks bypass the 12-hour automatic-check timer. '
+                    'The app checks the website update manifest and the latest '
+                    'GitHub Android release, then compares the installed build.',
+                    style: TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),

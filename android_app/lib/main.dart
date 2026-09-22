@@ -5,11 +5,13 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:provider/provider.dart';
+
 import 'services/settings_service.dart';
 import 'services/js_bundle_service.dart';
 import 'services/app_log_service.dart';
 import 'services/android_tabs_service.dart';
 import 'services/android_ui_service.dart';
+import 'services/android_update_service.dart';
 import 'screens/webview_screen.dart';
 
 void main() async {
@@ -45,7 +47,6 @@ void main() async {
     return true;
   };
 
-  // Initialize InAppWebView debugging (debug builds only)
   if (defaultTargetPlatform == TargetPlatform.android && kDebugMode) {
     try {
       await InAppWebViewController.setWebContentsDebuggingEnabled(true);
@@ -62,7 +63,6 @@ void main() async {
     }
   }
 
-  // Initialize services
   final settingsService = SettingsService();
   try {
     await settingsService.init();
@@ -76,8 +76,6 @@ void main() async {
       ),
     );
   } catch (e, stackTrace) {
-    // Startup must never terminate solely because local preference storage is
-    // damaged/unavailable. SettingsService is designed to fall back safely.
     unawaited(
       appLog.log(
         'Startup',
@@ -133,11 +131,29 @@ void main() async {
     );
   }
 
+  final androidUpdateService = AndroidUpdateService();
+  try {
+    await androidUpdateService.init();
+    unawaited(
+      appLog.log(
+        'Startup',
+        'Android update service initialized',
+      ),
+    );
+  } catch (e, stackTrace) {
+    unawaited(
+      appLog.log(
+        'Startup',
+        'Android update service initialization failed; manual checks may retry',
+        level: 'WARN',
+        error: e,
+        stackTrace: stackTrace,
+      ),
+    );
+  }
+
   final bundleService = JsBundleService();
   try {
-    // Never leave the native launch screen up forever because one bundled
-    // extension asset failed to load. The WebView can still start without
-    // QoL injection and the next build can fix the broken asset.
     await bundleService.loadAssets().timeout(const Duration(seconds: 15));
     unawaited(appLog.log('Startup', 'QoL bundle assets loaded'));
   } catch (e, stackTrace) {
@@ -160,22 +176,77 @@ void main() async {
         ChangeNotifierProvider.value(value: settingsService),
         ChangeNotifierProvider.value(value: tabsService),
         ChangeNotifierProvider.value(value: androidUiService),
+        ChangeNotifierProvider.value(value: androidUpdateService),
       ],
       child: SpicyChatQolApp(bundleService: bundleService),
     ),
   );
 }
 
-class SpicyChatQolApp extends StatelessWidget {
+class SpicyChatQolApp extends StatefulWidget {
   final JsBundleService bundleService;
 
   const SpicyChatQolApp({super.key, required this.bundleService});
+
+  @override
+  State<SpicyChatQolApp> createState() => _SpicyChatQolAppState();
+}
+
+class _SpicyChatQolAppState extends State<SpicyChatQolApp> {
+  final GlobalKey<ScaffoldMessengerState> _messengerKey =
+      GlobalKey<ScaffoldMessengerState>();
+
+  bool _automaticUpdateCheckStarted = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+
+    if (_automaticUpdateCheckStarted) return;
+    _automaticUpdateCheckStarted = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_runAutomaticAndroidUpdateCheck());
+    });
+  }
+
+  Future<void> _runAutomaticAndroidUpdateCheck() async {
+    final updates = Provider.of<AndroidUpdateService>(
+      context,
+      listen: false,
+    );
+
+    final didCheck = await updates.maybeCheckAutomatically();
+
+    if (!mounted || !didCheck || !updates.updateAvailable) {
+      return;
+    }
+
+    final latest = updates.latest;
+    if (latest == null) return;
+
+    _messengerKey.currentState?.showSnackBar(
+      SnackBar(
+        content: Text(
+          'Android update available: v${latest.versionName}',
+        ),
+        duration: const Duration(seconds: 10),
+        action: SnackBarAction(
+          label: 'UPDATE',
+          onPressed: () {
+            unawaited(updates.openLatestUpdatePage());
+          },
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'SpicyChat QOL',
       debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: _messengerKey,
       theme: ThemeData(
         brightness: Brightness.dark,
         primarySwatch: Colors.deepPurple,
@@ -190,7 +261,7 @@ class SpicyChatQolApp extends StatelessWidget {
           elevation: 0,
         ),
       ),
-      home: WebViewScreen(bundleService: bundleService),
+      home: WebViewScreen(bundleService: widget.bundleService),
     );
   }
 }
