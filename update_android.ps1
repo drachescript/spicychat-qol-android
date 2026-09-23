@@ -609,19 +609,11 @@ foreach ($RelativePath in $ContentScripts) {
         Fail "Verification failed: Android is missing $RelativePath"
     }
 
-    if ($FileName -ine "chat-export.js") {
-        if (
-            (Get-FileHash -LiteralPath $SourceFile -Algorithm SHA256).Hash -ne
-            (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
-        ) {
-            Fail "Verification failed: Android copy differs from extension source: $RelativePath"
-        }
-    }
-    else {
-        $AndroidExport = Read-Utf8Text $Destination
-        if (-not $AndroidExport.Contains("window._dsRequestExport")) {
-            Fail "Verification failed: Android chat-export.js lost native export handling."
-        }
+    if (
+        (Get-FileHash -LiteralPath $SourceFile -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+    ) {
+        Fail "Verification failed: Android copy differs from extension source: $RelativePath"
     }
 }
 
