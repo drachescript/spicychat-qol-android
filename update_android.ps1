@@ -111,43 +111,6 @@ function Write-IfChanged {
     }
 }
 
-function Get-AndroidChatExport([string]$SourceFile) {
-    $Content = Read-Utf8Text $SourceFile
-
-    if ($Content.Contains("window._dsRequestExport")) {
-        return $Content
-    }
-
-    $Pattern = '(?ms)^(?<indent>[ \t]*)a\.href\s*=\s*url;\s*\r?\n\k<indent>a\.download\s*=\s*(?<filename>[^;]+);\s*\r?\n\k<indent>a\.click\(\);'
-    $Regex = [regex]::new($Pattern)
-    $Matches = $Regex.Matches($Content)
-
-    if ($Matches.Count -ne 1) {
-        Fail "Could not safely add Android export support to content\chat-export.js. Its download block changed."
-    }
-
-    $Match = $Matches[0]
-    $Indent = $Match.Groups["indent"].Value
-    $FilenameExpression = $Match.Groups["filename"].Value.Trim()
-
-    $Replacement = @(
-        $Indent + "const dsExportFilename = $FilenameExpression;"
-        ""
-        $Indent + "// Android app: use the native file export bridge when available."
-        $Indent + 'if (typeof window._dsRequestExport === "function") {'
-        $Indent + "  URL.revokeObjectURL(url);"
-        $Indent + "  window._dsRequestExport(textarea.value, dsExportFilename);"
-        $Indent + "  return;"
-        $Indent + "}"
-        ""
-        $Indent + "a.href = url;"
-        $Indent + "a.download = dsExportFilename;"
-        $Indent + "a.click();"
-    ) -join "`r`n"
-
-    return $Regex.Replace($Content, $Replacement, 1)
-}
-
 function Get-AndroidOptionsHtml([string]$SourceFile) {
     $Html = Read-Utf8Text $SourceFile
     $NewLine = if ($Html.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -496,12 +459,10 @@ foreach ($RelativePath in $ContentScripts) {
 
     $Destination = Join-Path $AndroidJs $FileName
 
-    if ($FileName -ieq "chat-export.js") {
-        Write-IfChanged -Destination $Destination -Content (Get-AndroidChatExport $SourceFile)
-    }
-    else {
-        Copy-IfChanged -Source $SourceFile -Destination $Destination
-    }
+    # Keep shared content scripts byte-for-byte current. Chat export now routes
+    # downloads through DS.downloadTextFile(), while Android's bridge handles
+    # the native/generated-download side. Do not rewrite chat-export.js here.
+    Copy-IfChanged -Source $SourceFile -Destination $Destination
 }
 
 # 3) Copy current JS web_accessible_resources too.
