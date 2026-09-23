@@ -183,8 +183,10 @@ class AndroidUpdateService extends ChangeNotifier {
       return false;
     }
 
-    await checkForUpdates(manual: false);
-    return true;
+    // A failed/degraded network check must not count as a completed automatic
+    // check. Returning the real result also prevents startup UI from treating
+    // an inconclusive attempt as successful.
+    return checkForUpdates(manual: false);
   }
 
   Future<bool> checkForUpdates({bool manual = true}) async {
@@ -206,9 +208,14 @@ class AndroidUpdateService extends ChangeNotifier {
     final candidates = <AndroidUpdateInfo>[];
     final errors = <String>[];
 
+    AndroidUpdateInfo? websiteInfo;
+    var websiteSucceeded = false;
+    var githubSucceeded = false;
+
     try {
       final websiteJson = await _fetchJson(websiteManifestUrl);
-      final websiteInfo = _fromWebsiteManifest(websiteJson);
+      websiteSucceeded = true;
+      websiteInfo = _fromWebsiteManifest(websiteJson);
       if (websiteInfo != null) {
         candidates.add(websiteInfo);
       }
@@ -219,6 +226,7 @@ class AndroidUpdateService extends ChangeNotifier {
     try {
       final releaseJson = await _fetchJson(githubLatestReleaseUrl);
       var githubInfo = _fromGitHubRelease(releaseJson);
+      githubSucceeded = true;
 
       final metadataUrl = _githubUpdateMetadataUrl(releaseJson);
       if (metadataUrl != null) {
@@ -256,12 +264,6 @@ class AndroidUpdateService extends ChangeNotifier {
       errors.add('GitHub: $e');
     }
 
-    _lastCheckedAt = DateTime.now();
-    await _prefs?.setInt(
-      _lastCheckedKey,
-      _lastCheckedAt!.millisecondsSinceEpoch,
-    );
-
     if (candidates.isEmpty) {
       _latest = null;
       _status = AndroidUpdateStatus.error;
@@ -272,33 +274,103 @@ class AndroidUpdateService extends ChangeNotifier {
       unawaited(
         _appLog.log(
           'AndroidUpdate',
-          _errorMessage!,
+          'Update check was inconclusive and will not consume the 12-hour '
+              'cooldown: $_errorMessage',
           level: 'WARN',
         ),
       );
-    } else {
-      _latest = candidates.reduce(_newerInfo);
-      _status = updateAvailable
-          ? AndroidUpdateStatus.updateAvailable
-          : AndroidUpdateStatus.upToDate;
-      _errorMessage = null;
+
+      _checking = false;
+      notifyListeners();
+      return false;
+    }
+
+    _latest = candidates.reduce(_newerInfo);
+
+    // The website copy can briefly lag behind a just-published GitHub release.
+    // If GitHub itself could not be reached, an older website manifest must not
+    // be treated as proof that this installation is current. In that degraded
+    // case we leave lastCheckedAt untouched so the next launch retries instead
+    // of suppressing checks for another 12 hours.
+    final websiteConclusive = websiteSucceeded &&
+        websiteInfo != null &&
+        _compareInfoToInstalled(websiteInfo) >= 0;
+
+    final anySourceFoundNewer =
+        candidates.any((info) => _compareInfoToInstalled(info) > 0);
+
+    final conclusive =
+        githubSucceeded || websiteConclusive || anySourceFoundNewer;
+
+    if (!conclusive) {
+      _status = AndroidUpdateStatus.error;
+
+      final sourceDetail = errors.isEmpty
+          ? ''
+          : ' ${errors.join(' | ')}';
+
+      _errorMessage =
+          'The website update information is older than this installed build '
+          'and the latest GitHub release could not be verified. '
+          'The automatic checker will retry instead of waiting 12 hours.'
+          '$sourceDetail';
 
       unawaited(
         _appLog.log(
           'AndroidUpdate',
-          'Update check complete: installed='
-              '$_currentVersionName+$_currentVersionCode, '
-              'latest=${_latest!.versionName}+'
-              '${_latest!.versionCode ?? '?'} '
-              '(${_latest!.source}), '
-              'updateAvailable=$updateAvailable',
+          'Degraded update check did not consume the 12-hour cooldown: '
+              'installed=$_currentVersionName+$_currentVersionCode, '
+              'website=${websiteInfo?.versionName ?? 'unavailable'}+'
+              '${websiteInfo?.versionCode ?? '?'}, '
+              'githubSucceeded=$githubSucceeded',
+          level: 'WARN',
         ),
       );
+
+      _checking = false;
+      notifyListeners();
+      return false;
     }
+
+    _status = updateAvailable
+        ? AndroidUpdateStatus.updateAvailable
+        : AndroidUpdateStatus.upToDate;
+    _errorMessage = null;
+
+    // "Last checked" means last successful/conclusive check, not merely the
+    // last network attempt. This is the timestamp used by the 12-hour gate.
+    _lastCheckedAt = DateTime.now();
+    await _prefs?.setInt(
+      _lastCheckedKey,
+      _lastCheckedAt!.millisecondsSinceEpoch,
+    );
+
+    unawaited(
+      _appLog.log(
+        'AndroidUpdate',
+        'Update check complete: installed='
+            '$_currentVersionName+$_currentVersionCode, '
+            'latest=${_latest!.versionName}+'
+            '${_latest!.versionCode ?? '?'} '
+            '(${_latest!.source}), '
+            'updateAvailable=$updateAvailable, '
+            'websiteSucceeded=$websiteSucceeded, '
+            'githubSucceeded=$githubSucceeded',
+      ),
+    );
 
     _checking = false;
     notifyListeners();
-    return _status != AndroidUpdateStatus.error;
+    return true;
+  }
+
+  int _compareInfoToInstalled(AndroidUpdateInfo info) {
+    final remoteCode = info.versionCode;
+    if (remoteCode != null && remoteCode > 0 && _currentVersionCode > 0) {
+      return remoteCode.compareTo(_currentVersionCode);
+    }
+
+    return _compareVersions(info.versionName, _currentVersionName);
   }
 
   Future<bool> openLatestUpdatePage() async {
