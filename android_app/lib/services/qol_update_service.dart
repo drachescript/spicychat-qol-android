@@ -23,15 +23,19 @@ class QolUpdateService extends ChangeNotifier {
   static const _rawBase =
       'https://raw.githubusercontent.com/drachescript/spicychat-qol-extension';
 
-  static const _androidOptionsFiles = <String>[
-    'options.html',
-    'options.css',
-    'options.js',
-    'feature-registry.js',
-    'creator-follow-consent.js',
+  static const _optionsSupportFiles = <String>[
     'features.md',
     'CHANGELOG.md',
   ];
+
+  static const _requiredOptionScripts = <String>{
+    'options.js',
+    'feature-registry.js',
+  };
+
+  static const _requiredOptionStyles = <String>{
+    'options.css',
+  };
 
   SharedPreferences? _prefs;
   Directory? _root;
@@ -104,6 +108,9 @@ class QolUpdateService extends ChangeNotifier {
       final runtimeJs = _stringList(map['runtimeJs']);
       final runtimeCss = _stringList(map['runtimeCss']);
       final webResources = _stringList(map['webResources']);
+      final optionsScripts = _stringList(map['optionsScripts']);
+      final optionsStyles = _stringList(map['optionsStyles']);
+      final optionsSupport = _stringList(map['optionsSupportFiles']);
       final sha = (map['sha'] ?? '').toString().trim();
 
       if (sha.isEmpty || runtimeJs.isEmpty) {
@@ -113,9 +120,13 @@ class QolUpdateService extends ChangeNotifier {
 
       for (final relative in [
         'manifest.json',
+        'options.html',
         ...runtimeJs,
         ...runtimeCss,
         ...webResources,
+        ...optionsScripts,
+        ...optionsStyles,
+        ...optionsSupport,
       ]) {
         if (!await File(_pathFor(current, relative)).exists()) {
           _clearActiveMetadata();
@@ -147,6 +158,93 @@ class QolUpdateService extends ChangeNotifier {
         .map((item) => item.toString().trim())
         .where((item) => item.isNotEmpty)
         .toList(growable: false);
+  }
+
+  List<String> _localOptionScripts(String html) {
+    final matches = RegExp(
+      r'''<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>\s*</script>''',
+      caseSensitive: false,
+    ).allMatches(html);
+
+    return _orderedUnique(
+      matches
+          .map((match) => _cleanLocalDependency(match.group(1)))
+          .whereType<String>()
+          .where((path) => path.toLowerCase().endsWith('.js'))
+          .toList(),
+    );
+  }
+
+  List<String> _localOptionStyles(String html) {
+    final matches = RegExp(
+      r'''<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>''',
+      caseSensitive: false,
+    ).allMatches(html);
+
+    return _orderedUnique(
+      matches
+          .map((match) => _cleanLocalDependency(match.group(1)))
+          .whereType<String>()
+          .where((path) => path.toLowerCase().endsWith('.css'))
+          .toList(),
+    );
+  }
+
+  String? _cleanLocalDependency(String? source) {
+    final raw = (source ?? '').trim();
+    if (raw.isEmpty) return null;
+
+    final lower = raw.toLowerCase();
+    if (lower.startsWith('http://') ||
+        lower.startsWith('https://') ||
+        lower.startsWith('//') ||
+        lower.startsWith('data:') ||
+        lower.startsWith('blob:')) {
+      return null;
+    }
+
+    final clean = raw.split(RegExp(r'[?#]')).first.trim();
+    if (clean.isEmpty) return null;
+    return _safeRelative(clean);
+  }
+
+  String _baseName(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final at = normalized.lastIndexOf('/');
+    return at < 0 ? normalized : normalized.substring(at + 1);
+  }
+
+  bool _isRequiredOptionDependency(String relative) {
+    final name = _baseName(relative).toLowerCase();
+    return _requiredOptionScripts.contains(name) ||
+        _requiredOptionStyles.contains(name);
+  }
+
+  String _removeOptionDependencyReference(
+    String html,
+    String relative,
+  ) {
+    final escaped = RegExp.escape(relative);
+    final lower = relative.toLowerCase();
+
+    final RegExp pattern;
+    if (lower.endsWith('.js')) {
+      pattern = RegExp(
+        '<script\\b[^>]*\\bsrc=["\\\']$escaped'
+        '(?:[?#][^"\\\']*)?["\\\'][^>]*>\\s*</script>',
+        caseSensitive: false,
+      );
+    } else if (lower.endsWith('.css')) {
+      pattern = RegExp(
+        '<link\\b[^>]*\\bhref=["\\\']$escaped'
+        '(?:[?#][^"\\\']*)?["\\\'][^>]*>',
+        caseSensitive: false,
+      );
+    } else {
+      return html;
+    }
+
+    return html.replaceAll(pattern, '');
   }
 
   bool get _automaticCheckDue {
@@ -236,39 +334,88 @@ class QolUpdateService extends ChangeNotifier {
       await staging.create(recursive: true);
 
       try {
+        // Discover Options dependencies from the current options.html rather
+        // than keeping a hardcoded list. This automatically follows future
+        // splits such as options-overhaul.css.
+        var optionsHtml = await _getText(
+          client,
+          '$_rawBase/$remoteSha/options.html',
+        );
+
+        final optionScripts = _localOptionScripts(optionsHtml);
+        final optionStyles = _localOptionStyles(optionsHtml);
+        final missingOptionalOptions = <String>[];
+
         await _writeText(staging, 'manifest.json', manifestText);
 
-        final required = <String>[
+        final requiredRuntime = _orderedUnique(<String>[
           ...js,
           ...css,
           ...web,
-          ..._androidOptionsFiles,
-        ];
+        ]);
 
-        for (var offset = 0; offset < required.length; offset += 8) {
-          final end =
-              (offset + 8 < required.length) ? offset + 8 : required.length;
-          final chunk = required.sublist(offset, end);
+        for (var offset = 0;
+            offset < requiredRuntime.length;
+            offset += 8) {
+          final end = (offset + 8 < requiredRuntime.length)
+              ? offset + 8
+              : requiredRuntime.length;
+          final chunk = requiredRuntime.sublist(offset, end);
 
           await Future.wait(
             chunk.map(
               (relative) async {
-                try {
-                  final text = await _getText(
-                    client!,
-                    '$_rawBase/$remoteSha/$relative',
-                  );
-                  await _writeText(staging, relative, text);
-                } on HttpException catch (error) {
-                  if (relative == 'creator-follow-consent.js' &&
-                      error.message.contains('404')) {
-                    return;
-                  }
-                  rethrow;
-                }
+                final text = await _getText(
+                  client!,
+                  '$_rawBase/$remoteSha/$relative',
+                );
+                await _writeText(staging, relative, text);
               },
             ),
           );
+        }
+
+        final optionDependencies = _orderedUnique(<String>[
+          ...optionStyles,
+          ...optionScripts,
+        ]);
+
+        for (final relative in optionDependencies) {
+          try {
+            final text = await _getText(
+              client,
+              '$_rawBase/$remoteSha/$relative',
+            );
+            await _writeText(staging, relative, text);
+          } on HttpException catch (error) {
+            if (_isRequiredOptionDependency(relative) ||
+                !error.message.contains('404')) {
+              rethrow;
+            }
+
+            // Do not brick Android because extension Options left behind a
+            // stale optional script/link tag. Required core files still fail
+            // hard; only the dead optional reference is removed.
+            missingOptionalOptions.add(relative);
+            optionsHtml =
+                _removeOptionDependencyReference(optionsHtml, relative);
+          }
+        }
+
+        await _writeText(staging, 'options.html', optionsHtml);
+
+        final downloadedSupport = <String>[];
+        for (final relative in _optionsSupportFiles) {
+          try {
+            final text = await _getText(
+              client,
+              '$_rawBase/$remoteSha/$relative',
+            );
+            await _writeText(staging, relative, text);
+            downloadedSupport.add(relative);
+          } on HttpException catch (error) {
+            if (!error.message.contains('404')) rethrow;
+          }
         }
 
         final version = (manifest['version_name'] ??
@@ -281,14 +428,21 @@ class QolUpdateService extends ChangeNotifier {
           staging,
           'metadata.json',
           const JsonEncoder.withIndent('  ').convert({
-            'schemaVersion': 1,
+            'schemaVersion': 2,
             'version': version,
             'sha': remoteSha,
             'downloadedAt': DateTime.now().toUtc().toIso8601String(),
             'runtimeJs': js,
             'runtimeCss': css,
             'webResources': web,
-            'optionsFiles': _androidOptionsFiles,
+            'optionsScripts': optionScripts
+                .where((path) => !missingOptionalOptions.contains(path))
+                .toList(),
+            'optionsStyles': optionStyles
+                .where((path) => !missingOptionalOptions.contains(path))
+                .toList(),
+            'optionsSupportFiles': downloadedSupport,
+            'ignoredMissingOptions': missingOptionalOptions,
           }),
         );
 

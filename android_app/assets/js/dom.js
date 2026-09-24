@@ -63,6 +63,8 @@
 
     const path = normalizedRoutePath();
     const singleChatMatch = path.match(/^\/chat\/([^/?#]+)(?:\/([^/?#]+))?/i);
+    const storyModeMatch = path.match(/^\/story\/([^/?#]+)(?:\/([^/?#]+))?/i);
+    const lorebookExplore = path === "/lorebooks/explore" || path.startsWith("/lorebooks/explore/");
     const botEditor = /^\/chatbot\/(?:create(?:\/|$)|edit(?:\/|$)|[^/]+\/edit(?:\/|$))/i.test(path);
     const botProfileMatch = !botEditor ? path.match(/^\/chatbot\/([^/?#]+)/i) : null;
     const lorebookEditor = /^\/lorebook\/(?:create(?:\/|$)|edit(?:\/|$)|[^/]+\/edit(?:\/|$))/i.test(path);
@@ -78,13 +80,16 @@
     const singleChat = !!singleChatMatch;
     const chatList = chatsPage || chatRoot;
     const botProfile = !!botProfileMatch;
-    const lorebookPage = path === "/lorebook" || path.startsWith("/lorebook/") || myCreationsLorebooks;
+    const lorebookPage = path === "/lorebook" || path.startsWith("/lorebook/") || lorebookExplore || myCreationsLorebooks;
 
     let routeType = "other";
     if (singleChat) routeType = "chat";
+    else if (storyModeMatch) routeType = "story";
     else if (chatList) routeType = "chat-list";
     else if (botEditor) routeType = "bot-editor";
     else if (lorebookEditor) routeType = "lorebook-editor";
+    else if (lorebookExplore) routeType = "lorebook-explore";
+    else if (lorebookMatch) routeType = "lorebook-public";
     else if (botProfile) routeType = "bot-profile";
     else if (myCreationsChatbots) routeType = "creator-listing";
     else if (myCreationsLorebooks || path === "/lorebook") routeType = "lorebook-listing";
@@ -103,11 +108,15 @@
       isSingleChatPage: singleChat,
       chatId: singleChatMatch?.[1] || "",
       conversationId: singleChatMatch?.[2] || "",
+      isStoryModePage: !!storyModeMatch,
+      storyBotId: storyModeMatch?.[1] || "",
+      storyId: storyModeMatch?.[2] || "",
       isBotEditor: botEditor,
       isBotProfilePage: botProfile,
       botId: botProfileMatch?.[1] || "",
       isLorebookEditor: lorebookEditor,
       isLorebookPage: lorebookPage,
+      isLorebookExplorePage: lorebookExplore,
       lorebookId: lorebookMatch?.[1] && !["create", "edit"].includes(String(lorebookMatch[1]).toLowerCase()) ? lorebookMatch[1] : "",
       isFavoriteBotsPage: favoriteBots,
       isPublicCreatorPage: publicCreator,
@@ -137,11 +146,13 @@
   DS.isChatRootPage = () => !!DS.getPageState().isChatRootPage;
   DS.isChatListPage = () => !!DS.getPageState().isChatListPage;
   DS.isSingleChatPage = () => !!DS.getPageState().isSingleChatPage;
+  DS.isStoryModePage = () => !!DS.getPageState().isStoryModePage;
   DS.isBotProfilePage = () => !!DS.getPageState().isBotProfilePage;
   DS.isFavoriteBotsPage = () => !!DS.getPageState().isFavoriteBotsPage;
   DS.isSubscribePage = () => !!DS.getPageState().isSubscribePage;
   DS.isMyCreationsChatbotsPage = () => !!DS.getPageState().isMyCreationsChatbotsPage;
   DS.isLorebookPage = () => !!DS.getPageState().isLorebookPage;
+  DS.isLorebookExplorePage = () => !!DS.getPageState().isLorebookExplorePage;
 
   DS.chatIdFromHref = function chatIdFromHref(href) {
     try {
@@ -383,6 +394,33 @@
     if (!!enabled === has) return false;
     el.classList.toggle(className, !!enabled);
     return true;
+  };
+
+  // Shared MutationObserver guard. Several QoL features watch broad SpicyChat
+  // subtrees, and without a common ownership check one feature can wake another
+  // simply by adding/updating its own controls. Keep this intentionally
+  // conservative: it only classifies nodes that are explicitly QoL-owned.
+  DS.isQolOwnedNode = function isQolOwnedNode(node) {
+    const el = node instanceof Element ? node : node?.parentElement;
+    if (!el) return false;
+    if (el.dataset?.dsOwned === "1" || el.dataset?.dsOwner === "qol") return true;
+    if (String(el.id || "").startsWith("ds-")) return true;
+    if (Array.from(el.classList || []).some(name => String(name).startsWith("ds-"))) return true;
+    return !!el.closest?.("[data-ds-owned='1'],[data-ds-owner='qol'],#ds-qol-panel,#ds-chat-export-modal");
+  };
+
+  DS.mutationIsQolOnly = function mutationIsQolOnly(mutation) {
+    if (!mutation) return false;
+    const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+    if (target && DS.isQolOwnedNode(target)) return true;
+
+    const nodes = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
+    if (!nodes.length) return false;
+    return nodes.every(node => DS.isQolOwnedNode(node));
+  };
+
+  DS.mutationsHaveNativeChanges = function mutationsHaveNativeChanges(mutations) {
+    return Array.from(mutations || []).some(mutation => !DS.mutationIsQolOnly?.(mutation));
   };
 
   DS.searchableTextForMatching = function searchableTextForMatching(value) {

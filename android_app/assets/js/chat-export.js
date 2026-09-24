@@ -920,22 +920,10 @@
   }
 
   function downloadText(text, mime, filename) {
-    const blob = new Blob([text], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    const dsExportFilename = filename;
-
-    // Android app: use the native file export bridge when available.
-    if (typeof window._dsRequestExport === "function") {
-      URL.revokeObjectURL(url);
-      window._dsRequestExport(textarea.value, dsExportFilename);
+    if (typeof DS.downloadTextFile === "function") {
+      DS.downloadTextFile(text, filename, mime, { requestPermission: true });
       return;
     }
-
-    a.href = url;
-    a.download = dsExportFilename;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function printHtml(html) {

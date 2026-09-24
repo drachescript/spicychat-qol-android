@@ -3,6 +3,77 @@
 
   const DS = window.DragonScriptQoL;
 
+  let sidebarObserver = null;
+  let observedSidebarNav = null;
+  let sidebarDirty = true;
+  let lastSidebarSettingsSignature = "";
+
+  function sidebarSettingsSignature(settings = {}) {
+    return Object.keys(settings)
+      .filter(key => key.startsWith("hideSidebar"))
+      .sort()
+      .map(key => `${key}:${settings[key] ? 1 : 0}`)
+      .join("|") + `|enabled:${settings.enabled ? 1 : 0}`;
+  }
+
+  function sidebarManagedReason(el) {
+    return String(el?.dataset?.dsReason || "");
+  }
+
+  function sidebarManagedElementNeedsRepair(el) {
+    const reason = sidebarManagedReason(el);
+    if (!reason.startsWith("sidebar:")) return false;
+    return el?.dataset?.dsHidden !== "1" || !el?.classList?.contains?.("ds-hidden");
+  }
+
+  function ensureSidebarObserver() {
+    const nav = getNav();
+    if (!nav) {
+      sidebarObserver?.disconnect?.();
+      sidebarObserver = null;
+      observedSidebarNav = null;
+      sidebarDirty = true;
+      return;
+    }
+    if (sidebarObserver && observedSidebarNav === nav) return;
+
+    sidebarObserver?.disconnect?.();
+    observedSidebarNav = nav;
+    sidebarDirty = true;
+    sidebarObserver = new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes") {
+          const attr = String(mutation.attributeName || "");
+          const target = mutation.target instanceof Element ? mutation.target : null;
+          const managed = sidebarManagedReason(target).startsWith("sidebar:");
+
+          // Ignore same-state/native attribute churn on an element that QoL has
+          // already hidden correctly. If React actually removes our hidden
+          // class/state, mark one repair pass instead of continuously
+          // hide/showing the same element.
+          if (managed && ["class", "style", "hidden", "aria-hidden", "data-ds-hidden", "data-ds-reason"].includes(attr)) {
+            if (!sidebarManagedElementNeedsRepair(target)) continue;
+            sidebarDirty = true;
+            if (DS.state?.runtimeCounters) {
+              DS.state.runtimeCounters.sidebarNativeStateRepairs =
+                Number(DS.state.runtimeCounters.sidebarNativeStateRepairs || 0) + 1;
+            }
+            return;
+          }
+        }
+        if (DS.mutationIsQolOnly?.(mutation)) continue;
+        sidebarDirty = true;
+        return;
+      }
+    });
+    sidebarObserver.observe(nav, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "aria-label", "data-tooltip-content", "id", "class", "style", "hidden", "aria-hidden", "data-ds-hidden", "data-ds-reason"]
+    });
+  }
+
   function getNav() {
     return document.querySelector("nav") || document.querySelector('[role="navigation"]');
   }
@@ -335,15 +406,78 @@
     });
   }
 
-  function resetSidebarCleanup() {
-    const nav = getNav();
-    if (!nav) return;
+  function sidebarReasonStillWanted(reason, settings = {}) {
+    const key = String(reason || "");
+    if (!key.startsWith("sidebar:")) return false;
 
+    const wanted = {
+      "sidebar:logo": !!settings.hideSidebarLogo,
+      "sidebar:home": !!settings.hideSidebarHome,
+      "sidebar:home-text": !!settings.hideSidebarHome,
+      "sidebar:chats": !!settings.hideSidebarChats,
+      "sidebar:chats-text": !!settings.hideSidebarChats,
+      "sidebar:personas": !!settings.hideSidebarPersonas,
+      "sidebar:personas-text": !!settings.hideSidebarPersonas,
+      "sidebar:create-menu": !!settings.hideSidebarCreateMenu,
+      "sidebar:create-chatbot": !!settings.hideSidebarCreateChatbot,
+      "sidebar:create-chatbot-link": !!settings.hideSidebarCreateChatbot,
+      "sidebar:create-lorebook": !!settings.hideSidebarCreateLorebook,
+      "sidebar:create-lorebook-link": !!settings.hideSidebarCreateLorebook,
+      "sidebar:create-group": !!settings.hideSidebarCreateGroup,
+      "sidebar:create-group-link": !!settings.hideSidebarCreateGroup,
+      "sidebar:create-voice": !!settings.hideSidebarCreateVoice,
+      "sidebar:my-creations-menu": !!settings.hideSidebarMyCreationsMenu,
+      "sidebar:my-chatbots": !!settings.hideSidebarMyChatbots,
+      "sidebar:my-chatbots-link": !!settings.hideSidebarMyChatbots,
+      "sidebar:my-lorebooks": !!settings.hideSidebarMyLorebooks,
+      "sidebar:my-lorebooks-link": !!settings.hideSidebarMyLorebooks,
+      "sidebar:my-groups": !!settings.hideSidebarMyGroups,
+      "sidebar:my-groups-link": !!settings.hideSidebarMyGroups,
+      "sidebar:my-voices": !!settings.hideSidebarMyVoices,
+      "sidebar:favorites": !!settings.hideSidebarFavorites,
+      "sidebar:favorites-text": !!settings.hideSidebarFavorites,
+      "sidebar:recommendations": !!settings.hideSidebarRecommendations,
+      "sidebar:recommendations-text": !!settings.hideSidebarRecommendations,
+      "sidebar:leaderboard": !!settings.hideSidebarLeaderboard,
+      "sidebar:leaderboard-text": !!settings.hideSidebarLeaderboard,
+      "sidebar:blocked-creators": !!settings.hideSidebarBlockedCreators,
+      "sidebar:blocked-creators-text": !!settings.hideSidebarBlockedCreators,
+      "sidebar:subscribe": !!settings.hideSidebarSubscribe,
+      "sidebar:subscribe-text": !!settings.hideSidebarSubscribe,
+      "sidebar:help-text": !!settings.hideSidebarHelp,
+      "sidebar:social-discord": !!settings.hideSidebarSocialLinks || !!settings.hideSidebarSocialDiscord,
+      "sidebar:social-x": !!settings.hideSidebarSocialLinks || !!settings.hideSidebarSocialX,
+      "sidebar:social-reddit": !!settings.hideSidebarSocialLinks || !!settings.hideSidebarSocialReddit,
+      "sidebar:social-links-wrapper": !!settings.hideSidebarSocialLinks || !!settings.hideSidebarSocialDiscord || !!settings.hideSidebarSocialX || !!settings.hideSidebarSocialReddit,
+      "sidebar:footer-terms": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterTerms,
+      "sidebar:footer-privacy": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterPrivacy,
+      "sidebar:footer-refunds": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterRefunds,
+      "sidebar:footer-reporting": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterReporting,
+      "sidebar:footer-guidelines": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterGuidelines,
+      "sidebar:footer-support": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterSupport,
+      "sidebar:footer-affiliates": !!settings.hideSidebarFooterLinks || !!settings.hideSidebarFooterAffiliates,
+      "sidebar:app-download-google-play": !!settings.hideSidebarAppDownload || !!settings.hideSidebarAppDownloadGooglePlay,
+      "sidebar:app-download-app-store": !!settings.hideSidebarAppDownload || !!settings.hideSidebarAppDownloadAppStore,
+      "sidebar:app-download-generic": !!settings.hideSidebarAppDownload || !!settings.hideSidebarAppDownloadGeneric,
+      "sidebar:web-version": !!settings.hideSidebarWebVersion,
+      "sidebar:sign-out": !!settings.hideSidebarSignOut
+    };
+
+    return !!wanted[key];
+  }
+
+  function restoreNoLongerRequestedSidebarElements(settings) {
+    const nav = getNav();
+    if (!nav) return 0;
+
+    let restored = 0;
     DS.qsa("[data-ds-reason]", nav).forEach(el => {
-      if (String(el.dataset.dsReason || "").startsWith("sidebar:")) {
-        DS.unhideElement(el);
-      }
+      const reason = String(el.dataset.dsReason || "");
+      if (!reason.startsWith("sidebar:") || sidebarReasonStillWanted(reason, settings)) return;
+      DS.unhideElement(el);
+      restored += 1;
     });
+    return restored;
   }
 
   function keepNativeNavigationToggleVisible() {
@@ -367,7 +501,22 @@
   DS.applySidebarCleanup = function applySidebarCleanup() {
     const { settings } = DS.state;
 
-    resetSidebarCleanup();
+    ensureSidebarObserver();
+    const settingsSignature = sidebarSettingsSignature(settings);
+    if (!sidebarDirty && settingsSignature === lastSidebarSettingsSignature) {
+      if (DS.state?.runtimeCounters) {
+        DS.state.runtimeCounters.sidebarStablePassSkips = Number(DS.state.runtimeCounters.sidebarStablePassSkips || 0) + 1;
+      }
+      return;
+    }
+    sidebarDirty = false;
+    lastSidebarSettingsSignature = settingsSignature;
+
+    // Do not unhide every managed row and immediately hide it again on every
+    // reconciliation pass. That old restore/reapply loop fought React and was a
+    // major source of same-state sidebar mutations in active-use diagnostics.
+    // Only restore controls whose corresponding preference was actually turned off.
+    restoreNoLongerRequestedSidebarElements(settings);
     keepSignInVisible();
     keepNativeNavigationToggleVisible();
 

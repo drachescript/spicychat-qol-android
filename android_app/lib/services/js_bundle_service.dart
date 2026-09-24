@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 import 'qol_update_service.dart';
 
 class JsBundleService extends ChangeNotifier {
-  static const bundledExtensionVersion = '0.2.0';
+  static const bundledExtensionVersion = '0.2.15';
 
   final QolUpdateService qolUpdates;
 
@@ -194,32 +194,31 @@ class JsBundleService extends ChangeNotifier {
   Future<void> reloadAfterQolUpdate() => loadAssets();
 
   Future<void> _loadOptions({required bool remoteActive}) async {
-    Future<String> load(String remotePath, String bundledPath) async {
+    Future<String?> loadOptional(
+      String remotePath,
+      String bundledPath,
+    ) async {
       if (remoteActive) {
         final remote = await qolUpdates.readDownloadedText(remotePath);
         if (remote != null) return remote;
       }
-      return rootBundle.loadString(bundledPath);
+
+      try {
+        return await rootBundle.loadString(bundledPath);
+      } catch (_) {
+        return null;
+      }
     }
 
-    var html = await load('options.html', 'assets/options/options.html');
-    var css = await load('options.css', 'assets/options/options.css');
-    final featureRegistry = await load(
-      'feature-registry.js',
-      'assets/options/feature-registry.js',
+    final htmlSource = await loadOptional(
+      'options.html',
+      'assets/options/options.html',
     );
-    final optionsJs = await load('options.js', 'assets/options/options.js');
-
-    final bundledCss =
-        await rootBundle.loadString('assets/options/options.css');
-    const mobileMarker = '/* Android WebView / phone layout */';
-    final markerAt = bundledCss.indexOf(mobileMarker);
-    if (markerAt >= 0 && !css.contains(mobileMarker)) {
-      css = '$css\n\n${bundledCss.substring(markerAt)}';
+    if (htmlSource == null || htmlSource.trim().isEmpty) {
+      throw StateError('Android Options HTML is unavailable.');
     }
 
-    final androidBridge =
-        await rootBundle.loadString('assets/options/options-bridge.js');
+    var html = htmlSource;
 
     if (!html.contains('name="viewport"')) {
       html = html.replaceFirst(
@@ -232,46 +231,162 @@ class JsBundleService extends ChangeNotifier {
       );
     }
 
-    html = html.replaceFirst(
-      RegExp(
-        r'''<link[^>]+href=["']options\.css["'][^>]*>''',
-        caseSensitive: false,
-      ),
-      '<style id="ds-android-options-css">${_safeStyle(css)}</style>',
+    final bundledBaseCss = await loadOptional(
+      'options.css',
+      'assets/options/options.css',
+    );
+    const mobileMarker = '/* Android WebView / phone layout */';
+    String mobileCss = '';
+    if (bundledBaseCss != null) {
+      final markerAt = bundledBaseCss.indexOf(mobileMarker);
+      if (markerAt >= 0) {
+        mobileCss = bundledBaseCss.substring(markerAt);
+      }
+    }
+
+    // Inline every local stylesheet referenced by current extension Options.
+    // This follows new files such as options-overhaul.css automatically.
+    final stylesheetRegex = RegExp(
+      r'''<link\b[^>]*\bhref=["']([^"']+\.css(?:[?#][^"']*)?)["'][^>]*>''',
+      caseSensitive: false,
     );
 
-    html = html.replaceFirst(
-      RegExp(
-        r'''<script\s+src=["']feature-registry\.js["']\s*></script>''',
-        caseSensitive: false,
-      ),
-      '<script>${_safeScript(featureRegistry)}</script>',
+    final stylesheetMatches =
+        stylesheetRegex.allMatches(html).toList().reversed.toList();
+
+    for (final match in stylesheetMatches) {
+      final rawPath = match.group(1) ?? '';
+      final relative = _cleanLocalOptionPath(rawPath);
+      if (relative == null) continue;
+
+      var css = await loadOptional(
+        relative,
+        'assets/options/${_baseName(relative)}',
+      );
+
+      // A stale optional stylesheet reference should not make the complete
+      // Android Options page unusable. options.css itself remains required.
+      if (css == null) {
+        if (_baseName(relative).toLowerCase() == 'options.css') {
+          throw StateError('Required Android Options stylesheet is missing.');
+        }
+        html = html.replaceRange(match.start, match.end, '');
+        continue;
+      }
+
+      if (_baseName(relative).toLowerCase() == 'options.css' &&
+          mobileCss.isNotEmpty &&
+          !css.contains(mobileMarker)) {
+        css = '$css\n\n$mobileCss';
+      }
+
+      html = html.replaceRange(
+        match.start,
+        match.end,
+        '<style data-ds-options-source="${_htmlAttr(relative)}">'
+        '${_safeStyle(css)}</style>',
+      );
+    }
+
+    final androidBridge =
+        await rootBundle.loadString('assets/options/options-bridge.js');
+
+    // Inline every local script in source order. The APK-owned native bridge
+    // is inserted immediately before options.js and is never downloaded from
+    // the extension repository.
+    final scriptRegex = RegExp(
+      r'''<script\b[^>]*\bsrc=["']([^"']+\.js(?:[?#][^"']*)?)["'][^>]*>\s*</script>''',
+      caseSensitive: false,
     );
 
-    html = html.replaceAll(
-      RegExp(
-        r'''<script\s+src=["']options-bridge\.js["']\s*></script>''',
-        caseSensitive: false,
-      ),
-      '',
-    );
+    final scriptMatches =
+        scriptRegex.allMatches(html).toList().reversed.toList();
 
-    html = html.replaceFirst(
-      RegExp(
-        r'''<script\s+src=["']options\.js["']\s*></script>''',
-        caseSensitive: false,
-      ),
-      '<script>${_safeScript(androidBridge)}</script>\n'
-      '<script>${_safeScript(optionsJs)}</script>',
-    );
+    for (final match in scriptMatches) {
+      final rawPath = match.group(1) ?? '';
+      final relative = _cleanLocalOptionPath(rawPath);
+      if (relative == null) continue;
+
+      if (_baseName(relative).toLowerCase() == 'options-bridge.js') {
+        html = html.replaceRange(match.start, match.end, '');
+        continue;
+      }
+
+      final source = await loadOptional(
+        relative,
+        'assets/options/${_baseName(relative)}',
+      );
+
+      if (source == null) {
+        final name = _baseName(relative).toLowerCase();
+        if (name == 'options.js' || name == 'feature-registry.js') {
+          throw StateError(
+            'Required Android Options script is missing: $relative',
+          );
+        }
+        html = html.replaceRange(match.start, match.end, '');
+        continue;
+      }
+
+      final prefix = _baseName(relative).toLowerCase() == 'options.js'
+          ? '<script>${_safeScript(androidBridge)}</script>\n'
+          : '';
+
+      html = html.replaceRange(
+        match.start,
+        match.end,
+        '$prefix'
+        '<script data-ds-options-source="${_htmlAttr(relative)}">'
+        '${_safeScript(source)}</script>',
+      );
+    }
 
     _optionsHtml = html;
 
     _optionsSupportText.clear();
     for (final name in const ['CHANGELOG.md', 'features.md']) {
-      _optionsSupportText[name] = await load(name, 'assets/options/$name');
+      final text = await loadOptional(name, 'assets/options/$name');
+      if (text != null) {
+        _optionsSupportText[name] = text;
+      }
     }
   }
+
+  String? _cleanLocalOptionPath(String source) {
+    final raw = source.trim();
+    if (raw.isEmpty) return null;
+
+    final lower = raw.toLowerCase();
+    if (lower.startsWith('http://') ||
+        lower.startsWith('https://') ||
+        lower.startsWith('//') ||
+        lower.startsWith('data:') ||
+        lower.startsWith('blob:')) {
+      return null;
+    }
+
+    final clean = raw.split(RegExp(r'[?#]')).first.trim();
+    if (clean.isEmpty ||
+        clean.startsWith('/') ||
+        clean.contains('../') ||
+        clean == '..') {
+      return null;
+    }
+
+    return clean.replaceAll('\\', '/');
+  }
+
+  String _baseName(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final at = normalized.lastIndexOf('/');
+    return at < 0 ? normalized : normalized.substring(at + 1);
+  }
+
+  String _htmlAttr(String value) => value
+      .replaceAll('&', '&amp;')
+      .replaceAll('"', '&quot;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
 
   String _safeScript(String value) =>
       value.replaceAll(RegExp(r'</script', caseSensitive: false), r'<\/script');

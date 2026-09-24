@@ -189,6 +189,66 @@ function Get-LocalOptionsScriptSources([string]$OptionsHtmlFile) {
     return @($Result)
 }
 
+function Get-LocalOptionsStyleSources([string]$OptionsHtmlFile) {
+    $Html = Read-Utf8Text $OptionsHtmlFile
+    $Matches = [regex]::Matches(
+        $Html,
+        '<link\b[^>]*\bhref=["''][^"'']+["''][^>]*>',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+
+    $Result = [System.Collections.Generic.List[string]]::new()
+    $Seen = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+
+    foreach ($Match in $Matches) {
+        $HrefMatch = [regex]::Match(
+            $Match.Value,
+            'href=["''](?<href>[^"'']+)["'']',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if (-not $HrefMatch.Success) { continue }
+
+        $Source = $HrefMatch.Groups['href'].Value.Trim()
+        if (-not $Source) { continue }
+        if ($Source -match '^(?i:https?:|data:|blob:|//)') { continue }
+
+        $Clean = ($Source -split '[?#]', 2)[0]
+        if ($Clean -and $Clean -match '(?i)\.css$' -and $Seen.Add($Clean)) {
+            $Result.Add($Clean)
+        }
+    }
+
+    return @($Result)
+}
+
+function Remove-OptionsDependencyReference {
+    param(
+        [Parameter(Mandatory = $true)][string]$Html,
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    $Escaped = [regex]::Escape($RelativePath)
+
+    if ($RelativePath -match '(?i)\.js$') {
+        $Pattern = '<script\b[^>]*\bsrc=["'']' + $Escaped + '(?:[?#][^"'']*)?["''][^>]*>\s*</script>'
+    }
+    elseif ($RelativePath -match '(?i)\.css$') {
+        $Pattern = '<link\b[^>]*\bhref=["'']' + $Escaped + '(?:[?#][^"'']*)?["''][^>]*>'
+    }
+    else {
+        return $Html
+    }
+
+    return [regex]::Replace(
+        $Html,
+        $Pattern,
+        '',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+}
+
 function Get-AndroidOptionsCss {
     param(
         [string]$SourceFile,
@@ -270,85 +330,51 @@ function Update-BundleList {
         [string]$ManifestVersion
     )
 
-    # Generate this file deterministically so PowerShell 5.1 cannot corrupt it
-    # on repeated syncs. Keep all Android-only bridge fields in the template.
-    $Entries = [System.Collections.Generic.List[string]]::new()
-    $Entries.Add("    'assets/js/bridge.js',")
+    if (-not (Test-Path -LiteralPath $DartFile)) {
+        Fail "Updater-aware js_bundle_service.dart was not found: $DartFile"
+    }
 
+    $Content = Read-Utf8Text $DartFile
+
+    # v0.1.5+ owns a native QoL updater. Never regenerate this whole Dart file:
+    # doing that would delete its QolUpdateService constructor, downloaded
+    # Options support, and reload hooks. Only update the bundled fallback
+    # version and manifest-ordered bundled JS list.
+    if (-not $Content.Contains("JsBundleService({required this.qolUpdates})")) {
+        Fail "js_bundle_service.dart is not the updater-aware Android loader. Refusing to overwrite it."
+    }
+
+    $VersionPattern = "static const bundledExtensionVersion = '[^']*';"
+    $VersionRegex = [regex]::new($VersionPattern)
+    if (-not $VersionRegex.IsMatch($Content)) {
+        Fail "Could not find bundledExtensionVersion in js_bundle_service.dart."
+    }
+
+    $Content = $VersionRegex.Replace(
+        $Content,
+        "static const bundledExtensionVersion = '$ManifestVersion';",
+        1
+    )
+
+    $Entries = [System.Collections.Generic.List[string]]::new()
     foreach ($ScriptPath in $ManifestScripts) {
         $FileName = [System.IO.Path]::GetFileName(($ScriptPath -replace '/', '\'))
         $Entries.Add("    'assets/js/$FileName',")
     }
-
     $EntriesText = $Entries -join "`r`n"
-    $Template = @'
-import 'dart:convert';
 
-import 'package:flutter/services.dart';
-
-/// Loads all JS and CSS assets from the bundle and provides
-/// them as injectable strings for the WebView.
-class JsBundleService {
-  String _cssContent = '';
-  String _jsBundle = '';
-  String _extensionVersion = '__EXTENSION_VERSION__';
-
-  String get cssContent => _cssContent;
-  String get jsBundle => _jsBundle;
-  String get extensionVersion => _extensionVersion;
-
-  // Script injection order is generated from manifest.json by update_android.ps1.
-  static const _jsFiles = [
-__JS_ENTRIES__
-  ];
-
-  Future<void> loadAssets() async {
-    _cssContent = await rootBundle.loadString('assets/css/content.css');
-
-    final buffer = StringBuffer();
-    buffer.writeln('// SpicyChat QOL Android bundled injection');
-    buffer.writeln('// Injected by Flutter InAppWebView');
-    buffer.writeln(
-      'window.__spicyChatQolBundledVersion = ${jsonEncode(_extensionVersion)};',
-    );
-    buffer.writeln('');
-
-    for (final path in _jsFiles) {
-      try {
-        final source = await rootBundle.loadString(path);
-        buffer.writeln('// === $path ===');
-        buffer.writeln(source);
-        buffer.writeln('');
-      } catch (e) {
-        buffer.writeln('// ERROR loading $path: $e');
-      }
+    $ListRegex = [regex]::new(
+        '(?ms)^  static const _bundledJsFiles = \[\r?\n.*?^  \];'
+    )
+    if (-not $ListRegex.IsMatch($Content)) {
+        Fail "Could not find _bundledJsFiles in js_bundle_service.dart."
     }
 
-    _jsBundle = buffer.toString();
-  }
+    $Replacement = "  static const _bundledJsFiles = [`r`n" +
+        $EntriesText +
+        "`r`n  ];"
 
-  String get cssInjectionScript {
-    final escaped = _cssContent
-        .replaceAll('\\', '\\\\')
-        .replaceAll("'", "\\'")
-        .replaceAll('\n', '\\n')
-        .replaceAll('\r', '');
-
-    return '''
-      (function() {
-        if (document.getElementById('ds-qol-injected-css')) return;
-        var style = document.createElement('style');
-        style.id = 'ds-qol-injected-css';
-        style.textContent = '$escaped';
-        document.head.appendChild(style);
-      })();
-    ''';
-  }
-}
-'@
-
-    $Content = $Template.Replace('__JS_ENTRIES__', $EntriesText)
-    $Content = $Content.Replace('__EXTENSION_VERSION__', $ManifestVersion)
+    $Content = $ListRegex.Replace($Content, $Replacement, 1)
     Write-IfChanged -Destination $DartFile -Content $Content
 }
 
@@ -459,9 +485,9 @@ foreach ($RelativePath in $ContentScripts) {
 
     $Destination = Join-Path $AndroidJs $FileName
 
-    # Keep shared content scripts byte-for-byte current. Chat export now routes
-    # downloads through DS.downloadTextFile(), while Android's bridge handles
-    # the native/generated-download side. Do not rewrite chat-export.js here.
+    # Keep shared content scripts byte-for-byte current. Chat export routes
+    # downloads through the shared DS.downloadTextFile() path; Android's
+    # bridge handles the generated/native download side.
     Copy-IfChanged -Source $SourceFile -Destination $Destination
 }
 
@@ -518,7 +544,7 @@ Get-ChildItem -LiteralPath $AndroidCss -Filter "*.css" -File | ForEach-Object {
     }
 }
 
-# 5) Sync the extension options UI while retaining the Android bridge/mobile additions.
+# 5) Sync the extension Options UI while retaining Android bridge/mobile additions.
 $OptionsPage = if ($Manifest.options_page) {
     [string]$Manifest.options_page
 }
@@ -533,38 +559,94 @@ if ($OptionsPage) {
     New-Item -ItemType Directory -Path $AndroidOptions -Force | Out-Null
 
     $SourceOptionsHtml = Join-Path $ResolvedSource ($OptionsPage -replace '/', '\')
-    Write-IfChanged `
-        -Destination (Join-Path $AndroidOptions "options.html") `
-        -Content (Get-AndroidOptionsHtml $SourceOptionsHtml)
-
-    $SourceOptionsCss = Join-Path $ResolvedSource "options.css"
-    if (Test-Path -LiteralPath $SourceOptionsCss) {
-        $AndroidOptionsCss = Join-Path $AndroidOptions "options.css"
-        Write-IfChanged `
-            -Destination $AndroidOptionsCss `
-            -Content (Get-AndroidOptionsCss -SourceFile $SourceOptionsCss -ExistingAndroidFile $AndroidOptionsCss)
+    if (-not (Test-Path -LiteralPath $SourceOptionsHtml)) {
+        Fail "Extension options page was not found: $OptionsPage"
     }
 
-    # Mirror every local JavaScript dependency referenced by options.html.
-    # Newer QoL versions split the Features catalogue into feature-registry.js;
-    # copying only options.js made Android show 0/0 features.
     $OptionsScriptSources = Get-LocalOptionsScriptSources $SourceOptionsHtml
+    $OptionsStyleSources = Get-LocalOptionsStyleSources $SourceOptionsHtml
+
+    # Core files are required. Extra split files are mirrored when present.
+    # If the extension accidentally leaves a stale optional <script>/<link>
+    # reference behind, Android removes only that dead tag and continues.
+    $RequiredOptionScripts = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    [void]$RequiredOptionScripts.Add("options.js")
+    [void]$RequiredOptionScripts.Add("feature-registry.js")
+
+    $RequiredOptionStyles = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    [void]$RequiredOptionStyles.Add("options.css")
+
+    $MissingOptionalDependencies = [System.Collections.Generic.List[string]]::new()
+
     foreach ($RelativeScript in $OptionsScriptSources) {
         $NormalizedScript = $RelativeScript -replace '/', [System.IO.Path]::DirectorySeparatorChar
         $SourceFile = Join-Path (Split-Path -Parent $SourceOptionsHtml) $NormalizedScript
+        $FileName = [System.IO.Path]::GetFileName($NormalizedScript)
+
         if (-not (Test-Path -LiteralPath $SourceFile)) {
-            Fail "Options page references a local script that does not exist: $RelativeScript"
+            if ($RequiredOptionScripts.Contains($FileName)) {
+                Fail "Required Options script does not exist: $RelativeScript"
+            }
+
+            Write-Host "Ignoring stale optional Options script reference: $RelativeScript" -ForegroundColor Yellow
+            $MissingOptionalDependencies.Add($RelativeScript)
+            continue
         }
 
-        $Destination = Join-Path $AndroidOptions ([System.IO.Path]::GetFileName($NormalizedScript))
-        Copy-IfChanged -Source $SourceFile -Destination $Destination
+        Copy-IfChanged `
+            -Source $SourceFile `
+            -Destination (Join-Path $AndroidOptions $FileName)
     }
 
-    # Text resources read by the options UI through the Android native bridge.
+    foreach ($RelativeStyle in $OptionsStyleSources) {
+        $NormalizedStyle = $RelativeStyle -replace '/', [System.IO.Path]::DirectorySeparatorChar
+        $SourceFile = Join-Path (Split-Path -Parent $SourceOptionsHtml) $NormalizedStyle
+        $FileName = [System.IO.Path]::GetFileName($NormalizedStyle)
+
+        if (-not (Test-Path -LiteralPath $SourceFile)) {
+            if ($RequiredOptionStyles.Contains($FileName)) {
+                Fail "Required Options stylesheet does not exist: $RelativeStyle"
+            }
+
+            Write-Host "Ignoring stale optional Options stylesheet reference: $RelativeStyle" -ForegroundColor Yellow
+            $MissingOptionalDependencies.Add($RelativeStyle)
+            continue
+        }
+
+        $Destination = Join-Path $AndroidOptions $FileName
+
+        if ($FileName -ieq "options.css") {
+            Write-IfChanged `
+                -Destination $Destination `
+                -Content (Get-AndroidOptionsCss -SourceFile $SourceFile -ExistingAndroidFile $Destination)
+        }
+        else {
+            Copy-IfChanged -Source $SourceFile -Destination $Destination
+        }
+    }
+
+    $AndroidOptionsHtml = Get-AndroidOptionsHtml $SourceOptionsHtml
+    foreach ($MissingDependency in $MissingOptionalDependencies) {
+        $AndroidOptionsHtml = Remove-OptionsDependencyReference `
+            -Html $AndroidOptionsHtml `
+            -RelativePath $MissingDependency
+    }
+
+    Write-IfChanged `
+        -Destination (Join-Path $AndroidOptions "options.html") `
+        -Content $AndroidOptionsHtml
+
+    # Text resources read by the Options UI through the Android native bridge.
     foreach ($Name in @("CHANGELOG.md", "features.md")) {
         $SourceFile = Join-Path $ResolvedSource $Name
         if (Test-Path -LiteralPath $SourceFile) {
-            Copy-IfChanged -Source $SourceFile -Destination (Join-Path $AndroidOptions $Name)
+            Copy-IfChanged `
+                -Source $SourceFile `
+                -Destination (Join-Path $AndroidOptions $Name)
         }
     }
 
@@ -572,12 +654,26 @@ if ($OptionsPage) {
         Fail "Android-only options-bridge.js is missing."
     }
 
-    # Verify every options dependency before building. This catches future
-    # options-page splits instead of silently shipping a broken Android tab.
+    # Verify every dependency that survived sanitization.
     foreach ($RelativeScript in $OptionsScriptSources) {
-        $FileName = [System.IO.Path]::GetFileName(($RelativeScript -replace '/', [System.IO.Path]::DirectorySeparatorChar))
+        if ($MissingOptionalDependencies.Contains($RelativeScript)) { continue }
+
+        $FileName = [System.IO.Path]::GetFileName(
+            ($RelativeScript -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        )
         if (-not (Test-Path -LiteralPath (Join-Path $AndroidOptions $FileName))) {
             Fail "Verification failed: Android Options is missing $RelativeScript"
+        }
+    }
+
+    foreach ($RelativeStyle in $OptionsStyleSources) {
+        if ($MissingOptionalDependencies.Contains($RelativeStyle)) { continue }
+
+        $FileName = [System.IO.Path]::GetFileName(
+            ($RelativeStyle -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        )
+        if (-not (Test-Path -LiteralPath (Join-Path $AndroidOptions $FileName))) {
+            Fail "Verification failed: Android Options is missing $RelativeStyle"
         }
     }
 
@@ -648,6 +744,12 @@ if (-not $BundleText.Contains("String get extensionVersion")) {
 }
 if (-not $BundleText.Contains("__spicyChatQolBundledVersion")) {
     Fail "Verification failed: js_bundle_service.dart lost the JavaScript extension-version bridge."
+}
+if (-not $BundleText.Contains("JsBundleService({required this.qolUpdates})")) {
+    Fail "Verification failed: js_bundle_service.dart lost the QoL updater constructor."
+}
+if (-not $BundleText.Contains("Future<void> reloadAfterQolUpdate()")) {
+    Fail "Verification failed: js_bundle_service.dart lost downloaded-bundle reload support."
 }
 
 foreach ($RelativePath in $ContentScripts) {

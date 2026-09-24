@@ -6,6 +6,7 @@
 
   const PANEL_ID = "ds-bot-backup-tools";
   const STYLE_ID = "ds-bot-backup-style";
+  const CHATBOT_LOREBOOK_LINKS_KEY = "chatbotLorebookLinks";
   let activeForm = null;
   let saveTimer = null;
   let lastSavedSignature = "";
@@ -66,6 +67,31 @@
     return DS.state?.settings || {};
   }
 
+  function editorForm() {
+    if (!editorInfo()) return null;
+    const field = document.querySelector(
+      '[data-field-name="name"] input, input[name="name"], [data-field-name="greeting"] textarea, textarea[name="greeting"], textarea[name="persona"], textarea[name="personality"]'
+    );
+    const direct = field?.closest?.("form");
+    if (direct) return direct;
+
+    const explicit = document.querySelector("form[data-testid*='Chatbot'], form[data-testid*='Character']");
+    if (explicit) return explicit;
+
+    let best = null;
+    let bestScore = 0;
+    for (const form of document.querySelectorAll("form")) {
+      if (form.closest?.(`#${PANEL_ID},#ds-qol-panel,[data-ds-owned='1']`)) continue;
+      let score = 0;
+      const controls = form.querySelectorAll("textarea,input[type='text'],input:not([type]),select");
+      score += Math.min(8, controls.length);
+      for (const control of controls) if (semanticKey(control)) score += 4;
+      if (form.querySelector("button[type='submit']")) score += 2;
+      if (score > bestScore) { best = form; bestScore = score; }
+    }
+    return bestScore >= 6 ? best : null;
+  }
+
   function fieldText(control) {
     if (!control) return "";
     const parts = [
@@ -104,7 +130,7 @@
     return "";
   }
 
-  function directField(key) {
+  function directField(key, root = activeForm || editorForm() || document) {
     const selectors = {
       name: ["[name='name']"],
       title: ["[name='title']", "[name='tagline']"],
@@ -115,7 +141,7 @@
       exampleDialogues: ["[name='dialogue']", "[name='example_dialogue']", "[name='exampleDialogues']"]
     }[key] || [];
     for (const selector of selectors) {
-      const field = document.querySelector(selector);
+      const field = root.querySelector?.(selector);
       if (field && !field.closest?.(`#${PANEL_ID},#ds-qol-panel`)) return field;
     }
     return null;
@@ -123,13 +149,14 @@
 
   function captureTextFields() {
     const result = {};
+    const root = activeForm || editorForm() || document;
     const keys = ["name", "title", "description", "greeting", "personality", "scenario", "exampleDialogues"];
     for (const key of keys) {
-      const direct = directField(key);
+      const direct = directField(key, root);
       if (direct) result[key] = clean(direct.value, key === "personality" || key === "exampleDialogues" ? 18000 : 12000);
     }
     if (keys.every(key => result[key])) return result;
-    for (const control of document.querySelectorAll("textarea,input,select")) {
+    for (const control of root.querySelectorAll?.("textarea,input,select") || []) {
       const key = semanticKey(control);
       if (!key || result[key]) continue;
       result[key] = clean(control.value, key === "personality" || key === "exampleDialogues" ? 18000 : 12000);
@@ -180,7 +207,7 @@
 
   function currentAvatarUrl() {
     const upload = document.querySelector("input[type='file'][accept*='image'],input[data-testid='AvatarCreateUploadInput']");
-    let root = upload?.parentElement || document.querySelector("form");
+    let root = upload?.parentElement || activeForm || editorForm();
     for (let depth = 0; root && depth < 5; depth += 1, root = root.parentElement) {
       const image = [...root.querySelectorAll?.("img") || []].find(img => {
         const src = String(img.getAttribute("src") || "");
@@ -243,6 +270,57 @@
     return JSON.stringify(sanitizeBackupFields(profile.fields));
   }
 
+  function normalizedVersionTags(value) {
+    const values = String(value || "")
+      .split(/\s*,\s*/g)
+      .map(tag => clean(tag, 120))
+      .filter(Boolean);
+    const deduped = [...new Map(values.map(tag => [tag.toLocaleLowerCase(), tag])).values()];
+    deduped.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    return deduped.join(", ");
+  }
+
+  async function versionSnapshot(profile, reason = "Own bot editor") {
+    if (!profile?.info?.id) return null;
+    const fields = sanitizeBackupFields(profile.fields);
+    const result = await DS.storageGet?.([CHATBOT_LOREBOOK_LINKS_KEY]) || {};
+    const relations = result[CHATBOT_LOREBOOK_LINKS_KEY] && typeof result[CHATBOT_LOREBOOK_LINKS_KEY] === "object"
+      ? result[CHATBOT_LOREBOOK_LINKS_KEY]
+      : {};
+    const relation = relations[profile.info.id] && typeof relations[profile.info.id] === "object"
+      ? relations[profile.info.id]
+      : {};
+
+    return {
+      capturedAt: Date.now(),
+      source: reason,
+      content: {
+        name: fields.name || "",
+        title: fields.title || "",
+        greeting: fields.greeting || "",
+        personality: fields.personality || "",
+        scenario: fields.scenario || "",
+        exampleDialogues: fields.exampleDialogues || "",
+        tags: normalizedVersionTags(fields.tags),
+        image: fields.image || "",
+        lorebook: {
+          id: clean(relation.lorebookId || "", 240),
+          name: clean(relation.lorebookName || "", 500)
+        }
+      },
+      state: {
+        visibility: fields.visibility || "",
+        moderation: profile.readOnlyReview ? "under-review" : "",
+        capturedAt: Date.now()
+      }
+    };
+  }
+
+  function versionSnapshotSignature(snapshot) {
+    if (!snapshot?.content) return "";
+    return JSON.stringify(snapshot.content);
+  }
+
   function portableJson(profile) {
     const fields = sanitizeBackupFields(profile?.fields || {});
     const info = profile?.info || { id: "", mode: "create" };
@@ -303,26 +381,25 @@
   }
 
   function downloadJson(payload, filename) {
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1200);
+    const text = JSON.stringify(payload, null, 2);
+    if (typeof DS.downloadTextFile === "function") {
+      return DS.downloadTextFile(text, filename, "application/json;charset=utf-8", { requestPermission: true });
+    }
   }
 
   async function saveOwnBackup(reason = "Own bot editor", options = {}) {
     const profile = captureProfile();
     if (!profile?.info?.id || profile.info.mode !== "edit") return false;
-    const nextSignature = signature(profile);
+
+    const version = await versionSnapshot(profile, reason);
+    const nextSignature = `${signature(profile)}|${versionSnapshotSignature(version)}`;
+
     if (!options.manual && profile.readOnlyEditor) {
       if (nextSignature) lastSavedSignature = nextSignature;
       return false;
     }
     if (!options.manual && nextSignature && nextSignature === lastSavedSignature) return false;
+
     const fields = sanitizeBackupFields(profile.fields);
     const snapshot = {
       id: profile.info.id,
@@ -338,11 +415,14 @@
       fields,
       coverage: profile.coverage
     };
+
     const ok = await DS.saveBotArchiveSnapshot?.(snapshot, {
       trackRevision: true,
       manual: !!options.manual,
-      label: clean(options.label || (options.manual ? "Manual backup" : ""), 160)
+      label: clean(options.label || (options.manual ? "Manual backup" : ""), 160),
+      versionSnapshot: version
     });
+
     if (ok) {
       lastSavedSignature = nextSignature;
       const counters = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
@@ -416,11 +496,13 @@
     const entry = result[DS.BOT_ARCHIVE_KEY || "botArchive"]?.meta?.[info.id] || null;
     const revisions = Array.isArray(entry?.revisions) ? entry.revisions.length : 0;
     const manuals = Array.isArray(entry?.manualBackups) ? entry.manualBackups.length : 0;
+    const versions = Array.isArray(entry?.versions) ? entry.versions.length : 0;
     const readOnly = editorReadOnlyState();
     const parts = [
       `Automatic backup: ${automatic ? "On" : "Off"}`,
       `Last backup: ${relativeAge(entry?.lastSavedAt)}`,
-      `${revisions} auto revision${revisions === 1 ? "" : "s"}`,
+      `${versions} bot version${versions === 1 ? "" : "s"}`,
+      `${revisions} safety revision${revisions === 1 ? "" : "s"}`,
       `${manuals} manual backup${manuals === 1 ? "" : "s"}`
     ];
     if (readOnly) parts.push("editor is read-only; automatic revisions are paused; manual backup still works");
@@ -490,7 +572,7 @@
     const fields = importedBotFields(payload);
     if (!fields.name && !fields.greeting && !fields.personality) throw new Error("No supported chatbot fields were found in that JSON file.");
 
-    const form = document.querySelector("form");
+    const form = editorForm();
     if (!form) throw new Error("SpicyChat's chatbot form is not ready yet.");
     const mapping = [
       ["name", fields.name],
@@ -607,7 +689,7 @@
     if (info?.mode === "edit" && info.id) {
       const history = document.createElement("button");
       history.type = "button";
-      history.textContent = "History";
+      history.textContent = "Version history";
       history.addEventListener("click", () => openBackupHistory(info));
       actions.appendChild(history);
     }
@@ -662,7 +744,7 @@
       return;
     }
 
-    const form = document.querySelector("form");
+    const form = editorForm();
     if (!form) return;
     DS.state.botBackupWasActive = true;
     activeForm = form;
@@ -678,9 +760,11 @@
     if (!document.getElementById(PANEL_ID)) buildPanel(form);
     if (lastPanelAutoState !== !!cfg.botArchiveOwnEditorBackups) refreshPanelStatus().catch(() => {});
 
-    // Automatic backups are opt-in. Manual Save/Export/History stay available
-    // on every supported edit page. A read-only editor only establishes a
-    // baseline so native rerenders cannot create fake automatic revisions.
+    // Automatic backups are opt-in. Manual Save/Export/Version history stay
+    // available on every supported edit page. Meaningful bot versions are
+    // stored separately from rotating safety revisions/manual checkpoints. A
+    // read-only editor only establishes a baseline so native rerenders cannot
+    // create fake automatic revisions.
     if (cfg.botArchiveOwnEditorBackups && info.mode === "edit" && info.id && !lastSavedSignature) {
       if (readOnly) {
         lastSavedSignature = signature(captureProfile());

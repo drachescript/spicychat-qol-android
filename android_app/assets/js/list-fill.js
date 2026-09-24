@@ -8,7 +8,10 @@
   const EXTRA_CARD_ATTR = "data-ds-autofill-extra";
   const REFILL_FAVORITE_CLASS = "ds-refill-favorite-button";
   const REFILL_FAVORITE_FRAME_ID = "ds-listing-refill-favorite-frame";
+  const LISTING_FILTER_STATS_CLASS = "ds-listing-filter-stats";
   const MAX_SERIALIZED_CARD_HTML = 500000;
+  const REFILL_CANDIDATE_CACHE_TTL_MS = 20 * 60 * 1000;
+  const REFILL_CANDIDATE_CACHE_MAX = 600;
   let refillFavoriteFrame = null;
   let refillFavoriteFrameUrl = "";
   let refillFavoriteFrameLoad = null;
@@ -43,9 +46,36 @@
       appended: 0,
       duplicates: 0,
       filtered: 0,
+      blockedRejected: 0,
+      blockedBotRejected: 0,
+      blockedCreatorRejected: 0,
+      blockedWordRejected: 0,
+      blockedTagRejected: 0,
+      languageRejected: 0,
+      openedRejected: 0,
+      laterRejected: 0,
+      notInterestedRejected: 0,
+      otherRejected: 0,
+      filterRejected: 0,
+      smartFilterRejected: 0,
+      postInsertRejected: 0,
+      pagesWithNoSurvivors: 0,
       helperFailures: 0,
+      helperReuses: 0,
+      helperRecoveries: 0,
+      helperGcClosed: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      cacheCandidatesStored: 0,
+      cacheCandidatesUsed: 0,
+      cacheCandidatesExpired: 0,
       metadataExtracted: 0,
       tagsRestored: 0,
+      staleResponses: 0,
+      nativeRejected: 0,
+      domNodesCreated: 0,
+      visibleAfter: 0,
+      lastRejectReason: "",
       lastError: "",
       lastPage: 0,
       startedAt: Date.now()
@@ -55,6 +85,23 @@
   function runStats() {
     if (!DS.state.autoFillRunStats || typeof DS.state.autoFillRunStats !== "object") resetRunStats();
     return DS.state.autoFillRunStats;
+  }
+
+  function newRefillRunId() {
+    return globalThis.crypto?.randomUUID?.() || `refill-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function ensureRefillRunId() {
+    if (!DS.state.autoFillRunId) DS.state.autoFillRunId = newRefillRunId();
+    return DS.state.autoFillRunId;
+  }
+
+  async function releaseRefillPageWorker() {
+    const runId = String(DS.state.autoFillRunId || "").trim();
+    DS.state.autoFillRunId = "";
+    if (!runId) return false;
+    const response = await runtimeMessage({ type: "DS_LISTING_REFILL_RELEASE", runId });
+    return !!response?.ok;
   }
 
   DS.stopListingAutoFill = function stopListingAutoFill() {
@@ -261,6 +308,78 @@
     return FALLBACK_PAGE_KEY;
   }
 
+  function canonicalListingSignature(urlLike = location.href) {
+    let url;
+    try { url = new URL(urlLike, location.href); }
+    catch { return ""; }
+
+    const entries = [];
+    for (const [key, value] of url.searchParams.entries()) {
+      if (/\[page\]$/i.test(key)) continue;
+      if (key === "dsListingRefill") continue;
+      entries.push([key, value]);
+    }
+
+    entries.sort((left, right) => {
+      const keyOrder = String(left[0]).localeCompare(String(right[0]));
+      return keyOrder || String(left[1]).localeCompare(String(right[1]));
+    });
+
+    return JSON.stringify(entries);
+  }
+
+  function nativeTagRulesFromUrl(urlLike = location.href) {
+    let url;
+    try { url = new URL(urlLike, location.href); }
+    catch { return { include: [], exclude: [] }; }
+
+    const include = [];
+    const exclude = [];
+    for (const [key, rawValue] of url.searchParams.entries()) {
+      if (!/\[refinementList\]\[tags\](?:\[\d+\])?$/i.test(key)) continue;
+      const value = String(rawValue || "").trim();
+      if (!value) continue;
+      if (value.startsWith("-") && value.length > 1) exclude.push(value.slice(1));
+      else include.push(value);
+    }
+
+    const unique = values => [...new Map(values
+      .map(value => [String(value).trim().toLocaleLowerCase(), String(value).trim()])
+      .filter(([key]) => key))
+      .values()];
+
+    return { include: unique(include), exclude: unique(exclude) };
+  }
+
+  function currentNativeTagRules() {
+    return nativeTagRulesFromUrl(location.href);
+  }
+
+  function metadataTagSet(meta, wrapper) {
+    const values = [];
+    if (Array.isArray(meta?.tags)) values.push(...meta.tags);
+    if (!values.length && wrapper) {
+      values.push(...[...wrapper.querySelectorAll("button")]
+        .filter(isNativeTagPillButton)
+        .map(button => String(button.getAttribute("aria-label") || button.textContent || "").trim()));
+    }
+    return new Set(values.map(value => String(value || "").trim().toLocaleLowerCase()).filter(Boolean));
+  }
+
+  function nativeTagRejection(meta, wrapper, rules = currentNativeTagRules()) {
+    const tags = metadataTagSet(meta, wrapper);
+    if (!tags.size) return "";
+
+    const excluded = (rules.exclude || []).find(tag => tags.has(String(tag).toLocaleLowerCase()));
+    if (excluded) return `excluded tag "${excluded}"`;
+
+    const includes = rules.include || [];
+    if (includes.length && !includes.some(tag => tags.has(String(tag).toLocaleLowerCase()))) {
+      return `missing included tag (${includes.join(" / ")})`;
+    }
+    return "";
+  }
+
   function currentPage() {
     try {
       const url = new URL(location.href);
@@ -286,9 +405,10 @@
       .filter(Number.isFinite));
   }
 
-  function listingUrlForPage(page) {
-    const url = new URL(location.href);
+  function listingUrlForPage(page, sourceHref = location.href) {
+    const url = new URL(sourceHref, location.href);
     url.searchParams.set(pageKeyForUrl(url), String(page));
+    url.searchParams.delete("dsListingRefill");
     return url.href;
   }
 
@@ -322,7 +442,7 @@
     const seenExtraIds = new Set();
     let removed = 0;
     for (const extra of extras) {
-      extra.classList.add("ds-autofill-extra-card");
+      if (!extra.classList.contains("ds-autofill-extra-card")) extra.classList.add("ds-autofill-extra-card");
       const identity = extra.querySelector?.("a[href*='/chat/'], a[href*='/chatbot/']");
       const id = botIdFromLink(identity);
       if (!id) continue;
@@ -534,22 +654,29 @@
 
   function setRefillFavoriteVisual(button, active, statusText = "") {
     if (!button) return;
-    button.dataset.dsRefillFavoriteActive = active ? "1" : "0";
-    button.setAttribute("aria-pressed", active ? "true" : "false");
-    button.setAttribute("aria-label", active ? "unfavorite" : "favorite");
+    const activeValue = active ? "1" : "0";
+    const pressedValue = active ? "true" : "false";
+    const ariaValue = active ? "unfavorite" : "favorite";
+    const tooltipValue = active ? "Unlike" : "Like";
+    const titleValue = statusText || (active ? "Favorited on SpicyChat" : "Favorite this bot on SpicyChat");
+
+    DS.setDatasetIfChanged?.(button, "dsRefillFavoriteActive", activeValue);
+    DS.setAttributeIfChanged?.(button, "aria-pressed", pressedValue);
+    DS.setAttributeIfChanged?.(button, "aria-label", ariaValue);
 
     const tooltip = button.closest?.("[data-tooltip-content]");
-    if (tooltip) tooltip.setAttribute("data-tooltip-content", active ? "Unlike" : "Like");
+    if (tooltip) DS.setAttributeIfChanged?.(tooltip, "data-tooltip-content", tooltipValue);
 
     const svg = button.querySelector("svg");
     if (svg) {
-      svg.classList.toggle("text-red-9", !!active);
-      svg.classList.toggle("fill-red-9", !!active);
-      svg.classList.toggle("text-white", !active);
-      svg.classList.toggle("fill-transparent", !active);
-      svg.style.fill = active ? "currentColor" : "transparent";
+      DS.setClassState?.(svg, "text-red-9", !!active);
+      DS.setClassState?.(svg, "fill-red-9", !!active);
+      DS.setClassState?.(svg, "text-white", !active);
+      DS.setClassState?.(svg, "fill-transparent", !active);
+      const fill = active ? "currentColor" : "transparent";
+      if (svg.style.fill !== fill) svg.style.fill = fill;
     }
-    button.title = statusText || (active ? "Favorited on SpicyChat" : "Favorite this bot on SpicyChat");
+    if (button.title !== titleValue) button.title = titleValue;
   }
 
   async function rememberRefillFavoriteLocally(id, card, anchor) {
@@ -777,14 +904,421 @@
     return wrapper;
   }
 
+  function refillHomeContext() {
+    const path = String(location.pathname || "").replace(/\/+$/, "") || "/";
+    return path === "/";
+  }
+
+  function hardBlockRefillReason(reason) {
+    return /^(?:blocked bot(?: id)?|blocked word|blocked tag|blocked creator):?/i.test(String(reason || ""));
+  }
+
+  function rejectionBucket(reason, kind = "") {
+    const value = String(reason || "").toLowerCase();
+    if (/^blocked bot(?: id)?:/.test(value)) return "blockedBotRejected";
+    if (/^blocked creator:/.test(value)) return "blockedCreatorRejected";
+    if (/^blocked word:/.test(value)) return "blockedWordRejected";
+    if (/^blocked tag:/.test(value) || /excluded tag|missing included tag/.test(value)) return "blockedTagRejected";
+    if (/^language:/.test(value)) return "languageRejected";
+    if (/opened chat/.test(value)) return "openedRejected";
+    if (/saved for later/.test(value)) return "laterRejected";
+    if (/not interested/.test(value)) return "notInterestedRejected";
+    if (kind === "smart") return "smartFilterRejected";
+    return "otherRejected";
+  }
+
+  function noteRefillRejection(stats, kind, reason) {
+    stats.filtered = Number(stats.filtered || 0) + 1;
+    stats.lastRejectReason = String(reason || kind || "filtered");
+    if (kind === "blocked") stats.blockedRejected = Number(stats.blockedRejected || 0) + 1;
+    else stats.filterRejected = Number(stats.filterRejected || 0) + 1;
+    if (kind === "smart") stats.smartFilterRejected = Number(stats.smartFilterRejected || 0) + 1;
+    const bucket = rejectionBucket(reason, kind);
+    if (bucket !== "smartFilterRejected") stats[bucket] = Number(stats[bucket] || 0) + 1;
+  }
+
+  function classifyLiveHiddenReason(reason) {
+    return rejectionBucket(String(reason || "").replace(/^card:/i, "").trim());
+  }
+
+  function liveListingFilterCounts() {
+    const out = {
+      total: 0, blockedBotRejected: 0, blockedCreatorRejected: 0, blockedWordRejected: 0,
+      blockedTagRejected: 0, languageRejected: 0, openedRejected: 0, laterRejected: 0,
+      notInterestedRejected: 0, smartFilterRejected: 0, otherRejected: 0
+    };
+    const seen = new Set();
+    for (const target of document.querySelectorAll("[data-ds-hidden='1'], .ds-smart-filter-hidden")) {
+      if (target.closest?.("#ds-qol-panel")) continue;
+      const link = target.querySelector?.("a[href*='/chat/'], a[href*='/chatbot/']");
+      if (!link) continue;
+      const id = botIdFromLink(link);
+      const key = id || target;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.total += 1;
+      if (target.classList?.contains("ds-smart-filter-hidden") && !target.dataset?.dsReason) {
+        out.smartFilterRejected += 1;
+        continue;
+      }
+      const bucket = classifyLiveHiddenReason(target.dataset?.dsReason || "");
+      out[bucket] = Number(out[bucket] || 0) + 1;
+    }
+    return out;
+  }
+
+  function removeListingFilterStats() {
+    document.querySelectorAll(`.${LISTING_FILTER_STATS_CLASS}`).forEach(node => node.remove());
+  }
+
+  function updateListingFilterStats() {
+    const settings = DS.state?.settings || {};
+    if (LISTING_REFILL_WORKER || !settings.enabled || !settings.showListingFilterStats) {
+      removeListingFilterStats();
+      return;
+    }
+    const nativeText = document.querySelector("[data-testid='search-stats'] .ais-Stats-text, .ais-Stats .ais-Stats-text");
+    if (!nativeText?.parentElement) { removeListingFilterStats(); return; }
+    let badge = nativeText.parentElement.querySelector(`:scope > .${LISTING_FILTER_STATS_CLASS}`);
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = LISTING_FILTER_STATS_CLASS;
+      badge.dataset.dsOwned = "1";
+      badge.dataset.dsOwner = "qol";
+      badge.dataset.dsFeature = "listing-refill-stats";
+      nativeText.insertAdjacentElement("afterend", badge);
+    }
+    const live = liveListingFilterCounts();
+    const stats = runStats();
+    const total = live.total + Number(stats.filtered || 0);
+    let text = ` · QoL: ${total} bot${total === 1 ? "" : "s"} blocked/filtered`;
+    if (settings.showListingFilterStatsDetails) {
+      const sum = key => Number(live[key] || 0) + Number(stats[key] || 0);
+      const bots = sum("blockedBotRejected");
+      const creators = sum("blockedCreatorRejected");
+      const tagsWords = sum("blockedTagRejected") + sum("blockedWordRejected");
+      const language = sum("languageRejected");
+      const savedOpened = sum("openedRejected") + sum("laterRejected") + sum("notInterestedRejected");
+      const smartOther = sum("smartFilterRejected") + sum("otherRejected");
+      const parts = [
+        bots ? `${bots} blocked bot${bots === 1 ? "" : "s"}` : "",
+        creators ? `${creators} creator${creators === 1 ? "" : "s"}` : "",
+        tagsWords ? `${tagsWords} tag/word` : "",
+        language ? `${language} language` : "",
+        savedOpened ? `${savedOpened} opened/saved` : "",
+        smartOther ? `${smartOther} other` : ""
+      ].filter(Boolean);
+      if (parts.length) text += ` (${parts.join(", ")})`;
+    }
+    if (badge.textContent !== text) badge.textContent = text;
+    badge.title = "QoL-hidden cards currently on this listing plus Listing Refill candidates rejected before insertion.";
+  }
+
+  DS.updateListingFilterStats = updateListingFilterStats;
+
+  function refillDiagSnapshot(stats = runStats()) {
+    return {
+      received: Number(stats.received || 0), appended: Number(stats.appended || 0), duplicates: Number(stats.duplicates || 0),
+      blockedRejected: Number(stats.blockedRejected || 0), blockedBotRejected: Number(stats.blockedBotRejected || 0),
+      blockedCreatorRejected: Number(stats.blockedCreatorRejected || 0), blockedWordRejected: Number(stats.blockedWordRejected || 0),
+      blockedTagRejected: Number(stats.blockedTagRejected || 0), languageRejected: Number(stats.languageRejected || 0),
+      filterRejected: Number(stats.filterRejected || 0), smartFilterRejected: Number(stats.smartFilterRejected || 0),
+      nativeRejected: Number(stats.nativeRejected || 0), postInsertRejected: Number(stats.postInsertRejected || 0),
+      staleResponses: Number(stats.staleResponses || 0), helperFailures: Number(stats.helperFailures || 0),
+      helperReuses: Number(stats.helperReuses || 0), helperRecoveries: Number(stats.helperRecoveries || 0),
+      helperGcClosed: Number(stats.helperGcClosed || 0), cacheHits: Number(stats.cacheHits || 0),
+      cacheMisses: Number(stats.cacheMisses || 0), cacheCandidatesStored: Number(stats.cacheCandidatesStored || 0),
+      cacheCandidatesUsed: Number(stats.cacheCandidatesUsed || 0), cacheCandidatesExpired: Number(stats.cacheCandidatesExpired || 0),
+      domNodesCreated: Number(stats.domNodesCreated || 0), visibleAfter: Number(stats.visibleAfter || 0)
+    };
+  }
+
+  function emitListingRefillDiagnostic(page, before, outcome = "ok", error = "") {
+    const after = refillDiagSnapshot();
+    const delta = key => Math.max(0, Number(after[key] || 0) - Number(before?.[key] || 0));
+    const received = delta("received");
+    const inserted = delta("appended");
+    const duplicatesRejected = delta("duplicates");
+    const blockedRejected = delta("blockedRejected");
+    const tagRejected = delta("blockedTagRejected");
+    const filteredRejected = delta("filterRejected");
+    const token = DS.diagOperationStart?.("listing-refill", "listing-refill", {
+      page: Number(page || 0), outcome, received, inserted, blockedRejected, tagRejected,
+      languageRejected: delta("languageRejected"), smartFilterRejected: delta("smartFilterRejected"),
+      duplicatesRejected, postInsertRejected: delta("postInsertRejected"), helperReuses: delta("helperReuses"),
+      helperRecoveries: delta("helperRecoveries"), helperGcClosed: delta("helperGcClosed"),
+      cacheHits: delta("cacheHits"), cacheMisses: delta("cacheMisses"),
+      cacheCandidatesStored: delta("cacheCandidatesStored"), cacheCandidatesUsed: delta("cacheCandidatesUsed"),
+      visibleAfter: Number(after.visibleAfter || visibleCardCount()), error: error ? String(error).slice(0, 120) : ""
+    });
+    DS.diagOperationEnd?.(token, {
+      outcome,
+      counts: {
+        scanned: received, changed: inserted,
+        skipped: blockedRejected + filteredRejected + duplicatesRejected,
+        errors: outcome === "error" ? 1 : 0
+      }
+    });
+  }
+
+  function preflightRefillCard(wrapper, link, meta, nativeRules) {
+    const nativeReason = nativeTagRejection(meta, wrapper, nativeRules);
+    if (nativeReason) return { kind: "native", reason: nativeReason };
+
+    const cardReason = DS.shouldHideCard?.(wrapper, link, {
+      discovery: true,
+      home: refillHomeContext(),
+      ignoreOpened: !!DS.smartFilterWantsOpened?.(),
+      ignoreFavorite: !!DS.smartFilterWantsFavorites?.(),
+      ignoreLater: !!DS.smartFilterWantsLater?.()
+    }) || "";
+    if (cardReason) {
+      return { kind: hardBlockRefillReason(cardReason) ? "blocked" : "filter", reason: cardReason };
+    }
+
+    const smartReason = DS.getSmartFilterRefillRejection?.(wrapper, link) || "";
+    if (smartReason) return { kind: "smart", reason: smartReason };
+    return null;
+  }
+
+  function refillCandidateCacheStore() {
+    if (!(DS.state.listingRefillCandidateCache instanceof Map)) {
+      DS.state.listingRefillCandidateCache = new Map();
+    }
+    return DS.state.listingRefillCandidateCache;
+  }
+
+  function pruneRefillCandidateCache(now = Date.now()) {
+    const store = refillCandidateCacheStore();
+    const stats = runStats();
+    let expired = 0;
+    for (const [signature, bucket] of store.entries()) {
+      const candidates = Array.isArray(bucket?.candidates) ? bucket.candidates : [];
+      const fresh = candidates.filter(item => now - Number(item?.savedAt || 0) < REFILL_CANDIDATE_CACHE_TTL_MS);
+      expired += Math.max(0, candidates.length - fresh.length);
+      if (!fresh.length) store.delete(signature);
+      else if (fresh.length !== candidates.length) store.set(signature, { ...bucket, candidates: fresh, updatedAt: now });
+    }
+    if (expired) stats.cacheCandidatesExpired = Number(stats.cacheCandidatesExpired || 0) + expired;
+
+    let total = 0;
+    const ordered = [...store.entries()].sort((a, b) => Number(a[1]?.updatedAt || 0) - Number(b[1]?.updatedAt || 0));
+    for (const [, bucket] of ordered) total += Array.isArray(bucket?.candidates) ? bucket.candidates.length : 0;
+    while (total > REFILL_CANDIDATE_CACHE_MAX && ordered.length) {
+      const [signature, bucket] = ordered.shift();
+      const count = Array.isArray(bucket?.candidates) ? bucket.candidates.length : 0;
+      store.delete(signature);
+      total -= count;
+      stats.cacheCandidatesExpired = Number(stats.cacheCandidatesExpired || 0) + count;
+    }
+    return store;
+  }
+
+  function cacheRefillCandidates(signature, page, baseUrl, payloads) {
+    const rows = (Array.isArray(payloads) ? payloads : [])
+      .filter(item => item?.html)
+      .map(item => ({
+        html: item.html,
+        meta: item.meta || null,
+        page: Number(page) || 0,
+        baseUrl: String(baseUrl || ""),
+        savedAt: Date.now()
+      }));
+    if (!signature || !rows.length) return 0;
+
+    const store = pruneRefillCandidateCache();
+    const bucket = store.get(signature) || { candidates: [], updatedAt: 0 };
+    bucket.candidates.push(...rows);
+    bucket.updatedAt = Date.now();
+    if (bucket.candidates.length > REFILL_CANDIDATE_CACHE_MAX) {
+      bucket.candidates.splice(0, bucket.candidates.length - REFILL_CANDIDATE_CACHE_MAX);
+    }
+    store.set(signature, bucket);
+
+    const stats = runStats();
+    stats.cacheCandidatesStored = Number(stats.cacheCandidatesStored || 0) + rows.length;
+    return rows.length;
+  }
+
+  async function appendCachedRefillCandidates() {
+    const signature = canonicalListingSignature(location.href);
+    const store = pruneRefillCandidateCache();
+    const bucket = store.get(signature);
+    const stats = runStats();
+    if (!bucket?.candidates?.length) {
+      stats.cacheMisses = Number(stats.cacheMisses || 0) + 1;
+      return 0;
+    }
+
+    stats.cacheHits = Number(stats.cacheHits || 0) + 1;
+    const target = Math.max(1, Math.min(200, Number(DS.state.settings?.autoFillTargetCards || 50)));
+    const slots = Math.max(0, target - visibleCardCount());
+    if (!slots) return 0;
+
+    const host = extraGrid();
+    if (!host) return 0;
+
+    const known = currentBotIds();
+    const rejectedIds = DS.state.autoFillRejectedBotIds instanceof Set
+      ? DS.state.autoFillRejectedBotIds
+      : (DS.state.autoFillRejectedBotIds = new Set());
+    const requestTagRules = currentNativeTagRules();
+    const inserted = [];
+    let appended = 0;
+    let scanned = 0;
+
+    while (bucket.candidates.length && appended < slots) {
+      const payload = bucket.candidates.shift();
+      scanned += 1;
+      if (!payload?.html) continue;
+      if (Date.now() - Number(payload.savedAt || 0) >= REFILL_CANDIDATE_CACHE_TTL_MS) {
+        stats.cacheCandidatesExpired = Number(stats.cacheCandidatesExpired || 0) + 1;
+        continue;
+      }
+
+      const wrapper = wrapperFromHtml(payload.html);
+      if (!wrapper) continue;
+      const meta = payload.meta || extractCardMetadata(wrapper, payload.baseUrl || location.href);
+      stripWorkerArtifacts(wrapper);
+
+      const link = wrapper.querySelector("a[href*='/chat/'], a[href*='/chatbot/']");
+      const id = botIdFromLink(link);
+      if (!id) continue;
+      if (known.has(id) || rejectedIds.has(id)) {
+        stats.duplicates = Number(stats.duplicates || 0) + 1;
+        continue;
+      }
+
+      const rejection = preflightRefillCard(wrapper, link, meta, requestTagRules);
+      if (rejection) {
+        rejectedIds.add(id);
+        if (rejection.kind === "native") {
+          stats.nativeRejected = Number(stats.nativeRejected || 0) + 1;
+          noteRefillRejection(stats, "filter", rejection.reason);
+        } else {
+          noteRefillRejection(stats, rejection.kind, rejection.reason);
+        }
+        continue;
+      }
+
+      known.add(id);
+      const clone = document.importNode(wrapper, true);
+      clone.setAttribute(EXTRA_CARD_ATTR, "1");
+      clone.classList.add("ds-autofill-extra-card");
+      clone.dataset.dsAutofillPage = String(payload.page || 0);
+      clone.dataset.dsAutofillSignature = signature;
+      normalizeCloneUrls(clone, payload.baseUrl || location.href);
+
+      const favoriteButton = findFavoriteActionButton(clone);
+      clone.querySelectorAll("button").forEach(button => {
+        if (button === favoriteButton || isNativeTagPillButton(button)) return;
+        button.remove();
+      });
+      stats.tagsRestored += ensureTagPillsFromMetadata(clone, meta);
+      clone.querySelectorAll("svg.lucide-ellipsis-vertical").forEach(svg => {
+        const shell = svg.closest("div.relative");
+        if (shell && !shell.querySelector("a[href]") && !shell.querySelector("button")) shell.remove();
+        else svg.remove();
+      });
+      wireRefillFavoriteButton(clone, id, payload.baseUrl || location.href);
+
+      stats.domNodesCreated = Number(stats.domNodesCreated || 0) + 1 + clone.querySelectorAll("*").length;
+      host.appendChild(clone);
+      inserted.push(clone);
+      appended += 1;
+      stats.appended = Number(stats.appended || 0) + 1;
+      stats.cacheCandidatesUsed = Number(stats.cacheCandidatesUsed || 0) + 1;
+    }
+
+    bucket.updatedAt = Date.now();
+    if (!bucket.candidates.length) store.delete(signature);
+    else store.set(signature, bucket);
+
+    if (!appended) {
+      DS.runtimeLog?.("info", "listing-refill", "Cached refill candidates had no usable survivors", {
+        scanned,
+        remaining: bucket.candidates.length
+      });
+      return 0;
+    }
+
+    DS.bumpDomRevision?.();
+    await DS.applyCardHiding?.({ force: true });
+    await DS.applySmartFilterPresets?.();
+
+    let postRejected = 0;
+    for (const clone of inserted) {
+      if (!clone?.isConnected) continue;
+      const rejected = clone.dataset.dsHidden === "1" ||
+        clone.classList.contains("ds-hidden") ||
+        clone.classList.contains("ds-smart-filter-hidden");
+      if (!rejected) continue;
+      const reason = clone.dataset.dsReason || "post-insert safety filter";
+      clone.remove();
+      postRejected += 1;
+      stats.postInsertRejected = Number(stats.postInsertRejected || 0) + 1;
+      noteRefillRejection(stats, hardBlockRefillReason(reason) ? "blocked" : "filter", reason);
+    }
+
+    if (postRejected) {
+      appended = Math.max(0, appended - postRejected);
+      stats.appended = Math.max(0, Number(stats.appended || 0) - postRejected);
+      DS.bumpDomRevision?.();
+    }
+
+    stats.visibleAfter = visibleCardCount();
+    DS.applyCardBlockButtons?.();
+    DS.updateLaterBotButtons?.();
+    DS.updateCreatorFavoriteButtons?.();
+    await DS.applyCardWorkflow?.();
+    DS.applyCardDisplayNormalization?.();
+    DS.updateQuickPanel?.();
+
+    DS.runtimeLog?.("info", "listing-refill", "Reused cached refill candidates", {
+      scanned,
+      appended,
+      remaining: bucket.candidates.length,
+      signature
+    });
+    return appended;
+  }
+
   async function appendNextPaginationPage(page) {
-    const url = listingUrlForPage(page);
+    const diagBefore = refillDiagSnapshot();
+    let diagOutcome = "ok";
+    let diagError = "";
+    try {
+    const requestSourceUrl = location.href;
+    const requestSignature = canonicalListingSignature(requestSourceUrl);
+    const requestTagRules = nativeTagRulesFromUrl(requestSourceUrl);
+    const url = listingUrlForPage(page, requestSourceUrl);
+    const runId = ensureRefillRunId();
     DS.setQuickStatus?.(`Auto-fill opening helper page ${page}...`, true);
+
     const response = await runtimeMessage({
       type: "DS_LISTING_REFILL_PAGE",
       url,
-      expectedPage: page
+      expectedPage: page,
+      runId
     });
+
+    const stats = runStats();
+    if (response?.reused) stats.helperReuses = Number(stats.helperReuses || 0) + 1;
+    if (response?.recovered) stats.helperRecoveries = Number(stats.helperRecoveries || 0) + 1;
+    if (Number(response?.gcClosed || 0) > 0) stats.helperGcClosed = Number(stats.helperGcClosed || 0) + Number(response.gcClosed || 0);
+
+    const currentSignature = canonicalListingSignature(location.href);
+    if (requestSignature !== currentSignature) {
+      stats.staleResponses = Number(stats.staleResponses || 0) + 1;
+      stats.lastRejectReason = "listing filters changed while helper page was loading";
+      DS.runtimeLog?.("info", "listing-refill", "Discarded stale helper-page response", {
+        page,
+        requestSignature,
+        currentSignature
+      });
+      return 0;
+    }
+
     if (!response?.ok) {
       throw new Error(response?.error || response?.status || "helper page failed");
     }
@@ -793,93 +1327,227 @@
       .map(item => typeof item === "string" ? { html: item, meta: null } : { html: item?.html || "", meta: item?.meta || null })
       .filter(item => item.html);
     const wrappers = payloads
-      .map(item => ({ wrapper: wrapperFromHtml(item.html), meta: item.meta }))
+      .map(item => ({ wrapper: wrapperFromHtml(item.html), meta: item.meta, html: item.html }))
       .filter(item => item.wrapper);
-    const stats = runStats();
+
     stats.pages += 1;
     stats.received += wrappers.length;
     stats.metadataExtracted += wrappers.filter(item => item.meta && typeof item.meta === "object").length;
     stats.lastPage = Number(page) || 0;
     stats.lastError = "";
+    DS.state.autoFillHelperHasNext = response.hasNextPage !== false;
+    if (response.hasNextPage === false) DS.state.autoFillReachedEnd = true;
+
     const host = extraGrid();
-    if (!host || !wrappers.length) return 0;
+    if (!host || !wrappers.length) {
+      if (wrappers.length === 0) stats.pagesWithNoSurvivors = Number(stats.pagesWithNoSurvivors || 0) + 1;
+      return 0;
+    }
+
+    const target = Math.max(1, Math.min(200, Number(DS.state.settings?.autoFillTargetCards || 50)));
+    const slots = Math.max(0, target - visibleCardCount());
+    if (!slots) {
+      cacheRefillCandidates(requestSignature, page, response.baseUrl || url, payloads);
+      return 0;
+    }
 
     const known = currentBotIds();
+    const rejectedIds = DS.state.autoFillRejectedBotIds instanceof Set
+      ? DS.state.autoFillRejectedBotIds
+      : (DS.state.autoFillRejectedBotIds = new Set());
+    const insertedThisPage = [];
     let appended = 0;
-    for (const payload of wrappers) {
+
+    for (let payloadIndex = 0; payloadIndex < wrappers.length; payloadIndex++) {
+      if (appended >= slots) {
+        cacheRefillCandidates(
+          requestSignature,
+          page,
+          response.baseUrl || url,
+          wrappers.slice(payloadIndex).map(item => ({ html: item.html, meta: item.meta }))
+        );
+        break;
+      }
+      const payload = wrappers[payloadIndex];
+
+      const liveSignature = canonicalListingSignature(location.href);
+      if (liveSignature !== requestSignature) {
+        stats.staleResponses = Number(stats.staleResponses || 0) + 1;
+        stats.lastRejectReason = "listing filters changed while helper cards were being inserted";
+        DS.runtimeLog?.("info", "listing-refill", "Stopped stale helper-card insertion", {
+          page,
+          requestSignature,
+          currentSignature: liveSignature
+        });
+        break;
+      }
+
       const wrapper = payload.wrapper;
       const meta = payload.meta || extractCardMetadata(wrapper, response.baseUrl || url);
       stripWorkerArtifacts(wrapper);
+
       const link = wrapper.querySelector("a[href*='/chat/'], a[href*='/chatbot/']");
       const id = botIdFromLink(link);
       if (!id) continue;
-      if (known.has(id)) {
-        stats.duplicates += 1;
+      if (known.has(id) || rejectedIds.has(id)) {
+        stats.duplicates = Number(stats.duplicates || 0) + 1;
         continue;
       }
+
+      // Do not append first and let the normal card hider clean up afterward.
+      // That pattern was particularly expensive on filtered Home pages because
+      // every rejected helper card still became live DOM and triggered another
+      // listing/filter pass. Detached helper cards now go through the same hard
+      // block + discovery + language + Smart Filter rules before insertion.
+      const rejection = preflightRefillCard(wrapper, link, meta, requestTagRules);
+      if (rejection) {
+        rejectedIds.add(id);
+        if (rejection.kind === "native") {
+          stats.nativeRejected = Number(stats.nativeRejected || 0) + 1;
+          noteRefillRejection(stats, "filter", rejection.reason);
+        } else {
+          noteRefillRejection(stats, rejection.kind, rejection.reason);
+        }
+        DS.runtimeLog?.("info", "listing-refill", "Rejected helper card before live DOM insertion", {
+          page,
+          botId: id,
+          kind: rejection.kind,
+          reason: rejection.reason,
+          tags: Array.isArray(meta?.tags) ? meta.tags.slice(0, 20) : []
+        });
+        continue;
+      }
+
       known.add(id);
 
       const clone = document.importNode(wrapper, true);
       clone.setAttribute(EXTRA_CARD_ATTR, "1");
       clone.classList.add("ds-autofill-extra-card");
       clone.dataset.dsAutofillPage = String(page);
+      clone.dataset.dsAutofillSignature = requestSignature;
       normalizeCloneUrls(clone, response.baseUrl || url);
 
-      // Native React handlers do not survive serialization from the helper tab.
-      // Keep normal links usable. Remove dead native action buttons, but keep
-      // the heart and rebind it to a temporary rendered SpicyChat helper page
-      // so filled cards can still be favorited normally.
       const favoriteButton = findFavoriteActionButton(clone);
       clone.querySelectorAll("button").forEach(button => {
-        // Tag pills are display-only in SpicyChat (cursor-default) and do not
-        // depend on React handlers. Keep them so filled cards retain the same
-        // tag metadata/visuals and filtering can inspect those tags immediately.
         if (button === favoriteButton || isNativeTagPillButton(button)) return;
         button.remove();
       });
       stats.tagsRestored += ensureTagPillsFromMetadata(clone, meta);
-      // SpicyChat's three-dot card menu is React-only too. After serialization
-      // it looks clickable but has no handler, so remove the dead shell and let
-      // QoL's Later / Not Interested / Block / organizer controls provide the
-      // supported filled-card actions instead. Normal chat/profile links remain.
+
       clone.querySelectorAll("svg.lucide-ellipsis-vertical").forEach(svg => {
         const shell = svg.closest("div.relative");
         if (shell && !shell.querySelector("a[href]") && !shell.querySelector("button")) shell.remove();
         else svg.remove();
       });
+
       wireRefillFavoriteButton(clone, id, response.baseUrl || url);
+      stats.domNodesCreated = Number(stats.domNodesCreated || 0) + 1 + clone.querySelectorAll("*").length;
       host.appendChild(clone);
-      appended++;
-      stats.appended += 1;
+      insertedThisPage.push(clone);
+      appended += 1;
+      stats.appended = Number(stats.appended || 0) + 1;
     }
 
-    if (appended) {
-      DS.bumpDomRevision?.();
-      await DS.applyCardHiding?.();
-      const afterVisible = visibleCardCount();
-      const afterHidden = hiddenCardCount();
-      stats.filtered = afterHidden;
-      DS.applyCardBlockButtons?.();
-      DS.updateLaterBotButtons?.();
-      DS.updateCreatorFavoriteButtons?.();
-      await DS.applyCardWorkflow?.();
-      DS.applyCardDisplayNormalization?.();
-      DS.updateQuickPanel?.();
-      DS.runtimeLog?.("info", "listing-refill", "Added rendered helper-page cards", {
-        page, appended, visible: afterVisible, hidden: afterHidden, duplicates: stats.duplicates
+    if (!appended) {
+      stats.pagesWithNoSurvivors = Number(stats.pagesWithNoSurvivors || 0) + 1;
+      DS.runtimeLog?.("info", "listing-refill", "Helper page had no usable refill survivors", {
+        page,
+        received: wrappers.length,
+        blockedRejected: stats.blockedRejected || 0,
+        filterRejected: stats.filterRejected || 0,
+        duplicates: stats.duplicates || 0
       });
+      return 0;
     }
+
+    // Safety pass: preflight should already reject anything hidden by current
+    // rules. Run the normal card/smart filters once for parity, then immediately
+    // remove a refill clone if a later/dynamic check still rejects it. Hidden
+    // refill cards therefore do not accumulate in the live DOM.
+    DS.bumpDomRevision?.();
+    await DS.applyCardHiding?.({ force: true });
+    await DS.applySmartFilterPresets?.();
+
+    let postRejected = 0;
+    for (const clone of insertedThisPage) {
+      if (!clone?.isConnected) continue;
+      const rejected = clone.dataset.dsHidden === "1" ||
+        clone.classList.contains("ds-hidden") ||
+        clone.classList.contains("ds-smart-filter-hidden");
+      if (!rejected) continue;
+      const reason = clone.dataset.dsReason || "post-insert safety filter";
+      clone.remove();
+      postRejected += 1;
+      stats.postInsertRejected = Number(stats.postInsertRejected || 0) + 1;
+      noteRefillRejection(stats, hardBlockRefillReason(reason) ? "blocked" : "filter", reason);
+    }
+
+    if (postRejected) {
+      appended = Math.max(0, appended - postRejected);
+      stats.appended = Math.max(0, Number(stats.appended || 0) - postRejected);
+      DS.bumpDomRevision?.();
+    }
+
+    if (!appended) stats.pagesWithNoSurvivors = Number(stats.pagesWithNoSurvivors || 0) + 1;
+
+    const afterVisible = visibleCardCount();
+    stats.visibleAfter = afterVisible;
+    DS.applyCardBlockButtons?.();
+    DS.updateLaterBotButtons?.();
+    DS.updateCreatorFavoriteButtons?.();
+    await DS.applyCardWorkflow?.();
+    DS.applyCardDisplayNormalization?.();
+    DS.updateQuickPanel?.();
+    DS.runtimeLog?.("info", "listing-refill", "Processed rendered helper-page cards", {
+      page,
+      received: wrappers.length,
+      appended,
+      visible: afterVisible,
+      duplicates: stats.duplicates || 0,
+      blockedRejected: stats.blockedRejected || 0,
+      blockedBotRejected: stats.blockedBotRejected || 0,
+      blockedCreatorRejected: stats.blockedCreatorRejected || 0,
+      blockedWordRejected: stats.blockedWordRejected || 0,
+      blockedTagRejected: stats.blockedTagRejected || 0,
+      languageRejected: stats.languageRejected || 0,
+      openedRejected: stats.openedRejected || 0,
+      laterRejected: stats.laterRejected || 0,
+      notInterestedRejected: stats.notInterestedRejected || 0,
+      otherRejected: stats.otherRejected || 0,
+      filterRejected: stats.filterRejected || 0,
+      smartFilterRejected: stats.smartFilterRejected || 0,
+      postInsertRejected: stats.postInsertRejected || 0,
+      nativeRejected: stats.nativeRejected || 0,
+      staleResponses: stats.staleResponses || 0,
+      domNodesCreated: stats.domNodesCreated || 0,
+      helperReuses: stats.helperReuses || 0
+    });
     return appended;
+    } catch (error) {
+      diagOutcome = "error";
+      diagError = error?.message || String(error);
+      throw error;
+    } finally {
+      emitListingRefillDiagnostic(page, diagBefore, diagOutcome, diagError);
+      updateListingFilterStats();
+    }
   }
 
   DS.resetAutoFillIfUrlChanged = function resetAutoFillIfUrlChanged() {
     if (DS.state.autoFillUrl === location.href) return;
+    const previousRunId = String(DS.state.autoFillRunId || "").trim();
+    if (previousRunId) runtimeMessage({ type: "DS_LISTING_REFILL_RELEASE", runId: previousRunId });
+    DS.state.autoFillRunId = "";
+    DS.state.autoFillRejectedBotIds = new Set();
     DS.state.autoFillUrl = location.href;
     DS.state.autoFillClicks = 0;
-    DS.state.autoFillRunning = false;
+    // The caller owns the running flag. Resetting it here allowed a route-state
+    // refresh inside an active refill step to make a second refill look idle.
     DS.state.autoFillLastClickAt = 0;
     DS.state.autoFillNextPage = currentPage() + 1;
     DS.state.autoFillLoadedPages = [];
+    DS.state.autoFillReachedEnd = false;
+    DS.state.autoFillHelperHasNext = true;
     DS.state.autoFillStopRequested = false;
     DS.state.autoFillPausedByUser = false;
     resetRunStats();
@@ -899,9 +1567,31 @@
       appended: stats.appended || 0,
       duplicates: stats.duplicates || 0,
       filtered: stats.filtered || 0,
+      blockedRejected: stats.blockedRejected || 0,
+      blockedBotRejected: stats.blockedBotRejected || 0,
+      blockedCreatorRejected: stats.blockedCreatorRejected || 0,
+      blockedWordRejected: stats.blockedWordRejected || 0,
+      blockedTagRejected: stats.blockedTagRejected || 0,
+      languageRejected: stats.languageRejected || 0,
+      openedRejected: stats.openedRejected || 0,
+      laterRejected: stats.laterRejected || 0,
+      notInterestedRejected: stats.notInterestedRejected || 0,
+      otherRejected: stats.otherRejected || 0,
+      filterRejected: stats.filterRejected || 0,
+      smartFilterRejected: stats.smartFilterRejected || 0,
+      postInsertRejected: stats.postInsertRejected || 0,
+      pagesWithNoSurvivors: stats.pagesWithNoSurvivors || 0,
       helperFailures: stats.helperFailures || 0,
+      helperReuses: stats.helperReuses || 0,
+      helperRecoveries: stats.helperRecoveries || 0,
+      helperGcClosed: stats.helperGcClosed || 0,
       metadataExtracted: stats.metadataExtracted || 0,
       tagsRestored: stats.tagsRestored || 0,
+      staleResponses: stats.staleResponses || 0,
+      nativeRejected: stats.nativeRejected || 0,
+      domNodesCreated: stats.domNodesCreated || 0,
+      visibleAfter: stats.visibleAfter || 0,
+      lastRejectReason: stats.lastRejectReason || "",
       lastError: stats.lastError || "",
       lastPage: stats.lastPage || 0,
       running: !!DS.state.autoFillRunning,
@@ -955,6 +1645,16 @@
     const visible = visibleCardCount();
     if (!manual && visible >= target) return false;
 
+    // Reuse unused candidates from recently rendered page 2/page 3/etc. before
+    // applying the page-attempt limit, because a cache hit does not open or
+    // navigate another helper page. Every cached card is checked against the
+    // *current* block/filter state before it is inserted.
+    const cachedAppended = await appendCachedRefillCandidates();
+    if (cachedAppended > 0) {
+      DS.setQuickStatus?.(`Auto-fill reused ${cachedAppended} cached ${cachedAppended === 1 ? "bot" : "bots"}.`, true);
+      return true;
+    }
+
     if ((DS.state.autoFillClicks || 0) >= maxClicks) {
       if (manual) DS.setQuickStatus?.(`Auto-fill stopped at max attempts (${maxClicks}).`);
       return false;
@@ -977,22 +1677,31 @@
       return result.grew;
     }
 
-    if (paginationNextButton()) {
-      const nextPage = Math.max(currentPage() + 1, Number(DS.state.autoFillNextPage || (currentPage() + 1)));
-      const lastPage = lastKnownPage();
-      if (lastPage > 1 && nextPage > lastPage) {
+    if (paginationNextButton() || Number(DS.state.autoFillNextPage || 0) > currentPage()) {
+      if (DS.state.autoFillReachedEnd) {
         if (manual) DS.setQuickStatus?.("Auto-fill reached the last listing page.");
         return false;
       }
 
+      const nextPage = Math.max(currentPage() + 1, Number(DS.state.autoFillNextPage || (currentPage() + 1)));
       DS.state.autoFillClicks = (DS.state.autoFillClicks || 0) + 1;
       DS.state.autoFillNextPage = nextPage + 1;
       DS.setQuickStatus?.(`Auto-fill fetching page ${nextPage}... ${DS.state.autoFillClicks}/${maxClicks}`, true);
       try {
         const appended = await appendNextPaginationPage(nextPage);
         DS.state.autoFillLoadedPages = [...new Set([...(DS.state.autoFillLoadedPages || []), nextPage])];
-        if (!appended && manual) DS.setQuickStatus?.(`Page ${nextPage} loaded, but it had no new cards to add.`);
-        return appended > 0;
+        if (!appended && manual) {
+          const more = DS.state.autoFillHelperHasNext !== false && !DS.state.autoFillReachedEnd;
+          DS.setQuickStatus?.(more
+            ? `Page ${nextPage} had no new visible cards; continuing to the next page...`
+            : `Page ${nextPage} had no new cards and appears to be the end of the listing.`);
+        }
+        // A successfully loaded page is progress even when every card on it is
+        // duplicate/filtered. Older refill logic returned false here, causing
+        // manual and automatic refill to stop after the first "empty" page.
+        // Keep walking the server-side page sequence until target/max attempts
+        // or until the helper page says there is no Next page.
+        return appended > 0 || (DS.state.autoFillHelperHasNext !== false && !DS.state.autoFillReachedEnd);
       } catch (error) {
         runStats().helperFailures += 1;
         runStats().lastError = error?.message || String(error);
@@ -1013,15 +1722,21 @@
     removeDuplicateExtraCards();
     rememberCurrentHomeDiscoveryUrl();
     ensureListingRefillButton();
+    updateListingFilterStats();
     if (DS.state.autoFillRunning) return;
+    if (!DS.state?.settings?.autoFillListings) return;
 
     DS.state.autoFillRunning = true;
+    let continuing = false;
     try {
       const clicked = await runOneAutoFillStep({ manual: false });
       const target = Math.max(1, Math.min(200, Number(DS.state.settings.autoFillTargetCards || 50)));
       const maxClicks = Math.max(1, Math.min(30, Number(DS.state.settings.autoFillMaxClicks || 8)));
-      if (clicked && !DS.state.autoFillStopRequested && visibleCardCount() < target && (DS.state.autoFillClicks || 0) < maxClicks) {
+      continuing = !!(clicked && !DS.state.autoFillStopRequested && visibleCardCount() < target && (DS.state.autoFillClicks || 0) < maxClicks);
+      if (continuing) {
         setTimeout(() => DS.applyListingAutoFill?.(), 320);
+      } else {
+        await releaseRefillPageWorker();
       }
     } finally {
       DS.state.autoFillRunning = false;
@@ -1044,8 +1759,13 @@
     DS.state.autoFillRunning = true;
     try {
       DS.resetAutoFillIfUrlChanged?.();
+      await releaseRefillPageWorker();
+      DS.state.autoFillRunId = newRefillRunId();
+      DS.state.autoFillRejectedBotIds = new Set();
       DS.state.autoFillClicks = 0;
       DS.state.autoFillNextPage = currentPage() + 1;
+      DS.state.autoFillReachedEnd = false;
+      DS.state.autoFillHelperHasNext = true;
       DS.state.autoFillStopRequested = false;
       DS.state.autoFillPausedByUser = false;
       resetRunStats();
@@ -1063,12 +1783,15 @@
       const stats = runStats();
       const stopped = !!DS.state.autoFillStopRequested;
       DS.setQuickStatus?.(stopped
-        ? `Refill stopped: ${visibleCardCount()}/${target} visible. ${stats.appended || 0} added, ${stats.duplicates || 0} duplicates skipped.`
-        : `Refill done: ${visibleCardCount()}/${target} visible. ${stats.appended || 0} added, ${stats.duplicates || 0} duplicates skipped, ${hiddenCardCount()} hidden.`);
+        ? `Refill stopped: ${visibleCardCount()}/${target} visible. ${stats.appended || 0} added, ${stats.blockedRejected || 0} blocked + ${stats.filterRejected || 0} filtered before insert, ${stats.duplicates || 0} duplicates skipped.`
+        : `Refill done: ${visibleCardCount()}/${target} visible. ${stats.appended || 0} added, ${stats.blockedRejected || 0} blocked + ${stats.filterRejected || 0} filtered before insert, ${stats.duplicates || 0} duplicates skipped.`);
     } finally {
+      await releaseRefillPageWorker();
+      DS.state.autoFillRejectedBotIds = new Set();
       DS.state.autoFillRunning = false;
       DS.state.autoFillStopRequested = false;
       ensureListingRefillButton();
+      updateListingFilterStats();
       DS.updateQuickPanel?.();
     }
   };
@@ -1237,6 +1960,10 @@
       status: "ready",
       page: actual,
       lastPage: lastKnownPage(),
+      // SpicyChat now exposes pagination in moving windows (for example only
+      // ten page buttons at once), so lastKnownPage() is not a reliable end.
+      // The actual Next button on the rendered helper page is authoritative.
+      hasNextPage: !!paginationNextButton(),
       baseUrl: location.href,
       cards: wrappers.slice(0, 120).map(wrapper => {
         const clean = wrapper.cloneNode(true);

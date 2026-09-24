@@ -13,6 +13,10 @@
   let lastSignature = "";
   let listenersInstalled = false;
   let lastPanelAutoState = null;
+  let helperRunning = false;
+  const EXPORT_HELPER_PARAM = "dsQolLorebookExport";
+  const EXPORT_TARGET_PARAM = "dsQolLorebookTarget";
+  const EXPORT_JOB_PREFIX = "dsLorebookExportJob:";
 
   function clean(value, max = 24000) {
     return String(value ?? "")
@@ -291,35 +295,263 @@
     return ok;
   }
 
+  async function updateStoredEntries(id, entries, reason = "Full Lorebook export") {
+    if (!id || !Array.isArray(entries)) return false;
+    const result = await DS.storageGet?.([KEY]) || {};
+    const store = normalizeStore(result[KEY]);
+    const previous = store.meta[id] || { id, name: currentLorebookDisplayName() || id, entries: {} };
+    const next = {
+      ...previous,
+      id,
+      firstSavedAt: Number(previous.firstSavedAt) || Date.now(),
+      lastSavedAt: Date.now(),
+      source: reason,
+      entries: { ...(previous.entries || {}) }
+    };
+    for (const entry of entries) {
+      if (!entry?.name) continue;
+      const incoming = {
+        key: clean(entry.key || entry.name, 600).toLowerCase(),
+        name: clean(entry.name, 500),
+        keywords: unique(entry.keywords || [], 12),
+        keywordsComplete: entry.keywordsComplete !== false,
+        hiddenKeywordCount: entry.keywordsComplete === false ? Math.max(0, Number(entry.hiddenKeywordCount) || 0) : 0,
+        content: clean(entry.content, 24000),
+        capturedAt: Number(entry.capturedAt) || Date.now()
+      };
+      next.entries[incoming.key] = mergeEntry(next.entries[incoming.key], incoming);
+    }
+    if (!next.name) next.name = currentLorebookDisplayName() || id;
+    return !!(await DS.storageSet?.({ [KEY]: normalizeStore({ version: 1, meta: { ...store.meta, [id]: next } }) }));
+  }
+
+  async function captureFullEntriesHere(exportToken = "") {
+    const info = routeInfo();
+    if (!info?.id || info.page !== "entries") return false;
+    const capture = DS.captureLorebookEntriesFully;
+    if (typeof capture !== "function") throw new Error("Lorebook entry crawler is not ready yet.");
+    const result = await capture({
+      progress: state => {
+        const message = state?.message || "Reading Lorebook entries…";
+        setStatus(message);
+        if (exportToken) {
+          setExportJob(exportToken, {
+            status: "working",
+            id: info.id,
+            target: "entries",
+            current: Number(state?.current) || 0,
+            total: Number(state?.total) || 0,
+            message,
+            updatedAt: Date.now()
+          }).catch(() => {});
+        }
+      }
+    });
+    if (!result?.entries?.length && !captureListEntries().length) return false;
+    return updateStoredEntries(info.id, result.entries || [], "Full Lorebook export");
+  }
+
+  function jobKey(token) { return `${EXPORT_JOB_PREFIX}${clean(token, 140)}`; }
+
+  async function setExportJob(token, value) {
+    if (!token) return false;
+    return !!(await DS.storageSet?.({ [jobKey(token)]: value }));
+  }
+
+  async function getExportJob(token) {
+    const result = await DS.storageGet?.([jobKey(token)]) || {};
+    return result[jobKey(token)] || null;
+  }
+
+  async function removeExportJob(token) {
+    if (!token) return;
+    try { await chrome.storage.local.remove(jobKey(token)); } catch {}
+  }
+
+  async function requestOppositePageCapture(info) {
+    if (!info?.id) return false;
+    const target = info.page === "entries" ? "details" : "entries";
+    const token = globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const path = target === "entries" ? `/lorebook/edit/${encodeURIComponent(info.id)}/entries` : `/lorebook/edit/${encodeURIComponent(info.id)}`;
+    const url = new URL(path, location.origin);
+    await setExportJob(token, { status: "pending", id: info.id, target, startedAt: Date.now() });
+    const opened = await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({
+          type: "DS_LOREBOOK_EXPORT_HELPER",
+          url: url.href,
+          token,
+          target,
+          id: info.id
+        }, response => {
+          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+          else resolve(response || { ok: false });
+        });
+      } catch (error) { resolve({ ok: false, error: error?.message || String(error) }); }
+    });
+    if (!opened?.ok) {
+      await removeExportJob(token);
+      throw new Error(opened?.error || "Could not open the Lorebook export helper tab.");
+    }
+    const deadline = Date.now() + 5 * 60_000;
+    let lastMessage = "";
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const job = await getExportJob(token);
+      if (job?.message && job.message !== lastMessage) {
+        lastMessage = job.message;
+        setStatus(job.message);
+      }
+      if (job?.status === "done") { await removeExportJob(token); return true; }
+      if (job?.status === "error") {
+        await removeExportJob(token);
+        throw new Error(job.error || "Lorebook export helper failed.");
+      }
+    }
+    await removeExportJob(token);
+    throw new Error("Timed out while collecting the other Lorebook tab. Try again after the Lorebook Entries page has fully loaded.");
+  }
+
+  async function waitForExportHelperReady(target, timeout = 30_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeout) {
+      const info = routeInfo();
+      if (info?.id && info.page === target) {
+        if (target === "details" && document.querySelector("form")) return info;
+        if (target === "entries" && document.querySelector("[data-testid='EntriesListServer-Header']")) return info;
+      }
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+    throw new Error(`The Lorebook ${target === "entries" ? "Entries" : "Details"} page did not become ready in time.`);
+  }
+
+  async function runExportHelperCommand(message) {
+    const token = clean(message?.token, 140);
+    const target = clean(message?.target, 20);
+    const expectedId = clean(message?.id, 200);
+    if (!token || !["details", "entries"].includes(target)) {
+      return { ok: false, error: "Invalid Lorebook export helper request." };
+    }
+    helperRunning = true;
+    document.documentElement.dataset.dsLorebookExportHelper = "1";
+    try {
+      const info = await waitForExportHelperReady(target);
+      if (expectedId && info.id !== expectedId) {
+        throw new Error("The helper opened a different Lorebook than the one being exported.");
+      }
+      await setExportJob(token, {
+        status: "working",
+        id: info.id,
+        target,
+        message: target === "entries" ? "Reading Lorebook entries…" : "Reading Lorebook details…",
+        updatedAt: Date.now()
+      });
+      await saveCapture("Lorebook full export helper");
+      if (target === "entries") {
+        const listed = captureListEntries();
+        if (listed.length) await captureFullEntriesHere(token);
+      }
+      await setExportJob(token, { status: "done", id: info.id, target, finishedAt: Date.now() });
+      return { ok: true };
+    } catch (error) {
+      const messageText = error?.message || String(error);
+      await setExportJob(token, {
+        status: "error",
+        id: expectedId,
+        target,
+        error: messageText,
+        finishedAt: Date.now()
+      });
+      return { ok: false, error: messageText };
+    } finally {
+      delete document.documentElement.dataset.dsLorebookExportHelper;
+      helperRunning = false;
+    }
+  }
+
+  try {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message?.type !== "DS_LOREBOOK_EXPORT_RUN") return false;
+      runExportHelperCommand(message)
+        .then(result => sendResponse(result))
+        .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+    });
+  } catch {}
+
+  async function maybeRunExportHelper(info) {
+    if (helperRunning || !info?.id) return false;
+    const params = new URLSearchParams(location.search || "");
+    const token = clean(params.get(EXPORT_HELPER_PARAM), 140);
+    const target = clean(params.get(EXPORT_TARGET_PARAM), 20);
+    if (!token || !["details", "entries"].includes(target) || target !== info.page) return false;
+    helperRunning = true;
+    try {
+      await new Promise(resolve => setTimeout(resolve, 900));
+      await saveCapture("Lorebook full export helper");
+      if (target === "entries") await captureFullEntriesHere(token);
+      await setExportJob(token, { status: "done", id: info.id, target, finishedAt: Date.now() });
+    } catch (error) {
+      await setExportJob(token, { status: "error", id: info.id, target, error: error?.message || String(error), finishedAt: Date.now() });
+    } finally {
+      setTimeout(() => {
+        try { chrome.runtime.sendMessage({ type: "DS_CLOSE_CURRENT_TAB" }, () => void chrome.runtime.lastError); } catch {}
+      }, 250);
+    }
+    return true;
+  }
+
   function safeFilename(value) {
     return (clean(value, 100) || "spicychat-lorebook").replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, " ").trim().slice(0, 90) || "spicychat-lorebook";
   }
 
-  function downloadJson(payload, filename) {
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1200);
+  async function downloadJson(payload, filename) {
+    const text = JSON.stringify(payload, null, 2);
+    if (typeof DS.downloadTextFile === "function") {
+      return DS.downloadTextFile(text, filename, "application/json;charset=utf-8", { requestPermission: false });
+    }
+
+    // Legacy fallback in case this module is loaded without the current Core.
+    try {
+      const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.rel = "noopener";
+      anchor.style.display = "none";
+      (document.body || document.documentElement).appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      return { ok: true, method: "link" };
+    } catch (error) {
+      return { ok: false, error: error?.message || String(error) };
+    }
   }
 
   async function exportCurrent() {
-    await saveCapture("Manual Lorebook backup");
     const info = routeInfo();
     if (!info?.id) return false;
+    setStatus("Collecting full Lorebook data…");
+    await saveCapture("Manual Lorebook backup");
+    if (info.page === "entries") await captureFullEntriesHere();
+    await requestOppositePageCapture(info);
     const result = await DS.storageGet?.([KEY]) || {};
     const item = normalizeStore(result[KEY]).meta[info.id];
     if (!item) return false;
-    downloadJson({
+    const entries = Object.values(item.entries || {});
+    const incompleteKeywords = entries.filter(entry => !entry.keywordsComplete).length;
+    const download = await downloadJson({
       format: "spicychat-qol-lorebook-backup",
       version: 1,
       exportedAt: new Date().toISOString(),
+      completeness: { details: true, entries: true, keywords: incompleteKeywords === 0 },
       lorebook: item
     }, `${safeFilename(item.name)}-lorebook-backup.json`);
+    if (!download?.ok) throw new Error(download?.error || "The Lorebook JSON could not be handed to the browser download system.");
+    if (incompleteKeywords) setStatus(`Lorebook JSON download started, but ${incompleteKeywords} entr${incompleteKeywords === 1 ? "y has" : "ies have"} incomplete keyword data.`);
+    else setStatus("Full Lorebook JSON download started.");
     return true;
   }
 
@@ -408,12 +640,22 @@
     });
     const exp = document.createElement("button");
     exp.type = "button";
-    exp.textContent = "Export Lorebook JSON";
+    exp.textContent = "Export full Lorebook JSON";
     exp.addEventListener("click", async () => {
       exp.disabled = true;
-      const ok = await exportCurrent();
-      setStatus(ok ? "Lorebook backup JSON downloaded." : "No Lorebook backup was available yet.");
-      exp.disabled = false;
+      try {
+        // Request the optional downloads permission before the long Lorebook
+        // crawl consumes the original click. This makes Firefox/Opera exports
+        // use the reliable extension download manager when permission is given.
+        try { await DS.requestDownloadPermission?.(); } catch {}
+        const ok = await exportCurrent();
+        if (!ok) setStatus("No Lorebook backup was available yet.");
+      } catch (error) {
+        console.error("[SpicyChat QoL] Full Lorebook export failed", error);
+        setStatus(`Export failed: ${error?.message || String(error)}`);
+      } finally {
+        exp.disabled = false;
+      }
     });
     const info = routeInfo();
     const history = document.createElement("button");
@@ -504,6 +746,7 @@
       return;
     }
     DS.state.lorebookBackupWasActive = true;
+    maybeRunExportHelper(info).catch(() => {});
 
     if (cfg.lorebookBackupsEnabled) installListeners();
     else {

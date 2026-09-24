@@ -15,6 +15,11 @@
   let listenersInstalled = false;
   let lastRoute = "";
   let imageRestoreIds = new Set();
+  let scanDueAt = 0;
+  let observedEditorForm = null;
+  let lastAuditSignature = "";
+  let lastImagePromptSignature = "";
+  let formReadyRetryCount = 0;
 
   function clean(value, max = 18000) {
     return String(value ?? "")
@@ -76,7 +81,7 @@
     return "";
   }
 
-  function directField(key) {
+  function directField(key, root = document) {
     const selectors = {
       greeting: ["[name='greeting']", "[name='first_message']", "[name='firstMessage']"],
       description: ["[name='description']", "[name='title']", "[name='tagline']"],
@@ -85,24 +90,24 @@
       examples: ["[name='dialogue']", "[name='example_dialogue']", "[name='exampleDialogues']"]
     }[key] || [];
     for (const selector of selectors) {
-      const node = document.querySelector(selector);
+      const node = root.querySelector?.(selector);
       if (node && !node.closest?.("#ds-qol-panel,[data-ds-qol]")) return node;
     }
     return null;
   }
 
-  function captureAuditFields() {
+  function captureAuditFields(root = document) {
     const fields = {};
     const present = new Set();
     for (const key of ["greeting", "description", "personality", "scenario", "examples"]) {
-      const control = directField(key);
+      const control = directField(key, root);
       if (!control) continue;
       present.add(key);
       const value = clean(control.value, key === "personality" || key === "examples" ? 18000 : 12000);
       if (value) fields[key] = value;
     }
     if (present.size < 5) {
-      for (const control of document.querySelectorAll("textarea,input[type='text'],input:not([type])")) {
+      for (const control of root.querySelectorAll?.("textarea,input[type='text'],input:not([type])") || []) {
         const key = semanticKey(control);
         if (!key || present.has(key)) continue;
         present.add(key);
@@ -113,30 +118,61 @@
     return { fields, present: [...present] };
   }
 
-  async function saveAuditCache(id, fields, presentKeys = []) {
+  async function saveAuditCache(id, fields, presentKeys = [], trustedEmptyKeys = []) {
     const present = new Set(Array.isArray(presentKeys) ? presentKeys : []);
-    if (!id || (!Object.keys(fields || {}).length && !present.size)) return;
+    const trustedEmpty = new Set(Array.isArray(trustedEmptyKeys) ? trustedEmptyKeys : []);
+    if (!id || (!Object.keys(fields || {}).length && !present.size && !trustedEmpty.size)) return;
+
     const result = await DS.storageGet?.([AUDIT_KEY]) || {};
     const cache = result[AUDIT_KEY] && typeof result[AUDIT_KEY] === "object" ? result[AUDIT_KEY] : { meta: {} };
     cache.meta ||= {};
+
     const previous = cache.meta[id] && typeof cache.meta[id] === "object" ? cache.meta[id] : {};
     const merged = { ...(previous.fields || {}) };
-    const empty = new Set(Array.isArray(previous.emptyKeys) ? previous.emptyKeys : []);
+
+    // Older builds stored temporarily blank mounted controls in emptyKeys.
+    // On slower React/WebView hydration that can falsely turn a filled field
+    // into "Missing". Only a trusted user edit may prove an intentional blank.
+    const knownEmpty = new Set(
+      Array.isArray(previous.trustedEmptyKeys) ? previous.trustedEmptyKeys : []
+    );
     let changed = false;
 
     for (const key of present) {
       const next = clean(fields?.[key], key === "personality" || key === "examples" ? 18000 : 12000);
+
       if (next) {
         if (merged[key] !== next) { merged[key] = next; changed = true; }
-        if (empty.delete(key)) changed = true;
-      } else {
-        if (Object.prototype.hasOwnProperty.call(merged, key)) { delete merged[key]; changed = true; }
-        if (!empty.has(key)) { empty.add(key); changed = true; }
+        if (knownEmpty.delete(key)) changed = true;
+        continue;
+      }
+
+      // Passive scans are not evidence of a genuinely empty field.
+      if (!trustedEmpty.has(key)) continue;
+
+      if (Object.prototype.hasOwnProperty.call(merged, key)) {
+        delete merged[key];
+        changed = true;
+      }
+      if (!knownEmpty.has(key)) {
+        knownEmpty.add(key);
+        changed = true;
       }
     }
 
-    if (!changed && previous.updatedAt) return;
-    cache.meta[id] = { id, fields: merged, emptyKeys: [...empty], updatedAt: Date.now() };
+    const hadLegacyEmpty = Array.isArray(previous.emptyKeys) && previous.emptyKeys.length > 0;
+    if (!changed && previous.updatedAt && !hadLegacyEmpty) return;
+
+    const nextEntry = {
+      ...previous,
+      id,
+      fields: merged,
+      trustedEmptyKeys: [...knownEmpty],
+      updatedAt: Date.now()
+    };
+    delete nextEntry.emptyKeys;
+
+    cache.meta[id] = nextEntry;
     const ids = Object.keys(cache.meta).sort((a, b) => Number(cache.meta[b]?.updatedAt || 0) - Number(cache.meta[a]?.updatedAt || 0));
     for (const oldId of ids.slice(MAX_AUDIT)) delete cache.meta[oldId];
     await DS.storageSet?.({ [AUDIT_KEY]: cache });
@@ -156,10 +192,10 @@
     return score;
   }
 
-  function findImagePromptControl() {
+  function findImagePromptControl(root = document) {
     let best = null;
     let bestScore = 0;
-    for (const control of document.querySelectorAll("textarea,input[type='text'],input:not([type])")) {
+    for (const control of root.querySelectorAll?.("textarea,input[type='text'],input:not([type])") || []) {
       if (control.closest?.("#ds-qol-panel,[data-ds-qol]")) continue;
       const score = imagePromptScore(control);
       if (score > bestScore) {
@@ -168,6 +204,33 @@
       }
     }
     return bestScore >= 6 ? best : null;
+  }
+
+  function findEditorForm() {
+    const forms = [...document.querySelectorAll("form")].filter(form => !form.closest?.("#ds-qol-panel,[data-ds-owned='1'],[data-ds-owner='qol']"));
+    let best = null;
+    let bestScore = 0;
+    for (const form of forms) {
+      let score = 0;
+      const controls = form.querySelectorAll("textarea,input[type='text'],input:not([type])");
+      score += Math.min(12, controls.length);
+      for (const control of controls) if (semanticKey(control)) score += 4;
+      if (form.querySelector("button[type='submit']")) score += 3;
+      if (score > bestScore) { best = form; bestScore = score; }
+    }
+    return bestScore >= 4 ? best : null;
+  }
+
+  function editorFormReady(form) {
+    if (!(form instanceof Element) || !form.isConnected) return false;
+    if (["greeting", "description", "personality", "scenario", "examples"].some(key => directField(key, form))) return true;
+    return [...form.querySelectorAll("textarea,input[type='text'],input:not([type])")].some(control => !!semanticKey(control));
+  }
+
+  function auditSignature(id, captured) {
+    const fields = captured?.fields || {};
+    const present = [...(captured?.present || [])].sort();
+    return JSON.stringify([id, present, present.map(key => [key, clean(fields[key], key === "personality" || key === "examples" ? 18000 : 12000)])]);
   }
 
   async function imageStore() {
@@ -179,14 +242,15 @@
 
   async function saveImagePrompt(id, prompt) {
     const value = clean(prompt, 12000);
-    if (!id || !value) return;
+    if (!id || !value) return false;
     const store = await imageStore();
     const previous = store.meta[id];
-    if (previous?.prompt === value) return;
+    if (previous?.prompt === value) return false;
     store.meta[id] = { id, prompt: value, updatedAt: Date.now() };
     const ids = Object.keys(store.meta).sort((a, b) => Number(store.meta[b]?.updatedAt || 0) - Number(store.meta[a]?.updatedAt || 0));
     for (const oldId of ids.slice(MAX_IMAGE)) delete store.meta[oldId];
     await DS.storageSet?.({ [IMAGE_KEY]: store });
+    return true;
   }
 
   async function clearImagePrompt(id) {
@@ -208,32 +272,63 @@
     control.value = prompt;
     try { control.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
     try { control.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    lastImagePromptSignature = `${id}:${prompt}`;
     control.dataset.dsRememberedImagePrompt = "1";
     control.title = control.title || "Restored by SpicyChat QoL from your local remembered image prompt";
   }
 
   function scheduleScan(delay = 120) {
+    const wait = Math.max(0, Number(delay) || 0);
+    const dueAt = Date.now() + wait;
+    // Keep an already-scheduled earlier scan instead of repeatedly pushing it
+    // back while React is mounting/rerendering the editor.
+    if (scanTimer && scanDueAt && scanDueAt <= dueAt) return;
     clearTimeout(scanTimer);
+    scanDueAt = dueAt;
     scanTimer = setTimeout(() => {
       scanTimer = null;
+      scanDueAt = 0;
       scan().catch(() => {});
-    }, delay);
+    }, wait);
   }
 
   async function scan() {
     const id = editorId();
     if (!id) return;
     const settings = DS.state?.settings || {};
+    const form = findEditorForm();
+    if (!editorFormReady(form)) {
+      observedEditorForm = null;
+      formReadyRetryCount += 1;
+      if (formReadyRetryCount <= 6) scheduleScan(Math.min(2400, 320 * (2 ** Math.min(3, formReadyRetryCount - 1))));
+      return;
+    }
+    formReadyRetryCount = 0;
+    observedEditorForm = form;
+
     if (settings.enableCreationAudit) {
-      const captured = captureAuditFields();
-      if (captured.present.length) await saveAuditCache(id, captured.fields, captured.present);
+      const captured = captureAuditFields(form);
+      if (captured.present.length) {
+        const signature = auditSignature(id, captured);
+        if (signature !== lastAuditSignature) {
+          await saveAuditCache(id, captured.fields, captured.present);
+          lastAuditSignature = signature;
+          const perf = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+          perf.botEditorAuditMeaningfulScans = Number(perf.botEditorAuditMeaningfulScans || 0) + 1;
+        }
+      }
     }
     if (settings.rememberBotImagePrompt) {
-      const control = findImagePromptControl();
+      const control = findImagePromptControl(form);
       if (control) {
         const current = clean(control.value, 12000);
-        if (current) await saveImagePrompt(id, current);
-        else await restoreImagePrompt(id, control);
+        const signature = current ? `${id}:${current}` : "";
+        if (current && signature !== lastImagePromptSignature) {
+          await saveImagePrompt(id, current);
+          lastImagePromptSignature = signature;
+        } else if (!current) {
+          await restoreImagePrompt(id, control);
+        }
       }
     }
   }
@@ -248,7 +343,7 @@
       if (id && value) {
         imageSaveTimer = setTimeout(() => {
           imageSaveTimer = null;
-          saveImagePrompt(id, value).catch(() => {});
+          saveImagePrompt(id, value).then(() => { lastImagePromptSignature = `${id}:${value}`; }).catch(() => {});
         }, 500);
       } else if (id && event.isTrusted) {
         imageSaveTimer = setTimeout(() => {
@@ -257,7 +352,22 @@
         }, 500);
       }
     }
-    if (settings.enableCreationAudit && semanticKey(event.target)) scheduleScan(450);
+    if (settings.enableCreationAudit) {
+      const auditKey = semanticKey(event.target);
+      if (auditKey) {
+        // Only a real user edit may prove an intentionally empty creator field.
+        // Synthetic hydration/change events never create a Missing result.
+        if (event.isTrusted) {
+          const limit = auditKey === "personality" || auditKey === "examples" ? 18000 : 12000;
+          const value = clean(event.target?.value, limit);
+          if (!value) {
+            const id = editorId();
+            if (id) saveAuditCache(id, {}, [auditKey], [auditKey]).catch(() => {});
+          }
+        }
+        scheduleScan(450);
+      }
+    }
   }
 
   function install() {
@@ -265,7 +375,26 @@
     listenersInstalled = true;
     document.addEventListener("input", onInput, true);
     document.addEventListener("change", onInput, true);
-    observer = new MutationObserver(() => scheduleScan(180));
+    observer = new MutationObserver(mutations => {
+      let relevant = false;
+      for (const mutation of mutations) {
+        if (DS.mutationIsQolOnly?.(mutation)) continue;
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+        if (observedEditorForm?.isConnected && (observedEditorForm.contains(target) || target?.contains?.(observedEditorForm))) {
+          relevant = true;
+          break;
+        }
+        for (const node of mutation.addedNodes || []) {
+          if (!(node instanceof Element) || DS.isQolOwnedNode?.(node)) continue;
+          if (node.matches?.("form,textarea,input[type='text'],input:not([type])") || node.querySelector?.("form,textarea,input[type='text'],input:not([type])")) {
+            relevant = true;
+            break;
+          }
+        }
+        if (relevant) break;
+      }
+      if (relevant) scheduleScan(180);
+    });
     observer.observe(document.documentElement, { childList: true, subtree: true });
   }
 
@@ -273,6 +402,7 @@
     DS.state.botEditorLocalMemoryWasActive = false;
     if (scanTimer) clearTimeout(scanTimer);
     scanTimer = null;
+    scanDueAt = 0;
     if (imageSaveTimer) clearTimeout(imageSaveTimer);
     imageSaveTimer = null;
     observer?.disconnect();
@@ -283,6 +413,10 @@
       listenersInstalled = false;
     }
     imageRestoreIds.clear();
+    observedEditorForm = null;
+    lastAuditSignature = "";
+    lastImagePromptSignature = "";
+    formReadyRetryCount = 0;
   }
 
   DS.getCachedOwnerAuditFields = async function getCachedOwnerAuditFields(idValue) {
@@ -291,15 +425,22 @@
     const result = await DS.storageGet?.([AUDIT_KEY, DS.BOT_ARCHIVE_KEY || "botArchive"]) || {};
     const cacheEntry = result[AUDIT_KEY]?.meta?.[id] || {};
     const cacheFields = cacheEntry.fields || {};
-    const knownEmpty = new Set(Array.isArray(cacheEntry.emptyKeys) ? cacheEntry.emptyKeys : []);
+    // Ignore legacy emptyKeys: passive scans could write them before React
+    // hydrated the real field values. Only trustedEmptyKeys can suppress a
+    // stale archive value and count as verified-empty.
+    const knownEmpty = new Set(
+      Array.isArray(cacheEntry.trustedEmptyKeys) ? cacheEntry.trustedEmptyKeys : []
+    );
     const archive = result[DS.BOT_ARCHIVE_KEY || "botArchive"]?.meta?.[id];
     const archiveFields = archive?.fields || {};
     const out = {};
     const verified = {};
     for (const key of ["greeting", "description", "personality", "scenario", "examples"]) {
       const archiveKey = key === "examples" ? "exampleDialogues" : key;
-      const cached = clean(cacheFields[key] || "", key === "personality" || key === "examples" ? 18000 : 12000);
-      const value = cached || (!knownEmpty.has(key) ? clean(archiveFields[archiveKey] || "", key === "personality" || key === "examples" ? 18000 : 12000) : "");
+      const limit = key === "personality" || key === "examples" ? 18000 : 12000;
+      const cached = clean(cacheFields[key] || "", limit);
+      const archived = clean(archiveFields[archiveKey] || "", limit);
+      const value = cached || (!knownEmpty.has(key) ? archived : "");
       if (value) out[key] = value;
       if (cached || knownEmpty.has(key)) verified[key] = true;
     }
@@ -318,10 +459,13 @@
       lastRoute = "";
       return;
     }
+    const route = `${location.pathname}:${id}`;
+    const routeChanged = lastRoute !== route;
+    if (routeChanged) formReadyRetryCount = 0;
     DS.state.botEditorLocalMemoryWasActive = true;
-    lastRoute = `${location.pathname}:${id}`;
+    lastRoute = route;
     install();
-    scheduleScan(80);
+    if (routeChanged || !observedEditorForm?.isConnected) scheduleScan(80);
   };
 
   DS.removeBotEditorLocalMemory = cleanup;

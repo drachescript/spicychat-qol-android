@@ -101,7 +101,8 @@
 
   function setManagerStatus(message) {
     const node = document.querySelector(`#${TOOLBAR_ID} .ds-lb-manager-status`);
-    if (node) node.textContent = message || "";
+    const next = message || "";
+    if (node && node.textContent !== next) node.textContent = next;
   }
 
   function saveSettingsPatch(patch) {
@@ -242,23 +243,52 @@
   function findEntryRows() {
     const root = document.querySelector("[data-testid='EntriesListServer-Header']")?.parentElement;
     if (!root) return [];
+
     return [...root.querySelectorAll("button[type='button']")]
       .filter(button => button.offsetParent !== null)
       .filter(button => !button.dataset.testid)
       .filter(button => {
         if (button.closest(`#${TOOLBAR_ID},.ds-lb-row-tools,.ds-lorebook-entry-toggle-wrap`)) return false;
-        const ps = [...button.querySelectorAll("p")];
-        return ps.some(p => clean(p.textContent, 200).length > 0) && ps.some(p => clean(p.textContent, 5000).length > 30);
+
+        // Native Lorebook entry cards can contain extremely short content.
+        // Do not use content length as an entry detector: it made valid rows
+        // disappear from the crawler and produced “No Lorebook entries…” in
+        // Firefox/Opera even while the rows were visibly loaded.
+        const nativeShape = button.classList.contains("w-full") &&
+          button.classList.contains("items-start") &&
+          button.classList.contains("justify-between");
+        if (!nativeShape) return false;
+
+        const nameNode = button.querySelector(
+          "[data-tooltip-content] > p.text-label-md, p.text-label-md.line-clamp-1"
+        );
+        const name = clean(nameNode?.textContent, 200);
+        if (!name) return false;
+
+        // Entry cards expose at least the name plus keyword/content metadata.
+        const metaNodes = button.querySelectorAll("p.text-label-sm,[data-tooltip-content]");
+        return metaNodes.length > 0;
       });
   }
 
   function rowInfo(row) {
     if (!row) return null;
     const ps = [...row.querySelectorAll("p")];
-    const name = clean(ps.find(p => /line-clamp-1/.test(String(p.className || "")) && clean(p.textContent, 100).length > 0)?.textContent || ps[0]?.textContent, 50);
-    const contentNode = ps.filter(p => clean(p.textContent, 5000).length > 30).sort((a,b) => clean(b.textContent,5000).length-clean(a.textContent,5000).length)[0];
-    const content = clean(contentNode?.textContent, 12000);
-    const keywordLine = ps.find(p => /line-clamp-1/.test(String(p.className || "")) && p !== ps[0] && /,/.test(clean(p.textContent, 500)));
+    const nameNode = row.querySelector("[data-tooltip-content] > p.text-label-md, p.text-label-md.line-clamp-1") || ps[0];
+    const name = clean(nameNode?.textContent, 50);
+
+    const tooltipValues = [...row.querySelectorAll("[data-tooltip-content]")]
+      .map(node => clean(node.getAttribute("data-tooltip-content"), 12000))
+      .filter(Boolean);
+    const content = tooltipValues
+      .filter(value => value !== name)
+      .sort((a, b) => b.length - a.length)[0] || "";
+
+    const keywordLine = ps.find(p =>
+      p !== nameNode &&
+      /line-clamp-1/.test(String(p.className || "")) &&
+      /,/.test(clean(p.textContent, 500))
+    );
     const keywords = unique(String(keywordLine?.textContent || "").split(/\s*,\s*/g), 12);
     const hidden = Number(ps.find(p => /^\+\d+$/.test(clean(p.textContent, 20)))?.textContent?.replace("+", "")) || 0;
     return { name, content, keywords, hiddenKeywordCount: hidden, tokens: approxTokens(content) };
@@ -343,15 +373,19 @@
       if (cfg.lorebookEntryShowHiddenKeywordCount !== false && hiddenKeywordCount) bits.push(`+${hiddenKeywordCount} hidden keywords`);
       if (cfg.lorebookEntryShowNoKeywordsWarning !== false && !keys.length && !hiddenKeywordCount) bits.push("no keywords");
       if (cfg.lorebookEntryShowCharacterCount !== false && contentLength >= 1800) bits.push(`${contentLength.toLocaleString()}/2,000 chars`);
-      label.textContent = bits.join(" · ");
-      label.hidden = !bits.length;
+      const nextText = bits.join(" · ");
+      if (label.textContent !== nextText) label.textContent = nextText;
+      const nextHidden = !bits.length;
+      if (label.hidden !== nextHidden) label.hidden = nextHidden;
       const bad = cfg.lorebookEntryShowCharacterCount !== false && contentLength > 2000;
       const warn = (cfg.lorebookEntryShowNoKeywordsWarning !== false && !keys.length && !hiddenKeywordCount) ||
         (cfg.lorebookEntryShowCharacterCount !== false && contentLength >= 1800);
-      label.className = bad ? "ds-lb-entry-bad" : (warn ? "ds-lb-entry-warn" : "");
+      const nextClass = bad ? "ds-lb-entry-bad" : (warn ? "ds-lb-entry-warn" : "");
+      if (label.className !== nextClass) label.className = nextClass;
     } else if (label) {
-      label.hidden = true;
-      label.textContent = "";
+      if (!label.hidden) label.hidden = true;
+      if (label.textContent) label.textContent = "";
+      if (label.className) label.className = "";
     }
     return tools;
   }
@@ -642,7 +676,10 @@
 
   function flashDraftStatus(message) {
     const node = lastDraftModal?.root?.querySelector?.(".ds-lb-draft-status");
-    if (node) node.textContent = message || "";
+    const next = message || "";
+    if (!node) return;
+    if (typeof DS.setTextIfChanged === "function") DS.setTextIfChanged(node, next);
+    else if (node.textContent !== next) node.textContent = next;
   }
 
   async function restoreDraft(parts, draft) {
@@ -1080,10 +1117,17 @@
 
   async function exportRows(rows) {
     if (!rows?.length) return setManagerStatus("Select at least one entry first.");
+    try { await DS.requestDownloadPermission?.(); } catch {}
     const payload = [];
     for (const row of rows) payload.push(await captureRow(row));
-    const blob = new Blob([JSON.stringify({format:"spicychat-qol-lorebook-selected",version:1,exportedAt:new Date().toISOString(),entries:payload}, null, 2)], {type:"application/json"});
-    const url = URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=`lorebook-selected-${Date.now()}.json`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+    const text = JSON.stringify({format:"spicychat-qol-lorebook-selected",version:1,exportedAt:new Date().toISOString(),entries:payload}, null, 2);
+    const result = await DS.downloadTextFile?.(
+      text,
+      `lorebook-selected-${Date.now()}.json`,
+      "application/json;charset=utf-8",
+      { requestPermission: false }
+    );
+    if (result && !result.ok) return setManagerStatus(`Export failed: ${result.error || "browser download failed"}`);
     setManagerStatus(`Exported ${payload.length} selected entr${payload.length===1?'y':'ies'}.`);
   }
 
@@ -1247,7 +1291,42 @@
     document.querySelectorAll(".ds-lb-row-tools,.ds-lb-edit-page-shortcut,[data-ds-edit-lorebook-menu],.ds-lb-draft-banner").forEach(n=>n.remove());
   };
 
+  DS.captureLorebookEntriesFully = async function captureLorebookEntriesFully({ progress } = {}) {
+    const route = lorebookRoute();
+    if (!route?.id || route.page !== "entries") throw new Error("Open the Lorebook Entries page to collect full entry data.");
+    const rows = findEntryRows();
+    if (!rows.length) throw new Error("No Lorebook entries are loaded yet.");
+    const entries = [];
+    const wasBusy = bulkBusy;
+    bulkBusy = true;
+    try {
+      for (let index = 0; index < rows.length; index += 1) {
+        progress?.({ current: index + 1, total: rows.length, message: `Reading entry ${index + 1}/${rows.length}…` });
+        const data = await captureRow(rows[index]);
+        const name = clean(data?.name, 50);
+        if (!name) continue;
+        entries.push({
+          key: name.toLowerCase(),
+          name,
+          keywords: unique(data?.keywords || [], 12),
+          keywordsComplete: true,
+          hiddenKeywordCount: 0,
+          content: clean(data?.content, 24000),
+          capturedAt: Date.now()
+        });
+      }
+      progress?.({ current: rows.length, total: rows.length, message: `Read ${entries.length} entr${entries.length === 1 ? "y" : "ies"} with complete keywords.` });
+      return { id: route.id, entries, complete: true };
+    } finally {
+      bulkBusy = wasBusy;
+    }
+  };
+
   DS.applyLorebookWorkflowTools = async function applyLorebookWorkflowTools(){
+    if (document.documentElement.dataset.dsLorebookExportHelper === "1") {
+      DS.removeLorebookWorkflowTools?.();
+      return;
+    }
     ensureStyle(); installTabIntentListener(); installHistoryGuard(); maybeDefaultToEntries();
     await applyPreferredSort().catch(()=>{});
     ensureManagerToolbar();

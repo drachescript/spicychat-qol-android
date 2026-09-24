@@ -29,6 +29,7 @@ const GENERATION_PROFILES_KEY = "generationProfiles";
 const AUTO_AFK_STATUS_KEY = "dsAutoAfkLastScan";
 const DUPLICATE_TAB_STATUS_KEY = "dsDuplicateTabLastScan";
 const SAI_TOOLKIT_PRESENCE_KEY = "dsSaiToolkitPresence";
+const SPICYCHAT_BETA_CAPABILITIES_KEY = "dsSpicyChatBetaCapabilitiesV1";
 const RELEASE_NOTICE_KEY = "dsReleaseNotice";
 const LAST_SEEN_VERSION_KEY = "dsLastSeenReleaseVersion";
 const SMART_FILTER_PRESETS_KEY = "dsSmartFilterPresets";
@@ -47,9 +48,22 @@ const CHAT_BACKGROUNDS_KEY = "chatBackgroundMediaV1";
 const QUICK_DISLIKE_HISTORY_KEY = "quickDislikeHistoryV1";
 const QUICK_DISLIKE_BULK_STATE_KEY = "quickDislikeBulkStateV1";
 const BULK_DISLIKE_FAILURE_PAUSE_THRESHOLD = 3;
+const BULK_DISLIKE_RETRY_LIMIT = 2;
+const BULK_DISLIKE_RETRY_BASE_MS = 1200;
+const BULK_DISLIKE_TRANSIENT_STATUSES = new Set([
+  "worker-timeout",
+  "worker-tab-failed",
+  "worker-closed",
+  "rating-button-not-found",
+  "rating-modal-not-found",
+  "done-button-not-ready",
+  "submit-not-confirmed",
+  "worker-error",
+  "failed"
+]);
 const TAB_CLEANUP_TOPICS_KEY = "tabCleanupTopics";
 const RECOVERY_SNAPSHOT_KEY = "dsRecoverySnapshotV1";
-const BACKUP_FORMAT_VERSION = 11;
+const BACKUP_FORMAT_VERSION = 12;
 
 const OPTIONS_PERFORMANCE = {
   bootStartedAt: typeof performance !== "undefined" ? performance.now() : 0,
@@ -129,7 +143,10 @@ function applyOptionsAccessibilityPreview(settings = {}) {
 }
 
 const OLD_DEFAULT_OOC_TEMPLATE = "[OOC: Never control Lukas or the user in any way. Do not speak for Lukas. Do not describe what Lukas thinks, feels, wants, notices, decides, does, or how he reacts. Do not move Lukas forward in the scene. Only the user may write Lukas's words, actions, thoughts, emotions, expressions, and decisions. You may control only your character, NPCs, side characters, enemies, and the environment. End every response in a way that leaves Lukas free to respond.]";
+const DEFAULT_OOC_TEMPLATE_ID = "builtin-strict-no-control";
+const HARD_OOC_TEMPLATE_ID = "builtin-hard-no-control";
 const DEFAULT_OOC_TEMPLATE = "[OOC: Never control {user} or the user in any way. Do not speak for {user}. Do not describe what {user} thinks, feels, wants, notices, decides, does, or how {user} reacts. Do not move {user} forward in the scene. Only the user may write {user}'s words, actions, thoughts, emotions, expressions, and decisions. You may control only your character, NPCs, side characters, enemies, and the environment. End every response in a way that leaves {user} free to respond.]";
+const HARD_OOC_TEMPLATE = "[OOC: Never control {user} or the user in any way. Do not speak for {user}. Do not describe what {user} thinks, feels, wants, notices, decides, remembers, assumes, understands, intends, or how {user} reacts. Do not describe {user}'s facial expressions, body language, physical reactions, involuntary reactions, attention, focus, attraction, arousal, fear, embarrassment, surprise, discomfort, pleasure, or any other internal or external response unless the user explicitly wrote it first. Do not move {user} forward in the scene. Do not make {user} walk, sit, stand, turn, look, nod, shake their head, smile, laugh, sigh, blush, tense, relax, freeze, tremble, touch someone, pull away, approach, leave, eat, drink, sleep, wake, or perform any other action unless the user explicitly wrote that action first. If the user begins an action, do not continue, complete, alter, or finish that action for them. Characters may touch, speak to, approach, flirt with, question, or interact with {user}, but only describe the character's actions and stop before describing {user}'s response. NPCs may form opinions or assumptions about {user}, but those assumptions must remain clearly the NPC's perspective and must never be treated as confirmed narration or fact. Never use narration such as {user} can't help but, {user} finds themselves, {user} realizes, {user} notices, {user} feels, {user} wants, {user} knows, despite themselves, or before {user} can react unless the user explicitly established it. Do not move or control {user} during time skips. You may control only your character, NPCs, side characters, enemies, animals, crowds, and the environment. For formatting, write all narration, actions, environmental description, and nonverbal behavior in italics. Write dialogue in the format Character Name: dialogue. Do not use quotation marks around dialogue. Do not bold character names. Do not put narration in parentheses. Use a new paragraph when the speaker changes. Keep replies medium-length, cohesive, concrete, and story-focused. Avoid repetitive exposition, artificial cliffhangers, and cutting scenes short just to force continuation. End every response in a way that leaves {user} completely free to respond.]";
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -369,6 +386,7 @@ const DEFAULT_SETTINGS = {
   expandLongCardDescriptions: false,
   showCardGreetingTokenInfo: false,
   showExactMessageCounts: false,
+  showBotCreationDates: false,
   cardTokenShowGreeting: true,
   cardTokenShowDescription: false,
   cardTokenShowPersonality: false,
@@ -450,6 +468,8 @@ const DEFAULT_SETTINGS = {
 
   autoFillListings: false,
   showListingRefillButton: false,
+  showListingFilterStats: false,
+  showListingFilterStatsDetails: false,
   autoFillTargetCards: 50,
   autoFillMaxClicks: 8,
 
@@ -532,7 +552,10 @@ const DEFAULT_SETTINGS = {
   chatExportDefaultFormat: "text",
   chatExportHtmlLayout: "bubbles",
   showOocTools: false,
-  oocTemplates: [{ name: "Strict no-control", text: DEFAULT_OOC_TEMPLATE }],
+  oocTemplates: [
+    { id: DEFAULT_OOC_TEMPLATE_ID, name: "Strict no-control", text: DEFAULT_OOC_TEMPLATE, builtIn: true },
+    { id: HARD_OOC_TEMPLATE_ID, name: "Hard no-control + formatting", text: HARD_OOC_TEMPLATE, builtIn: true }
+  ],
 
   enableReplyInstructions: false,
   replyInstructionText: "",
@@ -670,6 +693,9 @@ const DEFAULT_SETTINGS = {
   pauseQolWhileMessageEditing: true,
   reduceQolAnimations: false,
   reduceOptionsAnimations: false,
+  settingsNavigationStyle: "classic",
+  settingsContentLayout: "single",
+  settingsPageWidth: "comfortable",
   collapseSettingsSectionsByDefault: false,
   enableCommandPalette: false,
   commandPaletteShortcut: "ctrl-k",
@@ -1509,6 +1535,7 @@ const FEATURE_CHANGE_MARKERS = {
   personaShowLocalMetaInPicker: { version: "0.1.8.79", label: "New" },
   showCardGreetingTokenInfo: { version: "0.1.8.97", label: "Updated" },
   showExactMessageCounts: { version: "0.1.9.112", label: "New" },
+  showBotCreationDates: { version: "0.2.14", label: "New" },
   cardTokenShowGreeting: { version: "0.1.8.97", label: "New" },
   cardTokenShowPersonality: { version: "0.1.8.97", label: "New" },
   cardTokenShowScenario: { version: "0.1.8.97", label: "New" },
@@ -1572,6 +1599,8 @@ const FEATURE_CHANGE_MARKERS = {
   quickDislikeIdleMinutes: { version: "0.1.9.86", label: "New" },
   blockedBulkDislikeDelayMs: { version: "0.1.9.92", label: "Updated" },
   autoFillListings: { version: "0.1.9.62", label: "Updated" },
+  showListingFilterStats: { version: "0.2.14", label: "New" },
+  showListingFilterStatsDetails: { version: "0.2.14", label: "New" },
   textNormalizationEnabled: { version: "0.1.9.61", label: "Updated" },
   scrollNavOnHome: { version: "0.1.9.31", label: "New" },
   scrollNavOnChats: { version: "0.1.9.31", label: "New" },
@@ -1768,6 +1797,7 @@ const OPTIONAL_FEATURE_KEYS = [
   "expandLongCardDescriptions",
   "showCardGreetingTokenInfo",
   "showExactMessageCounts",
+  "showBotCreationDates",
   "hideGroupChats",
   "showLorebookFilters",
   "enableSmartFilterPresets",
@@ -1802,6 +1832,8 @@ const OPTIONAL_FEATURE_KEYS = [
   "normalizeInvisibleCharacters",
   "normalizeDecorativeSymbols",
   "autoFillListings",
+  "showListingFilterStats",
+  "showListingFilterStatsDetails",
   "trackOpenedChats",
   "importOpenedFromChatsPage",
   "hideOpenedChats",
@@ -4263,6 +4295,8 @@ function setupSettingsSearch() {
   const SEARCH_ALIASES = {
     autoFillListings: "refill fill page listing autofill hidden cards",
     showListingRefillButton: "refill fill now manual listing",
+    showListingFilterStats: "bot blocking filters blocked filtered bots result count stats results found listing statistics",
+    showListingFilterStatsDetails: "bot blocking filters blocked filtered breakdown details language tags words creators listing statistics",
     autoLoadMyCreations: "my creations automatic auto load more bots pages creator",
     myCreationsAutoLoadPages: "my creations auto load more pages batches count",
     enableChatBackgrounds: "background wallpaper image custom chat",
@@ -4284,7 +4318,10 @@ function setupSettingsSearch() {
     enableBulkCardBlocking: "select bots bulk blocking multi select bot cards home recommendations creator pages",
     bulkCardBlockingSidebarLauncher: "select bots placement narrow by group size sidebar",
     rememberBotImagePrompt: "remember save restore chatbot character image generation prompt edit editor refresh",
-    collapseSettingsSectionsByDefault: "settings sections collapsed collapse options dropdown dropdowns accordion accordions less scrolling compact settings",
+    settingsNavigationStyle: "settings layout navigation tabs classic grouped categories options appearance",
+  settingsContentLayout: "settings layout cards single column adaptive columns two column options appearance",
+  settingsPageWidth: "settings layout width comfortable wide full page options appearance",
+  collapseSettingsSectionsByDefault: "settings sections collapsed collapse options dropdown dropdowns accordion accordions less scrolling compact settings",
     enableCommandPalette: "command palette ctrl k shortcut quick search navigation actions control center",
     commandPaletteShortcut: "keyboard shortcut hotkey ctrl k command palette",
     commandPaletteShowSavedItems: "command palette saved bots lorebooks personas favorites later",
@@ -4767,7 +4804,10 @@ function normalizeOocTemplates(input) {
   }
 
   if (!items.length) {
-    items = [{ name: "Strict no-control", text: DEFAULT_OOC_TEMPLATE }];
+    items = [
+      { id: DEFAULT_OOC_TEMPLATE_ID, name: "Strict no-control", text: DEFAULT_OOC_TEMPLATE, builtIn: true },
+      { id: HARD_OOC_TEMPLATE_ID, name: "Hard no-control + formatting", text: HARD_OOC_TEMPLATE, builtIn: true }
+    ];
   }
 
   return items
@@ -4793,7 +4833,8 @@ function normalizeOocTemplates(input) {
       return {
         id: String(item.id || `ooc-${Date.now()}-${index}`),
         name: String(item.name || item.title || "").trim() || oocNameFromText(text, index),
-        text
+        text,
+        builtIn: item.builtIn === true
       };
     })
     .filter(Boolean);
@@ -4809,6 +4850,24 @@ function oocTemplatesFromPage() {
       text: row.querySelector(".ooc-template-text")?.value?.trim() || ""
     }))
   );
+}
+
+function oocInnerBody(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^\[OOC\s*:\s*([\s\S]*?)\]$/i);
+  return match ? match[1].trim() : text;
+}
+
+function appendOocRules(baseValue, additionValue) {
+  const base = String(baseValue || "").trim();
+  const additionBody = oocInnerBody(additionValue);
+  if (!additionBody) return base;
+  const baseBody = oocInnerBody(base);
+  const norm = value => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (norm(baseBody).includes(norm(additionBody))) return base;
+  if (!baseBody) return `[OOC: ${additionBody}]`;
+  if (/^\[OOC\s*:/i.test(base) && /\]$/.test(base)) return `[OOC: ${baseBody} ${additionBody}]`;
+  return `${base}\n\n[OOC: ${additionBody}]`;
 }
 
 function renderOocTemplates(templates) {
@@ -4831,12 +4890,19 @@ function renderOocTemplates(templates) {
     nameInput.value = template.name;
     nameLabel.appendChild(nameInput);
 
+    const appendHard = makeElement("button", {
+      className: "ooc-template-append-hard",
+      text: "+ Hard rules",
+      attrs: { type: "button", title: "Append the built-in hard no-control and formatting rules without replacing this OOC" }
+    });
+    if (template.id === HARD_OOC_TEMPLATE_ID || template.text === HARD_OOC_TEMPLATE) appendHard.hidden = true;
+
     const remove = makeElement("button", {
       className: "ooc-template-remove",
       text: "×",
       attrs: { type: "button", title: "Remove this OOC" }
     });
-    head.append(nameLabel, remove);
+    head.append(nameLabel, appendHard, remove);
 
     const textLabel = makeElement("label", {}, [document.createTextNode("Text")]);
     const textarea = makeElement("textarea", {
@@ -4851,6 +4917,22 @@ function renderOocTemplates(templates) {
   });
 
   host.replaceChildren(...cards);
+
+  host.querySelectorAll(".ooc-template-append-hard").forEach(button => {
+    button.addEventListener("click", () => {
+      const card = button.closest(".ooc-template-card");
+      const textarea = card?.querySelector(".ooc-template-text");
+      if (!textarea) return;
+      const next = appendOocRules(textarea.value, HARD_OOC_TEMPLATE);
+      if (next === textarea.value) {
+        showSettingsToast("Those hard OOC rules are already present.");
+        return;
+      }
+      textarea.value = next;
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      showSettingsToast("Hard OOC rules appended without replacing your existing text.");
+    });
+  });
 
   host.querySelectorAll(".ooc-template-remove").forEach(button => {
     button.addEventListener("click", () => {
@@ -5081,6 +5163,18 @@ const BOT_ARCHIVE_FIELDS = [
   "exampleDialogues", "tags", "visibility", "creator", "image",
   "messageCount", "rating", "tokenCount"
 ];
+const BOT_VERSION_FIELDS = ["name", "title", "greeting", "personality", "scenario", "exampleDialogues", "tags", "image"];
+const BOT_VERSION_LABELS = {
+  name: "Name",
+  title: "Title",
+  greeting: "Greeting",
+  personality: "Personality",
+  scenario: "Scenario",
+  exampleDialogues: "Example Dialogues",
+  tags: "Tags",
+  image: "Avatar / image",
+  lorebook: "Lorebook"
+};
 const BOT_ARCHIVE_LABELS = {
   name: "Name",
   title: "Title",
@@ -5160,6 +5254,60 @@ function cleanBotArchiveText(value, max = 14000) {
     .slice(0, max);
 }
 
+function normalizeBotVersionTags(value) {
+  const values = String(value || "")
+    .split(/\s*,\s*/g)
+    .map(tag => cleanBotArchiveText(tag, 120))
+    .filter(Boolean);
+  const deduped = [...new Map(values.map(tag => [tag.toLocaleLowerCase(), tag])).values()];
+  deduped.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  return deduped.join(", ");
+}
+
+function normalizeBotVersionContent(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const content = {};
+  for (const field of BOT_VERSION_FIELDS) {
+    if (field === "image") content[field] = canonicalBotImage(source[field] || "");
+    else if (field === "tags") content[field] = normalizeBotVersionTags(source[field]);
+    else content[field] = cleanBotArchiveText(source[field], field === "personality" || field === "exampleDialogues" ? 18000 : 12000);
+  }
+  const lorebookRaw = source.lorebook && typeof source.lorebook === "object" ? source.lorebook : {};
+  content.lorebook = {
+    id: cleanBotArchiveText(lorebookRaw.id || source.lorebookId || "", 240),
+    name: cleanBotArchiveText(lorebookRaw.name || source.lorebookName || "", 500)
+  };
+  return content;
+}
+
+function normalizeBotVersionState(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  return {
+    visibility: cleanBotArchiveText(source.visibility || "", 80),
+    moderation: cleanBotArchiveText(source.moderation || "", 80),
+    capturedAt: Number(source.capturedAt) || 0
+  };
+}
+
+function normalizeBotVersion(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const content = normalizeBotVersionContent(raw.content || raw.fields || raw);
+  const hasContent = BOT_VERSION_FIELDS.some(field => String(content[field] || "")) || content.lorebook.id || content.lorebook.name;
+  if (!hasContent) return null;
+  return {
+    id: cleanBotArchiveText(raw.id || "", 120),
+    number: Math.max(1, Number(raw.number) || 1),
+    capturedAt: Number(raw.capturedAt) || Number(raw.savedAt) || 0,
+    source: cleanBotArchiveText(raw.source || "", 120),
+    label: cleanBotArchiveText(raw.label || "", 160),
+    content,
+    state: normalizeBotVersionState(raw.state),
+    changedFields: Array.isArray(raw.changedFields)
+      ? [...new Set(raw.changedFields.map(field => cleanBotArchiveText(field, 80)).filter(Boolean))]
+      : []
+  };
+}
+
 function normalizeBotArchiveRevision(raw) {
   if (!raw || typeof raw !== "object") return null;
   const rawFields = raw.fields && typeof raw.fields === "object" ? raw.fields : raw;
@@ -5223,6 +5371,8 @@ function normalizeBotArchive(value) {
       profileBackup: !!raw.profileBackup,
       revisions: Array.isArray(raw.revisions) ? raw.revisions.map(normalizeBotArchiveRevision).filter(Boolean).slice(0, 50) : [],
       manualBackups: Array.isArray(raw.manualBackups) ? raw.manualBackups.map(normalizeBotManualBackup).filter(Boolean).sort((a, b) => b.capturedAt - a.capturedAt) : [],
+      versions: Array.isArray(raw.versions) ? raw.versions.map(normalizeBotVersion).filter(Boolean).sort((a, b) => b.number - a.number || b.capturedAt - a.capturedAt).slice(0, 50) : [],
+      versionState: normalizeBotVersionState(raw.versionState),
       fields,
       coverage
     };
@@ -5252,6 +5402,10 @@ function mergeBotArchiveEntry(previousValue, incomingValue) {
     profileBackup: !!(incoming.profileBackup || previous?.profileBackup),
     revisions: Array.isArray(incoming.revisions) && incoming.revisions.length ? incoming.revisions : (previous?.revisions || []),
     manualBackups: Array.isArray(incoming.manualBackups) && incoming.manualBackups.length ? incoming.manualBackups : (previous?.manualBackups || []),
+    versions: Array.isArray(incoming.versions) && incoming.versions.length ? incoming.versions : (previous?.versions || []),
+    versionState: Number(incoming.versionState?.capturedAt || 0) >= Number(previous?.versionState?.capturedAt || 0)
+      ? normalizeBotVersionState(incoming.versionState)
+      : normalizeBotVersionState(previous?.versionState),
     fields,
     coverage: BOT_ARCHIVE_FIELDS.filter(field => fields[field])
   };
@@ -6517,6 +6671,152 @@ async function copyBackupJson(bot, revision) {
   }
 }
 
+function botVersionFieldValue(content, field) {
+  if (field === "lorebook") {
+    const id = String(content?.lorebook?.id || "");
+    const name = String(content?.lorebook?.name || "");
+    return name && id ? `${name} (${id})` : (name || id || "None");
+  }
+  return String(content?.[field] || "");
+}
+
+function botVersionAsRevision(version) {
+  const content = normalizeBotVersionContent(version?.content || {});
+  return {
+    capturedAt: Number(version?.capturedAt) || 0,
+    source: version?.source || `Bot version v${version?.number || "?"}`,
+    fields: {
+      name: content.name || "",
+      title: content.title || "",
+      greeting: content.greeting || "",
+      personality: content.personality || "",
+      scenario: content.scenario || "",
+      exampleDialogues: content.exampleDialogues || "",
+      tags: content.tags || "",
+      image: content.image || ""
+    },
+    coverage: BOT_VERSION_FIELDS.filter(field => String(content[field] || ""))
+  };
+}
+
+function creatorBotVersionDiff(previousVersion, version) {
+  const before = normalizeBotVersionContent(previousVersion?.content || {});
+  const after = normalizeBotVersionContent(version?.content || {});
+  const fields = [...BOT_VERSION_FIELDS, "lorebook"];
+  return fields.map(field => {
+    const previousValue = botVersionFieldValue(before, field);
+    const nextValue = botVersionFieldValue(after, field);
+    if (previousValue === nextValue) return null;
+    return { field, before: previousValue, after: nextValue };
+  }).filter(Boolean);
+}
+
+function shortVersionValue(value, max = 700) {
+  const text = String(value || "");
+  if (text.length <= max) return text || "(empty)";
+  return `${text.slice(0, max)}\n… (${text.length - max} more characters)`;
+}
+
+function creatorBackupVersionRow(bot, version, olderVersion) {
+  const row = makeElement("div", { className: "creator-backup-revision" });
+  const number = Math.max(1, Number(version?.number) || 1);
+  const changed = Array.isArray(version?.changedFields) && version.changedFields.length
+    ? version.changedFields
+    : creatorBotVersionDiff(olderVersion, version).map(item => item.field);
+  const changedText = changed.length
+    ? changed.map(field => BOT_VERSION_LABELS[field] || field).join(", ")
+    : (number === 1 ? "Initial captured version" : "Meaningful creator content changed");
+  const label = version?.label ? ` · ${version.label}` : "";
+  const stateBits = [];
+  if (version?.state?.visibility) stateBits.push(version.state.visibility);
+  if (version?.state?.moderation) stateBits.push(version.state.moderation);
+  const stateText = stateBits.length ? ` · state: ${stateBits.join(" / ")}` : "";
+
+  const text = makeElement("span", {
+    text: `v${number} · ${creatorBackupDate(version?.capturedAt)}${label} · changed: ${changedText}${stateText}`
+  });
+  const actions = makeElement("span", { className: "creator-backup-row-actions" });
+
+  const view = makeElement("button", { text: "View", attrs: { type: "button" } });
+  view.addEventListener("click", () => {
+    let box = row.querySelector(":scope > .creator-backup-compare[data-mode='view']");
+    if (box) { box.remove(); return; }
+    row.querySelectorAll(":scope > .creator-backup-compare").forEach(node => node.remove());
+    box = makeElement("div", { className: "creator-backup-compare" });
+    box.dataset.mode = "view";
+    const content = normalizeBotVersionContent(version?.content || {});
+    box.textContent = [...BOT_VERSION_FIELDS, "lorebook"]
+      .map(field => `${BOT_VERSION_LABELS[field] || field}:\n${shortVersionValue(botVersionFieldValue(content, field))}`)
+      .join("\n\n");
+    row.appendChild(box);
+  });
+
+  const compare = makeElement("button", { text: "Compare", attrs: { type: "button" } });
+  compare.addEventListener("click", () => {
+    let box = row.querySelector(":scope > .creator-backup-compare[data-mode='version-compare']");
+    if (box) { box.remove(); return; }
+    row.querySelectorAll(":scope > .creator-backup-compare").forEach(node => node.remove());
+    box = makeElement("div", { className: "creator-backup-compare" });
+    box.dataset.mode = "version-compare";
+    if (!olderVersion) {
+      box.textContent = "This is the first locally recorded bot version, so there is no older version to compare against.";
+    } else {
+      const diff = creatorBotVersionDiff(olderVersion, version);
+      box.textContent = diff.length
+        ? diff.map(item => `${BOT_VERSION_LABELS[item.field] || item.field}\n--- v${olderVersion.number || "?"}\n${shortVersionValue(item.before)}\n+++ v${number}\n${shortVersionValue(item.after)}`).join("\n\n")
+        : "No creator-content differences from the previous recorded version.";
+    }
+    row.appendChild(box);
+  });
+
+  const restore = makeElement("button", { text: "Restore fields", attrs: { type: "button" } });
+  restore.addEventListener("click", () => {
+    let box = row.querySelector(":scope > .creator-backup-restore-fields");
+    if (box) { box.remove(); return; }
+    const revision = botVersionAsRevision(version);
+    const restorable = ["name", "title", "greeting", "personality", "scenario", "exampleDialogues", "tags"]
+      .filter(field => String(revision.fields?.[field] || "").length > 0);
+    box = makeElement("div", { className: "creator-backup-restore-fields" });
+    if (!restorable.length) {
+      box.appendChild(makeElement("span", { className: "hint", text: "This version has no editor fields available to restore." }));
+      row.appendChild(box);
+      return;
+    }
+    for (const field of restorable) {
+      const input = makeElement("input", { attrs: { type: "checkbox", value: field } });
+      input.checked = true;
+      box.appendChild(makeElement("label", {}, [input, document.createTextNode(BOT_VERSION_LABELS[field] || field)]));
+    }
+    const go = makeElement("button", { text: "Open editor with selected fields", attrs: { type: "button" } });
+    go.addEventListener("click", () => queueBotFieldRestore(bot, revision, [...box.querySelectorAll("input:checked")].map(input => input.value)));
+    box.appendChild(go);
+    row.appendChild(box);
+  });
+
+  const rename = makeElement("button", { text: "Rename", attrs: { type: "button" } });
+  rename.addEventListener("click", async () => {
+    const next = prompt(`Name bot version v${number}:`, version?.label || "");
+    if (next == null) return;
+    const labelValue = cleanBotArchiveText(next, 160);
+    await mutateCreatorBotBackup(bot.id, entry => {
+      const item = (entry.versions || []).find(candidate => String(candidate.id || "") === String(version.id || "") || Number(candidate.number) === number);
+      if (item) item.label = labelValue;
+    }, labelValue ? `Renamed bot version v${number}.` : `Cleared the name for bot version v${number}.`);
+  });
+
+  const del = makeElement("button", { text: "Delete", attrs: { type: "button" } });
+  del.addEventListener("click", async () => {
+    if (!confirm(`Delete bot version v${number}? Safety revisions/manual checkpoints are separate and will not be deleted.`)) return;
+    await mutateCreatorBotBackup(bot.id, entry => {
+      entry.versions = (entry.versions || []).filter(item => !(String(item.id || "") === String(version.id || "") || Number(item.number) === number));
+    }, `Deleted bot version v${number}.`);
+  });
+
+  actions.append(view, compare, restore, rename, del);
+  row.append(text, actions);
+  return row;
+}
+
 function creatorBackupRevisionRow(bot, revision, index, options = {}) {
   const isManual = options.manual === true;
   const allowRestore = options.allowRestore !== false && !!bot.ownBot;
@@ -6631,10 +6931,12 @@ function creatorBackupBotRow(bot, kind = "bot") {
   main.appendChild(makeElement("div", { className: "creator-backup-row-title", text: bot.name || bot.id }));
   const revisions = Array.isArray(bot.revisions) ? bot.revisions : [];
   const manuals = Array.isArray(bot.manualBackups) ? bot.manualBackups : [];
+  const versions = Array.isArray(bot.versions) ? [...bot.versions].sort((a, b) => b.number - a.number || b.capturedAt - a.capturedAt) : [];
   const details = [
     isProfile ? "Bot profile" : "My chatbot",
     `last backup ${creatorBackupAge(bot.lastSavedAt)}`,
-    `${revisions.length} auto revision${revisions.length === 1 ? "" : "s"}`
+    ...(isProfile ? [] : [`${versions.length} bot version${versions.length === 1 ? "" : "s"}`]),
+    `${revisions.length} safety revision${revisions.length === 1 ? "" : "s"}`
   ];
   if (!isProfile) details.push(`${manuals.length} manual backup${manuals.length === 1 ? "" : "s"}`);
   const visibility = cleanBotArchiveText(bot.fields?.visibility || "", 40);
@@ -6661,16 +6963,28 @@ function creatorBackupBotRow(bot, kind = "bot") {
     actions.appendChild(restoreLatest);
   }
   if (revisions.length) {
-    const clearAuto = makeElement("button", { text: "Clear auto history", attrs: { type: "button" } });
+    const clearAuto = makeElement("button", { text: "Clear safety history", attrs: { type: "button" } });
     clearAuto.addEventListener("click", async () => {
-      if (!confirm("Delete all rotating automatic/profile revisions for this bot? Manual backups and the latest copy will remain.")) return;
-      await mutateCreatorBotBackup(bot.id, entry => { entry.revisions = []; }, "Cleared the automatic revision history.");
+      if (!confirm("Delete all rotating safety/profile revisions for this bot? Bot Version History, manual backups and the latest copy will remain.")) return;
+      await mutateCreatorBotBackup(bot.id, entry => { entry.revisions = []; }, "Cleared the safety revision history.");
     });
     actions.appendChild(clearAuto);
   }
   actions.appendChild(del);
   head.append(main, actions);
   row.appendChild(head);
+
+  if (versions.length && !isProfile) {
+    const versionHistory = makeElement("details", { className: "creator-backup-revisions" });
+    versionHistory.appendChild(makeElement("summary", { text: `Bot Version History (${versions.length})` }));
+    const list = makeElement("div", { className: "creator-backup-revision-list" });
+    versions.forEach((version, index) => {
+      const olderVersion = versions[index + 1] || null;
+      list.appendChild(creatorBackupVersionRow(bot, version, olderVersion));
+    });
+    versionHistory.appendChild(list);
+    row.appendChild(versionHistory);
+  }
 
   if (manuals.length && !isProfile) {
     const manualHistory = makeElement("details", { className: "creator-backup-revisions" });
@@ -6683,7 +6997,7 @@ function creatorBackupBotRow(bot, kind = "bot") {
 
   if (revisions.length) {
     const history = makeElement("details", { className: "creator-backup-revisions" });
-    history.appendChild(makeElement("summary", { text: `${isProfile ? "Profile" : "Automatic"} history (${revisions.length})` }));
+    history.appendChild(makeElement("summary", { text: `${isProfile ? "Profile" : "Safety revision"} history (${revisions.length})` }));
     const list = makeElement("div", { className: "creator-backup-revision-list" });
     revisions.forEach((revision, index) => list.appendChild(creatorBackupRevisionRow(bot, revision, index, { allowRestore: !isProfile })));
     history.appendChild(list);
@@ -7255,6 +7569,17 @@ function creatorNotificationAllowed(handleValue) {
   return !!normalizeCreatorHandle(handleValue);
 }
 
+function normalizeFavoriteCreatorPreferences(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    showOpenedBots: !!raw.showOpenedBots,
+    showLaterBots: !!raw.showLaterBots,
+    ignoreLanguageFilter: !!raw.ignoreLanguageFilter,
+    ignoreTagWordFilters: !!raw.ignoreTagWordFilters,
+    showAllBots: !!raw.showAllBots
+  };
+}
+
 function normalizeCreatorStore(store) {
   const raw = store && typeof store === "object" ? store : {};
   const handles = uniqueClean(Array.isArray(raw.handles) ? raw.handles.map(normalizeCreatorHandle) : []);
@@ -7263,7 +7588,8 @@ function normalizeCreatorStore(store) {
   for (const [rawKey, item] of Object.entries(rawMeta)) {
     const key = normalizeCreatorHandle(rawKey || item?.handle || "");
     if (!key) continue;
-    meta[key] = { ...(item && typeof item === "object" ? item : {}), handle: key };
+    const sourceItem = item && typeof item === "object" ? item : {};
+    meta[key] = { ...sourceItem, handle: key, preferences: normalizeFavoriteCreatorPreferences(sourceItem.preferences) };
   }
   return { handles, meta };
 }
@@ -7409,7 +7735,8 @@ function creatorEntriesFromStore(store) {
       handle,
       name: item.name || `@${handle}`,
       url: item.url || `https://spicychat.ai/creator/${encodeURIComponent(handle)}`,
-      savedAt: item.savedAt || 0
+      savedAt: item.savedAt || 0,
+      preferences: normalizeFavoriteCreatorPreferences(item.preferences)
     };
   });
 }
@@ -7490,6 +7817,51 @@ function renderFavoriteCreators() {
     buttonText: "Remove"
   })));
 
+  const prefDefs = [
+    ["showOpenedBots", "Show opened bots"],
+    ["showLaterBots", "Show Saved for Later bots"],
+    ["ignoreLanguageFilter", "Ignore language filter"],
+    ["ignoreTagWordFilters", "Ignore tag / blocked-word filters"],
+    ["showAllBots", "Always show all bots from this creator"]
+  ];
+
+  for (const row of host.querySelectorAll(".ds-creator-fav-row")) {
+    const handle = normalizeCreatorHandle(row.dataset.handle || "");
+    if (!handle) continue;
+    const meta = favoriteCreatorState.meta?.[handle] || {};
+    const prefs = normalizeFavoriteCreatorPreferences(meta.preferences);
+    const main = row.querySelector(".bot-manager-main") || row;
+    const box = makeElement("div", { className: "favorite-creator-overrides" });
+    for (const [key, labelText] of prefDefs) {
+      const label = makeElement("label", { className: "favorite-creator-override" });
+      const input = makeElement("input", { attrs: { type: "checkbox", "data-pref": key } });
+      input.checked = !!prefs[key];
+      label.append(input, document.createTextNode(labelText));
+      box.appendChild(label);
+    }
+    const note = makeElement("div", {
+      className: "bot-manager-note",
+      text: "Blocked bots always stay hidden. These switches only override softer discovery filters for this creator."
+    });
+    main.append(box, note);
+  }
+
+  host.querySelectorAll(".favorite-creator-overrides input[data-pref]").forEach(input => {
+    input.addEventListener("change", async () => {
+      const row = input.closest(".ds-creator-fav-row");
+      const handle = normalizeCreatorHandle(row?.dataset.handle || "");
+      const key = String(input.dataset.pref || "");
+      if (!handle || !key) return;
+      favoriteCreatorState = normalizeCreatorStore(favoriteCreatorState);
+      const meta = favoriteCreatorState.meta[handle] || { handle };
+      const prefs = normalizeFavoriteCreatorPreferences(meta.preferences);
+      prefs[key] = !!input.checked;
+      favoriteCreatorState.meta[handle] = { ...meta, preferences: prefs };
+      await persistFavoriteCreatorsNow();
+      showSettingsToast(`Updated @${handle} visibility overrides.`);
+    });
+  });
+
   host.querySelectorAll(".favorite-creator-remove").forEach(button => {
     button.addEventListener("click", async () => {
       const handle = button.closest(".ds-creator-fav-row")?.dataset.handle || "";
@@ -7522,7 +7894,8 @@ async function addFavoriteCreator() {
     handle,
     name,
     url: `https://spicychat.ai/creator/${encodeURIComponent(handle)}`,
-    savedAt: Date.now()
+    savedAt: Date.now(),
+    preferences: normalizeFavoriteCreatorPreferences(favoriteCreatorState.meta[handle]?.preferences)
   };
 
   if (handleInput) handleInput.value = "";
@@ -8902,18 +9275,40 @@ function blockedQuickDislikeCounts() {
 function updateBlockedDislikeStatus(text = "") {
   const status = $("blockedBotDislikeStatus");
   if (!status) return;
-  if (text) {
-    status.textContent = text;
-    return;
-  }
   const counts = blockedQuickDislikeCounts();
   const suffix = counts.nameOnly ? ` · ${counts.nameOnly} name-only skipped` : "";
-  status.textContent = `${counts.handled} handled · ${counts.remaining} remaining${suffix}`;
+  const next = text || `${counts.handled} handled · ${counts.remaining} remaining${suffix}`;
+  if (status.textContent !== next) status.textContent = next;
 }
 
 function optionsLooksMobile() {
   if (navigator.userAgentData?.mobile) return true;
   return /Android|iPhone|iPad|iPod|Mobile/i.test(String(navigator.userAgent || ""));
+}
+
+function quickDislikeResponseIsTransient(response) {
+  const status = String(response?.status || (response ? "failed" : "worker-error"));
+  return !response?.ok && BULK_DISLIKE_TRANSIENT_STATUSES.has(status);
+}
+
+async function runQuickDislikeWithBackoff(payload, label = "") {
+  let response = null;
+  for (let attempt = 0; attempt <= BULK_DISLIKE_RETRY_LIMIT; attempt += 1) {
+    if (navigator.onLine === false) return { ok: false, status: "offline-paused" };
+    if (attempt > 0) {
+      const wait = Math.min(8000, BULK_DISLIKE_RETRY_BASE_MS * (2 ** (attempt - 1)));
+      updateBlockedDislikeStatus(`Retrying ${label || payload.botName || payload.botId} in ${(wait / 1000).toFixed(wait >= 2000 ? 0 : 1)}s · attempt ${attempt + 1}/${BULK_DISLIKE_RETRY_LIMIT + 1}`);
+      await new Promise(resolve => setTimeout(resolve, wait));
+      if (navigator.onLine === false) return { ok: false, status: "offline-paused" };
+    }
+    try {
+      response = await runtimeMessage({ ...payload, retryAttempt: attempt });
+    } catch (error) {
+      response = { ok: false, status: "worker-error", error: String(error?.message || error || "Quick Dislike worker failed") };
+    }
+    if (!quickDislikeResponseIsTransient(response) || attempt >= BULK_DISLIKE_RETRY_LIMIT) return response || { ok: false, status: "worker-error" };
+  }
+  return response || { ok: false, status: "worker-error" };
 }
 
 function applyQuickDislikeResponseToLocalHistory(id, name, response) {
@@ -9059,17 +9454,28 @@ async function runBlockedBulkDislike(mode = "remaining") {
       });
       updateBlockedDislikeStatus(`Processing ${processed}/${candidates.length} · ${name}`);
 
-      let response = null;
-      try {
-        response = await runtimeMessage({
-          type: "DS_QUICK_DISLIKE_BOT",
-          botId: id,
-          botName: name,
-          chatUrl: meta.chatUrl || `https://spicychat.ai/chat/${id}`,
-          bulkRunId: runId
+      const response = await runQuickDislikeWithBackoff({
+        type: "DS_QUICK_DISLIKE_BOT",
+        botId: id,
+        botName: name,
+        chatUrl: meta.chatUrl || `https://spicychat.ai/chat/${id}`,
+        bulkRunId: runId
+      }, name);
+
+      // If connectivity drops, keep the current bot and everything after it
+      // pending instead of turning an offline period into a wall of failures.
+      if (response?.status === "offline-paused") {
+        blockedBulkDislikeStopRequested = true;
+        await persistQuickDislikeBulkState({
+          ...quickDislikeBulkState,
+          status: "paused",
+          currentId: "",
+          pendingIds: candidates.slice(index),
+          runId,
+          stopRequested: true
         });
-      } catch (error) {
-        response = { ok: false, status: "failed", error: String(error?.message || error || "Quick Dislike worker failed") };
+        updateBlockedDislikeStatus("Bulk Dislike paused because the browser is offline. Resume when the connection is back.");
+        break;
       }
 
       // A canceled request means Stop won the race before this item began.
@@ -9133,6 +9539,9 @@ async function runBlockedBulkDislike(mode = "remaining") {
     blockedBulkDislikeStopRequested = false;
     activeBlockedBulkDislikeRunId = "";
 
+    if (runId) {
+      await runtimeMessage({ type: "DS_QUICK_DISLIKE_RELEASE_BULK", bulkRunId: runId }).catch?.(() => null);
+    }
     await refreshQuickDislikeHistoryState();
     const unfinished = stopped ? blockedBulkCandidateIds("resume") : [];
     const finalFailed = uniqueClean([...(quickDislikeBulkState.failedIds || []), ...failedIds]).filter(id => !quickDislikeHistoryEntry(id));
@@ -10193,6 +10602,7 @@ async function load() {
     AUTO_AFK_STATUS_KEY,
     DUPLICATE_TAB_STATUS_KEY,
     SAI_TOOLKIT_PRESENCE_KEY,
+    SPICYCHAT_BETA_CAPABILITIES_KEY,
     LAST_SEEN_VERSION_KEY,
     RELEASE_NOTICE_KEY,
     PENDING_OPTIONS_NAV_KEY,
@@ -10201,7 +10611,8 @@ async function load() {
     CREATOR_BOT_WEBHOOK_KEY,
     "generationMetadataDefaultsMigrationV01841",
     "backupOptInMigrationV01990",
-    "quickDislikeOptInMigrationV019119"
+    "quickDislikeOptInMigrationV019119",
+    "oocHardPresetMigrationV022"
   ]);
 
   const rawSettings = result.settings || {};
@@ -10280,6 +10691,24 @@ async function load() {
     Array.isArray(result[OOC_TEMPLATES_KEY]) ? result[OOC_TEMPLATES_KEY] : settings.oocTemplates
   );
 
+  if (result.oocHardPresetMigrationV022 !== true) {
+    const templates = normalizeOocTemplates(settings.oocTemplates);
+    const hasHard = templates.some(item =>
+      String(item?.id || "") === HARD_OOC_TEMPLATE_ID ||
+      String(item?.text || "").trim() === HARD_OOC_TEMPLATE
+    );
+    if (!hasHard) {
+      templates.push({
+        id: HARD_OOC_TEMPLATE_ID,
+        name: "Hard no-control + formatting",
+        text: HARD_OOC_TEMPLATE,
+        builtIn: true
+      });
+    }
+    settings.oocTemplates = templates;
+    await storageSet({ [OOC_TEMPLATES_KEY]: templates, oocHardPresetMigrationV022: true });
+  }
+
   currentPersonas = uniqueClean([
     ...(Array.isArray(result[PERSONAS_KEY]) ? result[PERSONAS_KEY].map(p => p?.name || p?.id || "") : []),
     ...(Array.isArray(result[LEGACY_PERSONAS_KEY]) ? result[LEGACY_PERSONAS_KEY].map(p => p?.name || p?.id || "") : [])
@@ -10289,6 +10718,24 @@ async function load() {
   renderChatBackgroundOptions();
 
   setChecked("enabled", settings.enabled);
+  const betaStatus = $("spicyChatBetaStatus");
+  const betaDetails = $("spicyChatBetaCapabilities");
+  if (betaStatus || betaDetails) {
+    const beta = result[SPICYCHAT_BETA_CAPABILITIES_KEY] || {};
+    const caps = beta.capabilities || {};
+    const pub = caps.publicLorebooks || "unknown";
+    const story = caps.storyMode || "unknown";
+    const statusText = beta.detected ? "Detected on this browser profile" : (pub === "unavailable" ? "Not detected on this browser profile" : "Not detected yet");
+    if (betaStatus) {
+      const label = document.createElement("strong");
+      label.textContent = "Status:";
+      const checkedText = beta.lastCheckedAt
+        ? ` · checked ${new Date(Number(beta.lastCheckedAt)).toLocaleString()}`
+        : "";
+      betaStatus.replaceChildren(label, document.createTextNode(` ${statusText}${checkedText}`));
+    }
+    if (betaDetails) betaDetails.textContent = `Public Lorebooks: ${pub} · Story Mode: ${story}`;
+  }
   setChecked("saiToolkitCompatibility", !!settings.saiToolkitCompatibility);
   setValue("globalNsfwMode", settings.globalNsfwMode || "ignore");
 
@@ -10555,6 +11002,7 @@ async function load() {
   setChecked("expandLongCardDescriptions", settings.expandLongCardDescriptions);
   setChecked("showCardGreetingTokenInfo", !!settings.showCardGreetingTokenInfo);
   setChecked("showExactMessageCounts", !!settings.showExactMessageCounts);
+  setChecked("showBotCreationDates", !!settings.showBotCreationDates);
   setChecked("cardTokenShowGreeting", settings.cardTokenShowGreeting !== false);
   setChecked("cardTokenShowPersonality", !!settings.cardTokenShowPersonality);
   setChecked("cardTokenShowScenario", !!settings.cardTokenShowScenario);
@@ -10562,6 +11010,8 @@ async function load() {
 
   setChecked("autoFillListings", settings.autoFillListings);
   setChecked("showListingRefillButton", !!settings.showListingRefillButton);
+  setChecked("showListingFilterStats", !!settings.showListingFilterStats);
+  setChecked("showListingFilterStatsDetails", !!settings.showListingFilterStatsDetails);
   setValue("autoFillTargetCards", String(settings.autoFillTargetCards || 50));
   setValue("autoFillMaxClicks", String(settings.autoFillMaxClicks || 8));
 
@@ -10750,6 +11200,10 @@ async function load() {
   setChecked("pauseQolWhileMessageEditing", settings.pauseQolWhileMessageEditing !== false);
   setChecked("reduceQolAnimations", !!settings.reduceQolAnimations);
   setChecked("reduceOptionsAnimations", !!settings.reduceOptionsAnimations);
+  setValue("settingsNavigationStyle", ["classic", "grouped"].includes(settings.settingsNavigationStyle) ? settings.settingsNavigationStyle : "classic");
+  setValue("settingsContentLayout", ["single", "adaptive"].includes(settings.settingsContentLayout) ? settings.settingsContentLayout : "single");
+  setValue("settingsPageWidth", ["comfortable", "wide"].includes(settings.settingsPageWidth) ? settings.settingsPageWidth : "comfortable");
+  applyOptionsLayoutPreferences(settings);
   setChecked("collapseSettingsSectionsByDefault", !!settings.collapseSettingsSectionsByDefault);
   setChecked("enableCommandPalette", !!settings.enableCommandPalette);
   setValue("commandPaletteShortcut", ["ctrl-k", "ctrl-shift-k", "alt-k", "off"].includes(settings.commandPaletteShortcut) ? settings.commandPaletteShortcut : "ctrl-k");
@@ -10925,6 +11379,7 @@ async function load() {
   applySettingsSectionDefault(settings);
   applySettingsEnabledOnlyFilter();
   refreshSettingsSectionShortcuts();
+  initializeExportScopeSelection().catch(() => {});
 
   dirtySavedStores.clear();
   if (loadStarted && typeof performance !== "undefined") OPTIONS_PERFORMANCE.loadMs = Math.max(0, performance.now() - loadStarted);
@@ -11172,6 +11627,8 @@ function readSettingsFromPage() {
 
     autoFillListings: checked("autoFillListings"),
     showListingRefillButton: checked("showListingRefillButton"),
+    showListingFilterStats: checked("showListingFilterStats"),
+    showListingFilterStatsDetails: checked("showListingFilterStatsDetails"),
     autoFillTargetCards: Math.max(1, Math.min(200, Number(value("autoFillTargetCards", "50")) || 50)),
     autoFillMaxClicks: Math.max(1, Math.min(30, Number(value("autoFillMaxClicks", "8")) || 8)),
 
@@ -11353,6 +11810,9 @@ function readSettingsFromPage() {
     pauseQolWhileMessageEditing: checked("pauseQolWhileMessageEditing", true),
     reduceQolAnimations: checked("reduceQolAnimations"),
     reduceOptionsAnimations: checked("reduceOptionsAnimations"),
+    settingsNavigationStyle: ["classic", "grouped"].includes(value("settingsNavigationStyle")) ? value("settingsNavigationStyle") : "classic",
+    settingsContentLayout: ["single", "adaptive"].includes(value("settingsContentLayout")) ? value("settingsContentLayout") : "single",
+    settingsPageWidth: ["comfortable", "wide"].includes(value("settingsPageWidth")) ? value("settingsPageWidth") : "comfortable",
     collapseSettingsSectionsByDefault: checked("collapseSettingsSectionsByDefault"),
     enableCommandPalette: checked("enableCommandPalette", false),
     commandPaletteShortcut: ["ctrl-k", "ctrl-shift-k", "alt-k", "off"].includes(value("commandPaletteShortcut")) ? value("commandPaletteShortcut") : "ctrl-k",
@@ -11450,6 +11910,7 @@ function readSettingsFromPage() {
     expandLongCardDescriptions: checked("expandLongCardDescriptions"),
     showCardGreetingTokenInfo: checked("showCardGreetingTokenInfo"),
     showExactMessageCounts: checked("showExactMessageCounts"),
+    showBotCreationDates: checked("showBotCreationDates"),
     cardTokenShowGreeting: checked("cardTokenShowGreeting", true),
     cardTokenShowDescription: false,
     cardTokenShowPersonality: checked("cardTokenShowPersonality"),
@@ -11822,7 +12283,14 @@ function buildExportPayload(scopes, result) {
     }
   };
 
-  if (has("settings")) payload.settings = settings;
+  const selectedSettingScopes = new Set([...selected].filter(isSettingsBackupScope));
+  if (has("settings")) {
+    payload.settings = settings;
+    payload._qolBackup.settingsScopes = ["settings"];
+  } else if (selectedSettingScopes.size) {
+    payload.settings = settingsSubsetForScopes(settings, selectedSettingScopes);
+    payload._qolBackup.settingsScopes = [...selectedSettingScopes];
+  }
   if (has("opened")) {
     payload.openedChats = Array.isArray(result[OPENED_KEY]) ? result[OPENED_KEY] : [];
     payload.openedChatMeta = result[OPENED_META_KEY] || {};
@@ -11835,6 +12303,7 @@ function buildExportPayload(scopes, result) {
   if (has("notInterested")) payload.notInterestedBots = result[NOT_INTERESTED_KEY] || { ids: [], meta: {} };
   if (has("favoriteCreators")) payload.favoriteCreators = result[FAVORITE_CREATORS_KEY] || { handles: [], meta: {} };
   if (has("followedCreators")) payload.followedCreators = result[FOLLOWED_CREATORS_KEY] || { handles: [], meta: {} };
+  if (has("creatorBotWatch")) payload.creatorBotWatch = normalizeCreatorBotWatchState(result[CREATOR_BOT_WATCH_KEY]);
   if (has("favoriteBots")) payload.favoriteBots = result[FAVORITE_BOTS_KEY] || { ids: [], meta: {} };
   if (has("laterBots")) payload.laterBots = result[LATER_BOTS_KEY] || { ids: [], meta: {} };
   if (has("botOrganization")) payload.botOrganization = result[BOT_ORGANIZER_KEY] || { meta: {} };
@@ -11843,6 +12312,7 @@ function buildExportPayload(scopes, result) {
   if (has("botAvailability")) payload.botAvailability = normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]);
   if (has("botArchive")) payload.botArchive = normalizeBotArchive(result[BOT_ARCHIVE_KEY]);
   if (has("lorebookBackups")) payload.lorebookBackups = normalizeLorebookBackups(result[LOREBOOK_BACKUPS_KEY]);
+  if (has("chatbotLorebookLinks")) payload.chatbotLorebookLinks = result[CHATBOT_LOREBOOK_LINKS_KEY] && typeof result[CHATBOT_LOREBOOK_LINKS_KEY] === "object" ? result[CHATBOT_LOREBOOK_LINKS_KEY] : {};
   if (has("savedTextSnippets")) payload.savedTextSnippets = Array.isArray(result[SAVED_TEXT_SNIPPETS_KEY]) ? result[SAVED_TEXT_SNIPPETS_KEY] : [];
   if (has("contextKeeperData")) payload.contextKeeperData = result[CONTEXT_KEEPER_DATA_KEY] && typeof result[CONTEXT_KEEPER_DATA_KEY] === "object" ? result[CONTEXT_KEEPER_DATA_KEY] : {};
   if (has("storyDayTrackerData")) payload.storyDayTrackerData = result[STORY_DAY_TRACKER_KEY] && typeof result[STORY_DAY_TRACKER_KEY] === "object" ? result[STORY_DAY_TRACKER_KEY] : {};
@@ -11865,6 +12335,17 @@ function buildExportPayload(scopes, result) {
   if (has("botEditorDraftHistory")) payload.botEditorDraftHistory = normalizeBotEditorDraftHistory(result[BOT_EDITOR_DRAFT_HISTORY_KEY]);
   if (has("chatBookmarks")) payload.chatBookmarks = result[CHAT_BOOKMARKS_KEY] && typeof result[CHAT_BOOKMARKS_KEY] === "object" ? result[CHAT_BOOKMARKS_KEY] : {};
   if (has("recentlySeenBots")) payload.recentlySeenBots = result[RECENTLY_SEEN_BOTS_KEY] && typeof result[RECENTLY_SEEN_BOTS_KEY] === "object" ? result[RECENTLY_SEEN_BOTS_KEY] : { entries: [] };
+  if (has("soundscapes")) payload.soundscapes = normalizeSoundscapeScenes(result[SOUNDSCAPES_KEY]);
+  if (has("tabCleanupSessions")) payload.tabCleanupSessions = normalizeTabCleanupSessions(result[TAB_CLEANUP_SESSIONS_KEY]);
+  if (has("tabCleanupTopics")) payload.tabCleanupTopics = normalizeTabCleanupTopics(result[TAB_CLEANUP_TOPICS_KEY]);
+  if (has("tabCleanupEnrichment")) payload.tabCleanupEnrichment = result[TAB_CLEANUP_ENRICHMENT_KEY] && typeof result[TAB_CLEANUP_ENRICHMENT_KEY] === "object" ? result[TAB_CLEANUP_ENRICHMENT_KEY] : { meta: {} };
+  if (has("localChangeHistory")) payload.localChangeHistory = Array.isArray(result[LOCAL_CHANGE_HISTORY_KEY]) ? result[LOCAL_CHANGE_HISTORY_KEY] : [];
+  if (has("localMedia")) {
+    payload.localMedia = {
+      soundscapeAudio: normalizeSoundscapeAudio(result[SOUNDSCAPE_AUDIO_KEY]),
+      chatBackgroundMedia: normalizeChatBackgroundMediaStore(result[CHAT_BACKGROUNDS_KEY])
+    };
+  }
 
   return payload;
 }
@@ -12308,25 +12789,211 @@ function setupModerationTermManager() {
   renderModerationTermManager();
 }
 
+const SETTINGS_BACKUP_GROUPS = {
+  settingsGeneral: { label: "General & Control Center", pages: ["general", "control", "features"] },
+  settingsDiscovery: { label: "Discovery & Filters", pages: ["blocking"] },
+  settingsSavedBots: { label: "Saved Bots & Lists", pages: ["saved"] },
+  settingsChatList: { label: "Chat List", pages: ["chat-list"] },
+  settingsChat: { label: "Chat", pages: ["chat-ui"] },
+  settingsWriting: { label: "Writing & Generation", pages: ["writing"] },
+  settingsPersonas: { label: "Personas & Memory", pages: ["personas-memory"] },
+  settingsCreator: { label: "Creator Tools", pages: ["bot-tools"] },
+  settingsAppearance: { label: "Appearance & Interface", pages: ["appearance"] },
+  settingsBrowser: { label: "Browser, Tabs & Mobile", pages: ["browser", "android"] },
+  settingsAdvanced: { label: "Advanced & Compatibility", pages: ["advanced"] }
+};
+const SETTINGS_BACKUP_SCOPE_IDS = Object.keys(SETTINGS_BACKUP_GROUPS);
+const SETTINGS_BACKUP_OVERRIDES = {
+  autoAfkAction: "settingsBrowser",
+  botEditorSnippets: "settingsCreator",
+  blockedBotIds: "settingsDiscovery",
+  blockedBotNames: "settingsDiscovery",
+  cardTokenShowDescription: "settingsDiscovery",
+  cardTokenShowCombined: "settingsDiscovery",
+  allowedLanguages: "settingsDiscovery",
+  showListingRefillButton: "settingsDiscovery",
+  quickPanelCustomX: "settingsGeneral",
+  quickPanelCustomY: "settingsGeneral",
+  showBlockCurrentBotButton: "settingsDiscovery",
+  quickDislikeIdleEnabled: "settingsDiscovery",
+  chatListSearchMode: "settingsChatList",
+  autoLoadAllOpenedChats: "settingsChatList",
+  deepImportMaxPages: "settingsChatList",
+  oocTemplates: "settingsWriting",
+  replyInstructionBotOverrides: "settingsWriting",
+  chatBubblePreserveActionColors: "settingsAppearance",
+  hideSidebarSocialLinks: "settingsAppearance",
+  hideSidebarFooterLinks: "settingsAppearance",
+  hideSidebarAppDownload: "settingsAppearance",
+  enableMainFooterManagement: "settingsAppearance",
+  hideMainFooterEntirely: "settingsAppearance",
+  hideMainFooterCompany: "settingsAppearance",
+  hideMainFooterResources: "settingsAppearance",
+  hideMainFooterCommunity: "settingsAppearance",
+  hideMainFooterJoinUs: "settingsAppearance",
+  hideMainFooterAppDownload: "settingsAppearance",
+  hideMainFooter2257: "settingsAppearance",
+  enablePersonalUsageSummary: "settingsGeneral",
+  enableLocalChangeHistory: "settingsAdvanced",
+  showUpdateNotifications: "settingsGeneral",
+  debug: "settingsAdvanced"
+};
+
+function settingBackupScopeForKey(key) {
+  if (SETTINGS_BACKUP_OVERRIDES[key]) return SETTINGS_BACKUP_OVERRIDES[key];
+  const element = $(key);
+  const page = element?.closest?.(".tab-page[data-page]")?.dataset?.page || "";
+  for (const [scope, def] of Object.entries(SETTINGS_BACKUP_GROUPS)) {
+    if (def.pages.includes(page)) return scope;
+  }
+  return "settingsGeneral";
+}
+
+function settingKeysForBackupScope(scope) {
+  return Object.keys(DEFAULT_SETTINGS).filter(key => settingBackupScopeForKey(key) === scope);
+}
+
+function isSettingsBackupScope(scope) {
+  return SETTINGS_BACKUP_SCOPE_IDS.includes(String(scope || ""));
+}
+
+function settingsSubsetForScopes(settingsValue, scopes) {
+  const source = { ...DEFAULT_SETTINGS, ...(settingsValue || {}) };
+  const selected = scopes instanceof Set ? scopes : new Set(scopes || []);
+  const out = {};
+  for (const scope of SETTINGS_BACKUP_SCOPE_IDS) {
+    if (!selected.has(scope)) continue;
+    for (const key of settingKeysForBackupScope(scope)) out[key] = source[key];
+  }
+  return out;
+}
+
+function settingsPresentSubsetForScopes(settingsValue, scopes) {
+  const source = settingsValue && typeof settingsValue === "object" ? settingsValue : {};
+  const selected = scopes instanceof Set ? scopes : new Set(scopes || []);
+  const out = {};
+  for (const scope of SETTINGS_BACKUP_SCOPE_IDS) {
+    if (!selected.has(scope)) continue;
+    for (const key of settingKeysForBackupScope(scope)) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) out[key] = source[key];
+    }
+  }
+  return out;
+}
+
+function settingsScopeUsageCount(settingsValue, scope) {
+  const source = { ...DEFAULT_SETTINGS, ...(settingsValue || {}) };
+  return settingKeysForBackupScope(scope).reduce((count, key) => (
+    JSON.stringify(source[key]) === JSON.stringify(DEFAULT_SETTINGS[key]) ? count : count + 1
+  ), 0);
+}
+
 const BACKUP_STORAGE_KEYS = [
   "settings", OPENED_KEY, OPENED_META_KEY, BLOCKED_BOTS_KEY, QUICK_DISLIKE_HISTORY_KEY, QUICK_DISLIKE_BULK_STATE_KEY,
   NOT_INTERESTED_KEY, PERSONAS_KEY, LEGACY_PERSONAS_KEY, PERSONA_ORG_KEY, OOC_TEMPLATES_KEY, FAVORITE_CREATORS_KEY,
-  FOLLOWED_CREATORS_KEY, FAVORITE_BOTS_KEY, LATER_BOTS_KEY, BOT_ORGANIZER_KEY, CHAT_ORGANIZER_KEY, CHARACTER_QOL_PROFILES_KEY,
-  BOT_AVAILABILITY_KEY, BOT_ARCHIVE_KEY, LOREBOOK_BACKUPS_KEY, SAVED_TEXT_SNIPPETS_KEY, CONTEXT_KEEPER_DATA_KEY, STORY_DAY_TRACKER_KEY, RP_STATE_TRACKER_KEY, CHAT_NUDGE_STORE_KEY,
-  GENERATION_PROFILES_KEY, SMART_FILTER_PRESETS_KEY, SMART_FILTER_PINNED_KEY, BOT_EDITOR_DRAFT_HISTORY_KEY,
-  CHAT_BOOKMARKS_KEY, RECENTLY_SEEN_BOTS_KEY
+  FOLLOWED_CREATORS_KEY, CREATOR_BOT_WATCH_KEY, FAVORITE_BOTS_KEY, LATER_BOTS_KEY, BOT_ORGANIZER_KEY, CHAT_ORGANIZER_KEY, CHARACTER_QOL_PROFILES_KEY,
+  BOT_AVAILABILITY_KEY, BOT_ARCHIVE_KEY, LOREBOOK_BACKUPS_KEY, CHATBOT_LOREBOOK_LINKS_KEY, SAVED_TEXT_SNIPPETS_KEY, CONTEXT_KEEPER_DATA_KEY,
+  STORY_DAY_TRACKER_KEY, RP_STATE_TRACKER_KEY, CHAT_NUDGE_STORE_KEY, GENERATION_PROFILES_KEY, SMART_FILTER_PRESETS_KEY, SMART_FILTER_PINNED_KEY,
+  BOT_EDITOR_DRAFT_HISTORY_KEY, CHAT_BOOKMARKS_KEY, RECENTLY_SEEN_BOTS_KEY, SOUNDSCAPES_KEY, SOUNDSCAPE_AUDIO_KEY, CHAT_BACKGROUNDS_KEY,
+  TAB_CLEANUP_SESSIONS_KEY, TAB_CLEANUP_TOPICS_KEY, TAB_CLEANUP_ENRICHMENT_KEY, LOCAL_CHANGE_HISTORY_KEY
 ];
 const BACKUP_SCOPE_IDS = [
-  "settings", "opened", "blocked", "notInterested", "favoriteCreators", "followedCreators", "favoriteBots", "laterBots",
-  "botOrganization", "chatOrganization", "characterQolProfiles", "botAvailability", "botArchive", "lorebookBackups", "savedTextSnippets", "contextKeeperData", "storyDayTrackerData", "rpStateTrackerData",
-  "chatNudges", "personas", "personaOrganization", "ooc", "generationProfiles", "smartFilterPresets", "smartFilterPins",
-  "botEditorDraftHistory", "chatBookmarks", "recentlySeenBots"
+  ...SETTINGS_BACKUP_SCOPE_IDS,
+  "settings",
+  "opened", "blocked", "notInterested", "favoriteCreators", "followedCreators", "creatorBotWatch", "favoriteBots", "laterBots",
+  "botOrganization", "chatOrganization", "characterQolProfiles", "botAvailability", "botArchive", "lorebookBackups", "chatbotLorebookLinks",
+  "savedTextSnippets", "contextKeeperData", "storyDayTrackerData", "rpStateTrackerData", "chatNudges", "personas", "personaOrganization",
+  "ooc", "generationProfiles", "smartFilterPresets", "smartFilterPins", "botEditorDraftHistory", "chatBookmarks", "recentlySeenBots",
+  "soundscapes", "tabCleanupSessions", "tabCleanupTopics", "tabCleanupEnrichment", "localChangeHistory", "localMedia"
 ];
+const LIGHTWEIGHT_BACKUP_SCOPE_IDS = BACKUP_SCOPE_IDS.filter(scope => scope !== "localMedia");
+
+const BACKUP_DATA_SCOPE_DEFS = {
+  opened: { count: result => Array.isArray(result[OPENED_KEY]) ? result[OPENED_KEY].length : 0 },
+  blocked: { count: result => uniqueClean([...(result[BLOCKED_BOTS_KEY]?.ids || []), ...(result[BLOCKED_BOTS_KEY]?.names || [])]).length },
+  notInterested: { count: result => uniqueClean(result[NOT_INTERESTED_KEY]?.ids || []).length },
+  favoriteCreators: { count: result => uniqueClean(result[FAVORITE_CREATORS_KEY]?.handles || []).length },
+  followedCreators: { count: result => uniqueClean(result[FOLLOWED_CREATORS_KEY]?.handles || []).length },
+  creatorBotWatch: { count: result => Object.keys(normalizeCreatorBotWatchState(result[CREATOR_BOT_WATCH_KEY]).creators || {}).length },
+  favoriteBots: { count: result => uniqueClean(result[FAVORITE_BOTS_KEY]?.ids || []).length },
+  laterBots: { count: result => uniqueClean(result[LATER_BOTS_KEY]?.ids || []).length },
+  botOrganization: { count: result => Object.keys(result[BOT_ORGANIZER_KEY]?.meta || {}).length },
+  chatOrganization: { count: result => Object.keys(normalizeChatOrganization(result[CHAT_ORGANIZER_KEY]).meta).length },
+  characterQolProfiles: { count: result => Object.keys(normalizeCharacterQolProfiles(result[CHARACTER_QOL_PROFILES_KEY])).length },
+  botAvailability: { count: result => Object.keys(normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]).meta).length },
+  botArchive: { count: result => Object.keys(normalizeBotArchive(result[BOT_ARCHIVE_KEY]).meta).length },
+  lorebookBackups: { count: result => Object.keys(normalizeLorebookBackups(result[LOREBOOK_BACKUPS_KEY]).meta).length },
+  chatbotLorebookLinks: { count: result => Object.keys(result[CHATBOT_LOREBOOK_LINKS_KEY] && typeof result[CHATBOT_LOREBOOK_LINKS_KEY] === "object" ? result[CHATBOT_LOREBOOK_LINKS_KEY] : {}).length },
+  savedTextSnippets: { count: result => Array.isArray(result[SAVED_TEXT_SNIPPETS_KEY]) ? result[SAVED_TEXT_SNIPPETS_KEY].length : 0 },
+  contextKeeperData: { count: result => Object.keys(result[CONTEXT_KEEPER_DATA_KEY] && typeof result[CONTEXT_KEEPER_DATA_KEY] === "object" ? result[CONTEXT_KEEPER_DATA_KEY] : {}).length },
+  storyDayTrackerData: { count: result => Object.keys(result[STORY_DAY_TRACKER_KEY] && typeof result[STORY_DAY_TRACKER_KEY] === "object" ? result[STORY_DAY_TRACKER_KEY] : {}).length },
+  rpStateTrackerData: { count: result => Object.keys(result[RP_STATE_TRACKER_KEY] && typeof result[RP_STATE_TRACKER_KEY] === "object" ? result[RP_STATE_TRACKER_KEY] : {}).length },
+  chatNudges: { count: result => normalizeChatNudgeStore(result[CHAT_NUDGE_STORE_KEY]).length },
+  personas: { count: result => Array.isArray(result[PERSONAS_KEY]) ? result[PERSONAS_KEY].length : (Array.isArray(result[LEGACY_PERSONAS_KEY]) ? result[LEGACY_PERSONAS_KEY].length : 0) },
+  personaOrganization: { count: result => Object.keys(result[PERSONA_ORG_KEY]?.meta || {}).length },
+  ooc: { count: result => normalizeOocTemplates(result[OOC_TEMPLATES_KEY]).length },
+  generationProfiles: { count: result => Object.keys(normalizeGenerationProfiles(result[GENERATION_PROFILES_KEY])).length },
+  smartFilterPresets: { count: result => normalizeSmartFilterPresets(result[SMART_FILTER_PRESETS_KEY]).length },
+  smartFilterPins: { count: result => normalizeSmartFilterPins(result[SMART_FILTER_PINNED_KEY], result[SMART_FILTER_PRESETS_KEY]).length },
+  botEditorDraftHistory: { count: result => Object.values(normalizeBotEditorDraftHistory(result[BOT_EDITOR_DRAFT_HISTORY_KEY]).entries).reduce((n, list) => n + list.length, 0) },
+  chatBookmarks: { count: result => Object.values(result[CHAT_BOOKMARKS_KEY] || {}).reduce((n, chat) => n + (Array.isArray(chat?.entries) ? chat.entries.length : 0), 0) },
+  recentlySeenBots: { count: result => Array.isArray(result[RECENTLY_SEEN_BOTS_KEY]?.entries) ? result[RECENTLY_SEEN_BOTS_KEY].entries.length : 0 },
+  soundscapes: { count: result => normalizeSoundscapeScenes(result[SOUNDSCAPES_KEY]).scenes.length },
+  tabCleanupSessions: { count: result => normalizeTabCleanupSessions(result[TAB_CLEANUP_SESSIONS_KEY]).sessions.length },
+  tabCleanupTopics: { count: result => normalizeTabCleanupTopics(result[TAB_CLEANUP_TOPICS_KEY]).topics.length },
+  tabCleanupEnrichment: { count: result => Object.keys(result[TAB_CLEANUP_ENRICHMENT_KEY]?.meta || {}).length },
+  localChangeHistory: { count: result => Array.isArray(result[LOCAL_CHANGE_HISTORY_KEY]) ? result[LOCAL_CHANGE_HISTORY_KEY].length : 0 },
+  localMedia: { count: result => normalizeSoundscapeAudio(result[SOUNDSCAPE_AUDIO_KEY]).items.length + (normalizeChatBackgroundMediaStore(result[CHAT_BACKGROUNDS_KEY]).global ? 1 : 0) + Object.keys(normalizeChatBackgroundMediaStore(result[CHAT_BACKGROUNDS_KEY]).chats || {}).length, large: true }
+};
 
 async function readBackupSourceData() {
   const result = await storageGetChecked(BACKUP_STORAGE_KEYS);
   if (!result.ok) throw new Error(result.error || "Browser storage could not be read");
   return result.data;
+}
+
+let exportScopesInitialized = false;
+
+function setExportScopeCount(scope, count, suffix = "saved") {
+  document.querySelectorAll(`[data-export-count-for="${CSS.escape(scope)}"]`).forEach(node => {
+    const numeric = Number(count) || 0;
+    node.textContent = numeric ? `(${numeric.toLocaleString()} ${suffix})` : "";
+  });
+}
+
+function refreshExportScopeCounts(result) {
+  for (const scope of SETTINGS_BACKUP_SCOPE_IDS) {
+    setExportScopeCount(scope, settingsScopeUsageCount(result.settings, scope), "active/customized");
+  }
+  for (const [scope, def] of Object.entries(BACKUP_DATA_SCOPE_DEFS)) {
+    setExportScopeCount(scope, def.count(result), "saved");
+  }
+}
+
+async function selectActiveUsedExportScopes({ initialize = false } = {}) {
+  let result;
+  try {
+    result = await readBackupSourceData();
+  } catch {
+    if (!initialize) showSettingsToast("Could not read local data to build the Active / Used selection.");
+    return;
+  }
+  refreshExportScopeCounts(result);
+  document.querySelectorAll("[data-export-scope]").forEach(input => {
+    const scope = String(input.dataset.exportScope || "");
+    if (isSettingsBackupScope(scope)) {
+      input.checked = settingsScopeUsageCount(result.settings, scope) > 0;
+      return;
+    }
+    const def = BACKUP_DATA_SCOPE_DEFS[scope];
+    input.checked = !!def && !def.large && def.count(result) > 0;
+  });
+  exportScopesInitialized = true;
+}
+
+async function initializeExportScopeSelection() {
+  if (exportScopesInitialized) return;
+  await selectActiveUsedExportScopes({ initialize: true });
 }
 
 async function exportSettings() {
@@ -12353,6 +13020,7 @@ function normalizeRecoverySnapshot(value) {
     createdAt: Number(raw.createdAt) || 0,
     reason: String(raw.reason || "manual"),
     extensionVersion: String(raw.extensionVersion || ""),
+    scopes: Array.isArray(raw.scopes) ? raw.scopes.map(String) : [],
     backup: raw.backup
   };
 }
@@ -12367,7 +13035,10 @@ async function refreshRecoverySnapshotStatus() {
     return;
   }
   const when = snapshot.createdAt ? new Date(snapshot.createdAt).toLocaleString() : "unknown time";
-  host.textContent = `Last snapshot: ${when} · ${snapshot.reason}. Lightweight QoL data only; local media bytes and API keys stay device-local and are not copied.`;
+  const mediaNote = snapshot.scopes.includes("localMedia")
+    ? " Local media was included because that category was part of the protected action."
+    : " Local media bytes are not included.";
+  host.textContent = `Last snapshot: ${when} · ${snapshot.reason}.${mediaNote} API keys/webhook URLs are never copied.`;
 }
 
 let pendingImportSafetyDownload = null;
@@ -12389,13 +13060,14 @@ async function createRecoverySnapshot(reason = "manual", sourceData = null, scop
   const requestedScopes = scopes instanceof Set ? scopes : new Set(scopes || []);
   const selectedScopes = requestedScopes.size
     ? new Set([...requestedScopes].filter(scope => BACKUP_SCOPE_IDS.includes(scope)))
-    : new Set(BACKUP_SCOPE_IDS);
+    : new Set(LIGHTWEIGHT_BACKUP_SCOPE_IDS);
   if (!selectedScopes.size) throw new Error("No recovery data was selected");
 
   const snapshot = {
     createdAt: Date.now(),
     reason: String(reason || "manual"),
     extensionVersion: chrome.runtime.getManifest()?.version || "",
+    scopes: [...selectedScopes],
     backup: buildExportPayload(selectedScopes, result)
   };
   const ok = await storageSetVerified({ [RECOVERY_SNAPSHOT_KEY]: snapshot });
@@ -12465,6 +13137,28 @@ function replaceSettingsForImport(importedSettings) {
   next.replyInstructionBotOverrides = normalizeReplyInstructionOverrides(imported.replyInstructionBotOverrides);
 
   return next;
+}
+
+function selectedSettingsScopesForImport(importScopes) {
+  const selected = new Set([...importScopes].filter(isSettingsBackupScope));
+  if (importScopes.has("settings")) return new Set(["settings"]);
+  return selected;
+}
+
+function mergeSettingsGroupsForImport(currentSettings, importedSettings, selectedScopes) {
+  if (selectedScopes.has("settings")) return mergeSettingsForImport(currentSettings, importedSettings);
+  const subset = settingsPresentSubsetForScopes(importedSettings, selectedScopes);
+  return mergeSettingsForImport(currentSettings, subset);
+}
+
+function replaceSettingsGroupsForImport(currentSettings, importedSettings, selectedScopes) {
+  if (selectedScopes.has("settings")) return replaceSettingsForImport(importedSettings);
+  const current = { ...DEFAULT_SETTINGS, ...(currentSettings || {}) };
+  const replacement = replaceSettingsForImport(settingsSubsetForScopes(importedSettings, selectedScopes));
+  for (const scope of selectedScopes) {
+    for (const key of settingKeysForBackupScope(scope)) current[key] = replacement[key];
+  }
+  return current;
 }
 
 
@@ -12633,15 +13327,32 @@ function importCategoryEntries(parsed) {
     !source.botAvailability && !source.botArchive && !source.lorebookBackups && !source.savedTextSnippets &&
     !source.contextKeeperData && !source.storyDayTrackerData && !source.rpStateTrackerData && !source.chatNudges && !source.personas && !source.personaOrganization &&
     !source.oocTemplates && !source.generationProfiles && !source.smartFilterPresets && !source.smartFilterPinnedPresets &&
-    !source.botEditorDraftHistory && !source.chatBookmarks && !source.recentlySeenBots && !source._qolBackup
+    !source.botEditorDraftHistory && !source.chatBookmarks && !source.recentlySeenBots && !source.creatorBotWatch &&
+    !source.chatbotLorebookLinks && !source.soundscapes && !source.tabCleanupSessions && !source.tabCleanupTopics &&
+    !source.tabCleanupEnrichment && !source.localChangeHistory && !source.localMedia && !source._qolBackup
   ));
   const add = (scope, label, count) => entries.push({ scope, label, count: Number(count) || 0 });
-  if (settingsLike) add("settings", "Settings", Object.keys(source.settings || source || {}).filter(k => k !== "_qolBackup").length);
+  if (settingsLike) {
+    const settingsSource = source.settings || source || {};
+    const declaredScopes = Array.isArray(source?._qolBackup?.settingsScopes)
+      ? source._qolBackup.settingsScopes.map(String)
+      : [];
+    const grouped = declaredScopes.filter(isSettingsBackupScope);
+    if (grouped.length) {
+      for (const scope of grouped) {
+        const keys = settingKeysForBackupScope(scope).filter(key => Object.prototype.hasOwnProperty.call(settingsSource, key));
+        add(scope, SETTINGS_BACKUP_GROUPS[scope]?.label || scope, keys.length);
+      }
+    } else {
+      add("settings", "Settings (legacy/all)", Object.keys(settingsSource).filter(k => k !== "_qolBackup").length);
+    }
+  }
   if (Array.isArray(source.openedChats)) add("opened", "Bot Status Center opened history", source.openedChats.length);
   if (source.blockedBots && typeof source.blockedBots === "object") add("blocked", "Blocked bots", uniqueClean([...(source.blockedBots.ids || []), ...(source.blockedBots.names || [])]).length);
   if (source.notInterestedBots && typeof source.notInterestedBots === "object") add("notInterested", "Not interested", uniqueClean(source.notInterestedBots.ids || []).length);
   if (source.favoriteCreators && typeof source.favoriteCreators === "object") add("favoriteCreators", "Favorite creators", uniqueClean(source.favoriteCreators.handles || []).length);
   if (source.followedCreators && typeof source.followedCreators === "object") add("followedCreators", "Followed creators", uniqueClean(source.followedCreators.handles || []).length);
+  if (source.creatorBotWatch && typeof source.creatorBotWatch === "object") add("creatorBotWatch", "Creator follow/watch history", Object.keys(normalizeCreatorBotWatchState(source.creatorBotWatch).creators || {}).length);
   if (source.favoriteBots && typeof source.favoriteBots === "object") add("favoriteBots", "Favorite bots", uniqueClean(source.favoriteBots.ids || []).length);
   if (source.laterBots && typeof source.laterBots === "object") add("laterBots", "Later bots", uniqueClean(source.laterBots.ids || []).length);
   if (source.botOrganization && typeof source.botOrganization === "object") add("botOrganization", "Bot organization", Object.keys(source.botOrganization.meta || {}).length);
@@ -12651,6 +13362,7 @@ function importCategoryEntries(parsed) {
   if (source.botAvailability && typeof source.botAvailability === "object") add("botAvailability", "Bot availability checks", Object.keys(normalizeBotAvailability(source.botAvailability).meta).length);
   if (source.botArchive && typeof source.botArchive === "object") add("botArchive", "Saved bot copies", Object.keys(normalizeBotArchive(source.botArchive).meta).length);
   if (source.lorebookBackups && typeof source.lorebookBackups === "object") add("lorebookBackups", "Lorebook backups", Object.keys(normalizeLorebookBackups(source.lorebookBackups).meta).length);
+  if (source.chatbotLorebookLinks && typeof source.chatbotLorebookLinks === "object") add("chatbotLorebookLinks", "Chatbot ↔ Lorebook links", Object.keys(source.chatbotLorebookLinks).length);
   if (Array.isArray(source.savedTextSnippets)) add("savedTextSnippets", "Saved snippets", source.savedTextSnippets.length);
   if (source.contextKeeperData && typeof source.contextKeeperData === "object") add("contextKeeperData", "Context Keeper chats", Object.keys(source.contextKeeperData).length);
   if (source.storyDayTrackerData && typeof source.storyDayTrackerData === "object") add("storyDayTrackerData", "Internal Day Tracker chats", Object.keys(source.storyDayTrackerData).length);
@@ -12664,6 +13376,16 @@ function importCategoryEntries(parsed) {
   if (Array.isArray(source.smartFilterPinnedPresets)) add("smartFilterPins", "Pinned Smart Filter presets", normalizeSmartFilterPins(source.smartFilterPinnedPresets, source.smartFilterPresets).length);
   if (source.botEditorDraftHistory && typeof source.botEditorDraftHistory === "object") add("botEditorDraftHistory", "Chatbot editor draft history", Object.values(normalizeBotEditorDraftHistory(source.botEditorDraftHistory).entries).reduce((n, list) => n + list.length, 0));
   if (source.recentlySeenBots && typeof source.recentlySeenBots === "object") add("recentlySeenBots", "Recently seen bots", Array.isArray(source.recentlySeenBots.entries) ? source.recentlySeenBots.entries.length : 0);
+  if (source.soundscapes && typeof source.soundscapes === "object") add("soundscapes", "Soundscape scene configuration", normalizeSoundscapeScenes(source.soundscapes).scenes.length);
+  if (source.tabCleanupSessions && typeof source.tabCleanupSessions === "object") add("tabCleanupSessions", "Saved tab sessions", normalizeTabCleanupSessions(source.tabCleanupSessions).sessions.length);
+  if (source.tabCleanupTopics && typeof source.tabCleanupTopics === "object") add("tabCleanupTopics", "Tab Cleanup topics", normalizeTabCleanupTopics(source.tabCleanupTopics).topics.length);
+  if (source.tabCleanupEnrichment && typeof source.tabCleanupEnrichment === "object") add("tabCleanupEnrichment", "Tab Cleanup profile metadata", Object.keys(source.tabCleanupEnrichment.meta || {}).length);
+  if (Array.isArray(source.localChangeHistory)) add("localChangeHistory", "Recent QoL change history", source.localChangeHistory.length);
+  if (source.localMedia && typeof source.localMedia === "object") {
+    const audioCount = normalizeSoundscapeAudio(source.localMedia.soundscapeAudio).items.length;
+    const backgrounds = normalizeChatBackgroundMediaStore(source.localMedia.chatBackgroundMedia);
+    add("localMedia", "Local media", audioCount + (backgrounds.global ? 1 : 0) + Object.keys(backgrounds.chats || {}).length);
+  }
   return entries;
 }
 
@@ -12678,7 +13400,7 @@ function validateBackupObject(parsed) {
   const migration = migrateBackupPayload(parsed);
   const source = migration.payload;
   const entries = importCategoryEntries(source);
-  const known = new Set(["_qolBackup", "settings", "openedChats", "openedChatMeta", "blockedBots", "quickDislikeHistory", "quickDislikeBulkState", "notInterestedBots", "favoriteCreators", "followedCreators", "favoriteBots", "laterBots", "botOrganization", "chatOrganization", "characterQolProfiles", "botAvailability", "botArchive", "lorebookBackups", "savedTextSnippets", "contextKeeperData", "storyDayTrackerData", "rpStateTrackerData", "chatNudges", "personas", "personaOrganization", "oocTemplates", "generationProfiles", "smartFilterPresets", "smartFilterPinnedPresets", "botEditorDraftHistory", "chatBookmarks", "recentlySeenBots"]);
+  const known = new Set(["_qolBackup", "settings", "openedChats", "openedChatMeta", "blockedBots", "quickDislikeHistory", "quickDislikeBulkState", "notInterestedBots", "favoriteCreators", "followedCreators", "creatorBotWatch", "favoriteBots", "laterBots", "botOrganization", "chatOrganization", "characterQolProfiles", "botAvailability", "botArchive", "lorebookBackups", "chatbotLorebookLinks", "savedTextSnippets", "contextKeeperData", "storyDayTrackerData", "rpStateTrackerData", "chatNudges", "personas", "personaOrganization", "oocTemplates", "generationProfiles", "smartFilterPresets", "smartFilterPinnedPresets", "botEditorDraftHistory", "chatBookmarks", "recentlySeenBots", "soundscapes", "tabCleanupSessions", "tabCleanupTopics", "tabCleanupEnrichment", "localChangeHistory", "localMedia"]);
   const warnings = Object.keys(source).filter(key => !known.has(key)).map(key => `Unknown top-level field: ${key}`);
   const meta = source._qolBackup && typeof source._qolBackup === "object" ? source._qolBackup : null;
   if (!meta) warnings.push("Legacy backup: no QoL backup metadata found (still importable after preview). ");
@@ -12712,10 +13434,8 @@ function importPreviewDetails(parsed, validation) {
     details.push(`Personas: ${personas.length} total · ${withText} with text · ${withAvatar} with local avatar data`);
   }
 
-  // Chat-background media intentionally remains device-local and is excluded
-  // from normal lightweight backup payloads because base64 images can dwarf
-  // the rest of the settings/data JSON.
-  details.push("Local chat-background image bytes are not included in normal backups");
+  if (parsed?.localMedia) details.push("Local media is included in this backup and may make the file much larger");
+  else details.push("Local soundscape audio and chat-background image bytes are not included unless Local media is selected");
   return details;
 }
 
@@ -12852,7 +13572,16 @@ async function importSettings() {
       SMART_FILTER_PINNED_KEY,
       BOT_EDITOR_DRAFT_HISTORY_KEY,
       CHAT_BOOKMARKS_KEY,
-      RECENTLY_SEEN_BOTS_KEY
+      RECENTLY_SEEN_BOTS_KEY,
+      CREATOR_BOT_WATCH_KEY,
+      CHATBOT_LOREBOOK_LINKS_KEY,
+      SOUNDSCAPES_KEY,
+      SOUNDSCAPE_AUDIO_KEY,
+      CHAT_BACKGROUNDS_KEY,
+      TAB_CLEANUP_SESSIONS_KEY,
+      TAB_CLEANUP_TOPICS_KEY,
+      TAB_CLEANUP_ENRICHMENT_KEY,
+      LOCAL_CHANGE_HISTORY_KEY
     ]);
     if (!currentRead.ok) throw new Error(currentRead.error || "Current QoL data could not be read safely");
     const current = currentRead.data;
@@ -12887,12 +13616,21 @@ async function importSettings() {
         !parsed.smartFilterPinnedPresets &&
         !parsed.botEditorDraftHistory &&
         !parsed.chatBookmarks &&
-        !parsed.recentlySeenBots);
+        !parsed.recentlySeenBots &&
+        !parsed.creatorBotWatch &&
+        !parsed.chatbotLorebookLinks &&
+        !parsed.soundscapes &&
+        !parsed.tabCleanupSessions &&
+        !parsed.tabCleanupTopics &&
+        !parsed.tabCleanupEnrichment &&
+        !parsed.localChangeHistory &&
+        !parsed.localMedia);
 
-    if (parsedLooksLikeSettings && hasImportScope("settings")) {
+    const selectedSettingsScopes = selectedSettingsScopesForImport(importScopes);
+    if (parsedLooksLikeSettings && selectedSettingsScopes.size) {
       payload.settings = mode === "replace"
-        ? replaceSettingsForImport(parsed.settings || parsed)
-        : mergeSettingsForImport(current.settings, parsed.settings || parsed);
+        ? replaceSettingsGroupsForImport(current.settings, parsed.settings || parsed, selectedSettingsScopes)
+        : mergeSettingsGroupsForImport(current.settings, parsed.settings || parsed, selectedSettingsScopes);
     }
 
     if (hasImportScope("opened") && Array.isArray(parsed.openedChats)) {
@@ -12938,6 +13676,20 @@ async function importSettings() {
       payload[FOLLOWED_CREATORS_KEY] = mode === "replace"
         ? normalizeCreatorStore(parsed.followedCreators)
         : mergeCreatorStores(current[FOLLOWED_CREATORS_KEY], parsed.followedCreators);
+    }
+
+    if (hasImportScope("creatorBotWatch") && parsed.creatorBotWatch && typeof parsed.creatorBotWatch === "object") {
+      const incoming = normalizeCreatorBotWatchState(parsed.creatorBotWatch);
+      if (mode === "replace") payload[CREATOR_BOT_WATCH_KEY] = incoming;
+      else {
+        const existing = normalizeCreatorBotWatchState(current[CREATOR_BOT_WATCH_KEY]);
+        payload[CREATOR_BOT_WATCH_KEY] = normalizeCreatorBotWatchState({
+          ...existing,
+          ...incoming,
+          creators: { ...(existing.creators || {}), ...(incoming.creators || {}) },
+          recent: [...(existing.recent || []), ...(incoming.recent || [])]
+        });
+      }
     }
 
     if (hasImportScope("favoriteBots") && parsed.favoriteBots && typeof parsed.favoriteBots === "object") {
@@ -12986,6 +13738,11 @@ async function importSettings() {
       payload[LOREBOOK_BACKUPS_KEY] = mode === "replace"
         ? normalizeLorebookBackups(parsed.lorebookBackups)
         : mergeLorebookBackups(current[LOREBOOK_BACKUPS_KEY], parsed.lorebookBackups);
+    }
+
+    if (hasImportScope("chatbotLorebookLinks") && parsed.chatbotLorebookLinks && typeof parsed.chatbotLorebookLinks === "object") {
+      const existing = current[CHATBOT_LOREBOOK_LINKS_KEY] && typeof current[CHATBOT_LOREBOOK_LINKS_KEY] === "object" ? current[CHATBOT_LOREBOOK_LINKS_KEY] : {};
+      payload[CHATBOT_LOREBOOK_LINKS_KEY] = mode === "replace" ? parsed.chatbotLorebookLinks : { ...existing, ...parsed.chatbotLorebookLinks };
     }
 
     if (hasImportScope("savedTextSnippets") && Array.isArray(parsed.savedTextSnippets)) {
@@ -13117,6 +13874,79 @@ async function importSettings() {
       payload[BOT_EDITOR_DRAFT_HISTORY_KEY] = mode === "replace"
         ? normalizeBotEditorDraftHistory(parsed.botEditorDraftHistory)
         : mergeBotEditorDraftHistory(current[BOT_EDITOR_DRAFT_HISTORY_KEY], parsed.botEditorDraftHistory);
+    }
+
+    if (hasImportScope("soundscapes") && parsed.soundscapes && typeof parsed.soundscapes === "object") {
+      if (mode === "replace") payload[SOUNDSCAPES_KEY] = normalizeSoundscapeScenes(parsed.soundscapes);
+      else {
+        const existing = normalizeSoundscapeScenes(current[SOUNDSCAPES_KEY]);
+        const incoming = normalizeSoundscapeScenes(parsed.soundscapes);
+        const byId = new Map(existing.scenes.map(scene => [String(scene.id || scene.name || ""), scene]));
+        for (const scene of incoming.scenes) byId.set(String(scene.id || scene.name || ""), scene);
+        payload[SOUNDSCAPES_KEY] = { ...existing, ...incoming, scenes: [...byId.values()] };
+      }
+    }
+
+    if (hasImportScope("tabCleanupSessions") && parsed.tabCleanupSessions && typeof parsed.tabCleanupSessions === "object") {
+      if (mode === "replace") payload[TAB_CLEANUP_SESSIONS_KEY] = normalizeTabCleanupSessions(parsed.tabCleanupSessions);
+      else {
+        const existing = normalizeTabCleanupSessions(current[TAB_CLEANUP_SESSIONS_KEY]);
+        const incoming = normalizeTabCleanupSessions(parsed.tabCleanupSessions);
+        const byId = new Map(existing.sessions.map(session => [String(session.id || session.createdAt || ""), session]));
+        for (const session of incoming.sessions) byId.set(String(session.id || session.createdAt || ""), session);
+        payload[TAB_CLEANUP_SESSIONS_KEY] = { version: 2, sessions: [...byId.values()].sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)).slice(0, 40) };
+      }
+    }
+
+    if (hasImportScope("tabCleanupTopics") && parsed.tabCleanupTopics && typeof parsed.tabCleanupTopics === "object") {
+      if (mode === "replace") payload[TAB_CLEANUP_TOPICS_KEY] = normalizeTabCleanupTopics(parsed.tabCleanupTopics);
+      else {
+        const existing = normalizeTabCleanupTopics(current[TAB_CLEANUP_TOPICS_KEY]);
+        const incoming = normalizeTabCleanupTopics(parsed.tabCleanupTopics);
+        const byId = new Map(existing.topics.map(topic => [String(topic.id || topic.name || ""), topic]));
+        for (const topic of incoming.topics) byId.set(String(topic.id || topic.name || ""), topic);
+        payload[TAB_CLEANUP_TOPICS_KEY] = { version: 1, topics: [...byId.values()] };
+      }
+    }
+
+    if (hasImportScope("tabCleanupEnrichment") && parsed.tabCleanupEnrichment && typeof parsed.tabCleanupEnrichment === "object") {
+      const existing = current[TAB_CLEANUP_ENRICHMENT_KEY] && typeof current[TAB_CLEANUP_ENRICHMENT_KEY] === "object" ? current[TAB_CLEANUP_ENRICHMENT_KEY] : { meta: {} };
+      payload[TAB_CLEANUP_ENRICHMENT_KEY] = mode === "replace"
+        ? parsed.tabCleanupEnrichment
+        : { ...existing, ...parsed.tabCleanupEnrichment, meta: { ...(existing.meta || {}), ...(parsed.tabCleanupEnrichment.meta || {}) } };
+    }
+
+    if (hasImportScope("localChangeHistory") && Array.isArray(parsed.localChangeHistory)) {
+      if (mode === "replace") payload[LOCAL_CHANGE_HISTORY_KEY] = parsed.localChangeHistory.slice(0, 100);
+      else {
+        const existing = Array.isArray(current[LOCAL_CHANGE_HISTORY_KEY]) ? current[LOCAL_CHANGE_HISTORY_KEY] : [];
+        const byId = new Map();
+        for (const item of [...existing, ...parsed.localChangeHistory]) {
+          const key = String(item?.id || `${item?.at || ""}:${item?.label || ""}`);
+          if (key) byId.set(key, item);
+        }
+        payload[LOCAL_CHANGE_HISTORY_KEY] = [...byId.values()].sort((a, b) => Number(b?.at || 0) - Number(a?.at || 0)).slice(0, 100);
+      }
+    }
+
+    if (hasImportScope("localMedia") && parsed.localMedia && typeof parsed.localMedia === "object") {
+      const incomingAudio = normalizeSoundscapeAudio(parsed.localMedia.soundscapeAudio);
+      const incomingBackgrounds = normalizeChatBackgroundMediaStore(parsed.localMedia.chatBackgroundMedia);
+      if (mode === "replace") {
+        payload[SOUNDSCAPE_AUDIO_KEY] = incomingAudio;
+        payload[CHAT_BACKGROUNDS_KEY] = incomingBackgrounds;
+      } else {
+        const existingAudio = normalizeSoundscapeAudio(current[SOUNDSCAPE_AUDIO_KEY]);
+        const audioById = new Map(existingAudio.items.map(item => [String(item.id || item.name || ""), item]));
+        for (const item of incomingAudio.items) audioById.set(String(item.id || item.name || ""), item);
+        payload[SOUNDSCAPE_AUDIO_KEY] = { ...existingAudio, ...incomingAudio, items: [...audioById.values()] };
+
+        const existingBackgrounds = normalizeChatBackgroundMediaStore(current[CHAT_BACKGROUNDS_KEY]);
+        payload[CHAT_BACKGROUNDS_KEY] = {
+          global: incomingBackgrounds.global || existingBackgrounds.global || null,
+          chats: { ...(existingBackgrounds.chats || {}), ...(incomingBackgrounds.chats || {}) }
+        };
+      }
     }
 
     if (!Object.keys(payload).length) throw new Error("Nothing importable found");
@@ -13605,12 +14435,13 @@ async function renderCreatorWorkspace() {
   const botList = Object.values(bots);
   const bookList = Object.values(books);
   const ownBots = botList.filter(bot => bot.ownBot);
-  const revisionCount = botList.reduce((n, bot) => n + (Array.isArray(bot.revisions) ? bot.revisions.length : 0), 0);
+  const versionCount = ownBots.reduce((n, bot) => n + (Array.isArray(bot.versions) ? bot.versions.length : 0), 0);
+  const revisionCount = ownBots.reduce((n, bot) => n + (Array.isArray(bot.revisions) ? bot.revisions.length : 0), 0);
   const draftCount = Object.values(drafts).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0);
   const staleBots = cfg.botBackupToolsEnabled && cfg.botArchiveOwnEditorBackups ? ownBots.filter(bot => Number(bot.lastSavedAt || 0) && Date.now() - Number(bot.lastSavedAt) > CREATOR_BACKUP_STALE_MS).length : 0;
   const staleBooks = cfg.lorebookBackupToolsEnabled && cfg.lorebookBackupsEnabled ? bookList.filter(book => Number(book.lastSavedAt || 0) && Date.now() - Number(book.lastSavedAt) > CREATOR_BACKUP_STALE_MS).length : 0;
   const cards = [
-    ["Own bot backups", ownBots.length, `${revisionCount} previous revision${revisionCount === 1 ? "" : "s"}${staleBots ? ` · ${staleBots} stale` : ""}`],
+    ["Own bot backups", ownBots.length, `${versionCount} recorded bot version${versionCount === 1 ? "" : "s"} · ${revisionCount} safety revision${revisionCount === 1 ? "" : "s"}${staleBots ? ` · ${staleBots} stale` : ""}`],
     ["Lorebook backups", bookList.length, `${bookList.reduce((n, book) => n + Object.keys(book.entries || {}).length, 0)} saved entries${staleBooks ? ` · ${staleBooks} stale` : ""}`],
     ["Editor drafts", draftCount, `${Object.keys(drafts).length} bot/draft workspace${Object.keys(drafts).length === 1 ? "" : "s"}`],
     ["Known bot ↔ Lorebook links", Object.keys(links).length, "Learned when attached Lorebooks are visible on Edit Chatbot"]
@@ -13649,7 +14480,7 @@ async function collectDataHealth() {
   rows.push({ state: "ok", label: "Browser storage", detail: `Readable${Number.isFinite(totalBytes) ? ` · ${formatControlBytes(totalBytes)} used` : ""}.` });
 
   try {
-    const payload = buildExportPayload(new Set(BACKUP_SCOPE_IDS), result);
+    const payload = buildExportPayload(new Set(LIGHTWEIGHT_BACKUP_SCOPE_IDS), result);
     const roundTrip = JSON.parse(JSON.stringify(payload));
     const validation = validateBackupObject(roundTrip);
     rows.push({ state: validation.ok ? "ok" : "bad", label: "Backup schema", detail: validation.ok ? `Current local data produces a valid schema v${BACKUP_FORMAT_VERSION} backup.` : validation.warnings.join(" · ") });
@@ -13721,7 +14552,7 @@ async function runMigrationDryRun() {
   const host = $("controlHealthResults");
   try {
     const result = await readBackupSourceData();
-    const payload = buildExportPayload(new Set(BACKUP_SCOPE_IDS), result);
+    const payload = buildExportPayload(new Set(LIGHTWEIGHT_BACKUP_SCOPE_IDS), result);
     const serialized = JSON.stringify(payload);
     const parsed = JSON.parse(serialized);
     const validation = validateBackupObject(parsed);
@@ -13956,7 +14787,7 @@ function sanitizeDiagnosticPath(url) {
   try {
     const parsed = new URL(url || "");
     return parsed.pathname
-      .replace(/\/(chat|chats|chatbot)\/[0-9a-f-]{8,}/ig, "/$1/:id")
+      .replace(/\/(chat|chats|chatbot|story|lorebook)\/[0-9a-f-]{8,}/ig, "/$1/:id")
       .replace(/\/(creator|profile)\/[^/]+/ig, "/$1/:name");
   } catch {
     return "unknown";
@@ -13991,6 +14822,7 @@ async function copyDiagnostics({ returnOnly = false } = {}) {
     CHAT_BOOKMARKS_KEY,
     RECOVERY_SNAPSHOT_KEY,
     SAI_TOOLKIT_PRESENCE_KEY,
+    SPICYCHAT_BETA_CAPABILITIES_KEY,
     "cardTokenFetchDiagnosticsV1"
   ]);
   const context = await runtimeMessage({ type: "DS_GET_DIAGNOSTIC_CONTEXT" });
@@ -14002,7 +14834,7 @@ async function copyDiagnostics({ returnOnly = false } = {}) {
   const diagnosticLines = [
     "SpicyChat QoL diagnostics",
     `Generated: ${new Date().toISOString()}`,
-    `Version: ${chrome.runtime.getManifest?.().version_name || displayReleaseVersion(chrome.runtime.getManifest?.().version || "unknown")} (technical ${chrome.runtime.getManifest?.().version || "unknown"})`,
+    `Version: ${chrome.runtime.getManifest?.().version_name || displayReleaseVersion(chrome.runtime.getManifest?.().version || "unknown")}`,
     `Browser: ${navigator.userAgent}`,
     `Platform: ${navigator.platform || "unknown"}`,
     (() => { const p = context?.pageDiagnostics?.buildProfile; return context?.runtimeAvailable && context?.pageDiagnostics ? `Build profile: ${p?.label || p?.id || "Full"}; bundles ${(p?.bundles || []).join(", ") || "unknown"}` : "Build profile: unavailable with runtime data"; })(),
@@ -14010,6 +14842,7 @@ async function copyDiagnostics({ returnOnly = false } = {}) {
     `Runtime data: ${context?.runtimeAvailable && context?.pageDiagnostics ? "available" : "unavailable — no open SpicyChat tab responded to diagnostics; runtime counters below are omitted or unavailable"}`,
     (() => { const p = context?.pageDiagnostics?.diagnosticProtocol; return p ? `Dragon's SpicyChat Diagnostic Extension protocol: v${Number(p.protocolVersion || 1)}; ${p.inspectorConnected ? `paired${p.inspectorVersion ? ` with Inspector ${p.inspectorVersion}` : " with Inspector"}` : "Inspector not currently paired"}; QoL ${p.runState || "unknown"}` : "Dragon's SpicyChat Diagnostic Extension protocol: unavailable with runtime data"; })(),
     `S.AI Toolkit detected: ${result[SAI_TOOLKIT_PRESENCE_KEY]?.detected ? "yes" : "no"}`,
+    (() => { const beta = result[SPICYCHAT_BETA_CAPABILITIES_KEY] || {}; const caps = beta.capabilities || {}; return `SpicyChat beta/experimental access: ${beta.detected ? "detected" : "not detected"}; Public Lorebooks ${caps.publicLorebooks || "unknown"}; Story Mode ${caps.storyMode || "unknown"}`; })(),
     `S.AI compatibility enabled: ${settings.saiToolkitCompatibility ? "yes" : "no"}`,
     Number.isFinite(bytes) ? `QoL storage: ${(bytes / 1024).toFixed(1)} KB` : "QoL storage: unavailable",
     `Backup schema supported: v${BACKUP_FORMAT_VERSION}`,
@@ -14060,7 +14893,7 @@ async function copyDiagnostics({ returnOnly = false } = {}) {
 
   const refill = context?.pageDiagnostics?.listingRefill;
   if (refill) {
-    diagnosticLines.push(`Listing refill: ${Number(refill.visible || 0)}/${Number(refill.target || settings.autoFillTargetCards || 50)} visible; ${Number(refill.hidden || 0)} hidden; ${Number(refill.pagesLoaded || 0)} helper pages; ${Number(refill.received || 0)} cards received; ${Number(refill.metadataExtracted || 0)} metadata records; ${Number(refill.tagsRestored || 0)} tag rows rebuilt; ${Number(refill.appended || 0)} added; ${Number(refill.duplicates || 0)} duplicates; ${Number(refill.helperFailures || 0)} helper failures; last page ${Number(refill.lastPage || 0) || "—"}; ${refill.running ? (refill.stopping ? "stopping" : "running") : (refill.paused ? "paused" : "idle")}${refill.lastError ? `; last error: ${refill.lastError}` : ""}`);
+    diagnosticLines.push(`Listing refill: ${Number(refill.visible || 0)}/${Number(refill.target || settings.autoFillTargetCards || 50)} visible; ${Number(refill.hidden || 0)} hidden; ${Number(refill.pagesLoaded || 0)} helper pages; ${Number(refill.received || 0)} cards received; ${Number(refill.metadataExtracted || 0)} metadata records; ${Number(refill.tagsRestored || 0)} tag rows rebuilt; ${Number(refill.appended || 0)} added; ${Number(refill.duplicates || 0)} duplicates; ${Number(refill.blockedRejected || 0)} blocked rejects (${Number(refill.blockedBotRejected || 0)} explicit bots, ${Number(refill.blockedCreatorRejected || 0)} creators, ${Number(refill.blockedTagRejected || 0)} tags, ${Number(refill.blockedWordRejected || 0)} words); ${Number(refill.languageRejected || 0)} language rejects; ${Number(refill.smartFilterRejected || 0)} Smart Filter rejects; ${Number(refill.helperFailures || 0)} helper failures; ${Number(refill.helperReuses || 0)} helper reuses; ${Number(refill.helperRecoveries || 0)} helper recoveries; ${Number(refill.helperGcClosed || 0)} stale helper tabs closed; last page ${Number(refill.lastPage || 0) || "—"}; ${refill.running ? (refill.stopping ? "stopping" : "running") : (refill.paused ? "paused" : "idle")}${refill.lastError ? `; last error: ${refill.lastError}` : ""}`);
   }
 
   if (settings.performanceDiagnostics && Array.isArray(context?.pageDiagnostics?.performance)) {
@@ -14159,14 +14992,14 @@ async function copyPerformanceReport({ returnOnly = false } = {}) {
   const runtimeAvailable = !!(context?.runtimeAvailable && context?.pageDiagnostics);
   const runtime = context?.pageDiagnostics?.runtimePerformance || {};
   const perf = Array.isArray(context?.pageDiagnostics?.performance) ? context.pageDiagnostics.performance.slice(0, 20) : [];
-  const env = context?.pageDiagnostics?.androidEnvironment || {};
+  const env = context?.pageDiagnostics?.androidEnvironment || detectSettingsEnvironment();
   const warnings = runtimeAvailable ? performanceWarningLines(context, settings) : [];
   const readAvg = OPTIONS_PERFORMANCE.storageReads ? OPTIONS_PERFORMANCE.storageReadTotalMs / OPTIONS_PERFORMANCE.storageReads : 0;
   const writeAvg = OPTIONS_PERFORMANCE.storageWrites ? OPTIONS_PERFORMANCE.storageWriteTotalMs / OPTIONS_PERFORMANCE.storageWrites : 0;
   let lines = [
     "SpicyChat QoL performance report",
     `Generated: ${new Date().toISOString()}`,
-    `Version: ${manifest.version_name || displayReleaseVersion(manifest.version || "unknown")} (technical ${manifest.version || "unknown"})`,
+    `Version: ${manifest.version_name || displayReleaseVersion(manifest.version || "unknown")}`,
     `Browser: ${navigator.userAgent}`,
     `Platform: ${navigator.platform || "unknown"}`,
     (() => { const p = context?.pageDiagnostics?.buildProfile; return context?.runtimeAvailable && context?.pageDiagnostics ? `Build profile: ${p?.label || p?.id || "Full"}; bundles ${(p?.bundles || []).join(", ") || "unknown"}` : "Build profile: unavailable with runtime data"; })(),
@@ -14249,7 +15082,7 @@ async function buildPerformanceSelfCheckText() {
   const lines = [
     "SpicyChat QoL performance self-check",
     `Generated: ${new Date().toISOString()}`,
-    `Version: ${manifest.version_name || displayReleaseVersion(manifest.version || "unknown")} (technical ${manifest.version || "unknown"})`,
+    `Version: ${manifest.version_name || displayReleaseVersion(manifest.version || "unknown")}`,
     `Browser: ${navigator.userAgent}`,
     `Platform: ${navigator.platform || "unknown"}`,
     `SpicyChat page: ${sanitizeDiagnosticPath(context?.url || "")}`,
@@ -14866,7 +15699,7 @@ function featureRegistryState(entry) {
 }
 
 function featureChronologyParts(entry) {
-  const raw = String(entry?.added || "").trim();
+  const raw = String(entry?.updated || entry?.added || "").trim();
   if (!raw) return [0, 0, 0, 0, 0];
   const parts = raw.split(".").map(value => Number(value) || 0);
   const major = parts[0] || 0;
@@ -14982,7 +15815,18 @@ function setupFeaturesIndex() {
     }
 
     const groups = [];
-    for (const groupName of categories) {
+    const mode = sortMode?.value || "oldest";
+    const groupedCategories = [...categories];
+    if (mode === "newest" || mode === "oldest") {
+      const firstPosition = new Map();
+      ordered.forEach((entry, index) => {
+        if (!firstPosition.has(entry.category)) firstPosition.set(entry.category, index);
+      });
+      groupedCategories.sort((left, right) => (firstPosition.get(left) ?? Number.MAX_SAFE_INTEGER) - (firstPosition.get(right) ?? Number.MAX_SAFE_INTEGER));
+    } else if (mode === "name") {
+      groupedCategories.sort((left, right) => String(left).localeCompare(String(right), undefined, { sensitivity: "base" }));
+    }
+    for (const groupName of groupedCategories) {
       const groupEntries = ordered.filter(entry => entry.category === groupName);
       if (!groupEntries.length) continue;
       const section = makeElement("details", { className: "feature-index-group", attrs: { open: "" } });
@@ -15068,6 +15912,7 @@ const SETTING_DEPENDENCY_GROUPS = [
   { parent: "reduceAnimatedBotImages", name: "Animated bot images", children: ["animatedImagesListings", "animatedImagesChats", "animatedImagesProfiles", "animatedImagesChatMedia"] },
   { parent: "textNormalizationEnabled", name: "Text normalization", children: ["normalizeFancyUnicode", "normalizePunctuation", "normalizeInvisibleCharacters", "normalizeDecorativeSymbols"] },
   { parent: "autoFillListings", name: "Listing refill", children: ["showListingRefillButton"] },
+  { parent: "showListingFilterStats", name: "Listing filter stats", children: ["showListingFilterStatsDetails"] },
   { parent: "showRandomChatButton", name: "Random Chat", children: ["randomChatUseLastHomeFilters", "randomChatIncludeOpened", "randomChatIncludeLater", "randomChatIncludeFavorites"] },
   { parent: "showChatTopBarTools", name: "Chat top-bar tools", children: ["chatTopBarInlineCreator", "hideChatTopBarRatingButton", "hideChatTopBarModelButton", "hideChatTopBarContextDot", "hideChatDropdownVoiceUpsell", "hideChatDropdownMemoryItem"] },
   { parent: "enableChatTextReplacements", name: "Chat text replacements", children: ["chatTextReplacementPreview"] },
@@ -15561,6 +16406,7 @@ $("soundscapeAddScene")?.addEventListener("click", async () => {
 });
 $("clearOpened")?.addEventListener("click", clearOpened);
 $("exportSettings")?.addEventListener("click", exportSettings);
+$("selectActiveUsedExportScopes")?.addEventListener("click", () => selectActiveUsedExportScopes());
 $("selectAllExportScopes")?.addEventListener("click", () => document.querySelectorAll("[data-export-scope]").forEach(input => { input.checked = true; }));
 $("clearExportScopes")?.addEventListener("click", () => document.querySelectorAll("[data-export-scope]").forEach(input => { input.checked = false; }));
 $("validateImport")?.addEventListener("click", validateImportBackup);
@@ -15589,6 +16435,20 @@ $("undoLastLocalChange")?.addEventListener("click", undoLatestLocalChange);
 $("clearLocalChangeHistory")?.addEventListener("click", clearLocalChangeHistoryFromOptions);
 $("cleanLocalData")?.addEventListener("click", cleanLocalData);
 $("copyAllSupportInfo")?.addEventListener("click", copyAllSupportInfo);
+function applyOptionsLayoutPreferences(settings = null) {
+  const source = settings || {
+    settingsNavigationStyle: value("settingsNavigationStyle", "classic"),
+    settingsContentLayout: value("settingsContentLayout", "single"),
+    settingsPageWidth: value("settingsPageWidth", "comfortable")
+  };
+  const nav = ["classic", "grouped"].includes(source.settingsNavigationStyle) ? source.settingsNavigationStyle : "classic";
+  const layout = ["single", "adaptive"].includes(source.settingsContentLayout) ? source.settingsContentLayout : "single";
+  const width = ["comfortable", "wide"].includes(source.settingsPageWidth) ? source.settingsPageWidth : "comfortable";
+  document.body.classList.toggle("ds-options-nav-grouped", nav === "grouped");
+  document.body.classList.toggle("ds-options-layout-adaptive", layout === "adaptive");
+  document.body.classList.toggle("ds-options-width-wide", width === "wide");
+}
+
 $("downloadAllSupportInfo")?.addEventListener("click", downloadAllSupportInfo);
 $("copyDiagnostics")?.addEventListener("click", copyDiagnostics);
 $("downloadDiagnostics")?.addEventListener("click", downloadDiagnostics);
@@ -15598,6 +16458,9 @@ $("runPerformanceSelfCheck")?.addEventListener("click", runPerformanceSelfCheck)
 $("downloadPerformanceSelfCheck")?.addEventListener("click", downloadPerformanceSelfCheck);
 $("resetPerformanceCounters")?.addEventListener("click", resetPerformanceCounters);
 $("reduceOptionsAnimations")?.addEventListener("change", () => applyOptionsPerformancePreferences({ reduceOptionsAnimations: checked("reduceOptionsAnimations") }));
+["settingsNavigationStyle", "settingsContentLayout", "settingsPageWidth"].forEach(id => {
+  $(id)?.addEventListener("change", () => applyOptionsLayoutPreferences());
+});
 $("qolInterfaceScale")?.addEventListener("change", () => applyOptionsAccessibilityPreview({ qolInterfaceScale: Number(value("qolInterfaceScale", "100")) || 100 }));
 $("collapseAllSettingsSections")?.addEventListener("click", () => setAllSettingsSectionsCollapsed(true));
 $("expandAllSettingsSections")?.addEventListener("click", () => setAllSettingsSectionsCollapsed(false));
@@ -15640,7 +16503,7 @@ function reorderOptionsUi() {
     "features", "advanced", "android", "changelog", "help"
   ];
   const tabs = document.querySelector("nav.tabs");
-  if (tabs) {
+  if (tabs && !tabs.querySelector(".tab-group")) {
     tabOrder.forEach(name => {
       const button = tabs.querySelector(`.tab-button[data-tab="${name}"]`);
       if (button) tabs.appendChild(button);
@@ -15648,13 +16511,17 @@ function reorderOptionsUi() {
   }
 
   const cardOrders = {
-    general: ["Extension", "Settings layout", "SpicyChat NSFW switch", "Quick setup", "S.AI Toolkit compatibility", "Android app settings"],
-    saved: ["Favorite bots", "Later bots", "Favorite creators", "Followed creators", "Saved Bots Hub", "Bot Organizer", "Bot Status Center"],
-    writing: ["OOC presets", "Composer and draft helpers", "Model quick menu", "Saved Text / Snippets", "Reply Instructions", "Translation (DeepL)", "Generation profiles", "Timestamps and generation details"],
-    "personas-memory": ["Memory manager", "Persona helpers", "Context Keeper", "Chat Nudges"],
-    "bot-tools": ["Creation helpers", "My Creations filters", "Bot editor snippets", "Bot tags in chats", "Creation audit", "Bot & Lorebook backups", "Backup manager"],
-    blocking: ["Card filters", "Blocked bots", "Not interested", "Tag defaults", "Favorite protection", "Smart filter presets", "Recommendation helpers", "Card / discovery workflow", "Listing refill", "Language filter", "Text normalization"],
-    data: ["Backup and restore", "Recently changed / Undo", "Local storage & recovery", "What's New notification", "Settings check", "Debug"]
+    general: ["Extension", "Quick setup", "Settings layout", "SpicyChat beta / experimental access", "S.AI Toolkit compatibility", "Android app settings", "SpicyChat NSFW switch"],
+    control: ["Command Palette", "Data health & storage", "Creator Workspace", "Performance & support"],
+    blocking: ["Tag defaults", "Bot Blocking & Dislikes", "Blocked bots manager", "Not interested", "Card filters", "Language filter", "Text normalization", "Local tag aliases / emoji", "Favorite protection", "Smart filter presets", "Recommendation helpers", "Card / discovery workflow", "Listing refill"],
+    saved: ["Saved Bots Hub", "Favorite bots", "Later bots", "Favorite creators", "Followed creators", "Bot Organizer", "Bot Status Center"],
+    writing: ["Composer and draft helpers", "OOC presets", "Reply Instructions", "Saved Text / Snippets", "Model quick menu", "Generation profiles", "Timestamps and generation details", "Translation (DeepL)"],
+    "personas-memory": ["Persona helpers", "Memory manager", "Context Keeper", "Global Memory / Baseline Notes", "Internal Day Tracker", "RP State Tracker", "Chat Nudges"],
+    "chat-ui": ["Chat top bar", "Character shortcuts", "Message options", "Search inside current chat", "Message bookmarks / multiple local pins", "Scroll navigation", "Chat export", "Native rating helpers", "Chat text replacements", "Focus / Immersive Mode"],
+    "bot-tools": ["Creation helpers", "Bot editor snippets", "My Creations filters", "Creator Writing Assistant", "Creation audit", "Bot & Lorebook backups", "Backup manager", "Bot / profile export", "Bot tags in chats"],
+    appearance: ["Accessibility & text size", "Mini panel", "Panel size", "Panel items", "Layout preview", "Top bar cleanup", "Avatar name", "Sidebar cleanup", "Premium & promo cleanup", "Chat bubble customization", "Custom chat backgrounds", "RP Format Repair", "Alternate dialogue styling", "Soundscapes / Ambience", "Animated bot images"],
+    browser: ["Extension popup", "Notifications", "Inactive tab cleanup (Auto-AFK)", "Duplicate SpicyChat tab guard", "Tab cleanup & session analysis"],
+    data: ["Backup and restore", "Local storage & recovery", "Recently changed / Undo", "Personal usage & context", "What's New notification", "Settings check", "Debug"]
   };
 
   for (const [pageName, headings] of Object.entries(cardOrders)) {

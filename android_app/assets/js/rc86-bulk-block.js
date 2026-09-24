@@ -275,14 +275,15 @@
     const clear = toolbar.querySelector("[data-action='clear']");
     const all = toolbar.querySelector("[data-action='all']");
     const done = toolbar.querySelector("[data-action='done']");
-    if (countNode) countNode.textContent = `${count} selected`;
+    if (countNode) DS.setTextIfChanged?.(countNode, `${count} selected`);
     if (block) {
-      block.textContent = `Block selected (${count})`;
-      block.disabled = !count || state.bulkBlocking;
+      DS.setTextIfChanged?.(block, `Block selected (${count})`);
+      const disabled = !count || state.bulkBlocking;
+      if (block.disabled !== disabled) block.disabled = disabled;
     }
-    if (clear) clear.disabled = !count || state.bulkBlocking;
-    if (all) all.disabled = state.bulkBlocking;
-    if (done) done.disabled = state.bulkBlocking;
+    if (clear && clear.disabled !== (!count || state.bulkBlocking)) clear.disabled = !count || state.bulkBlocking;
+    if (all && all.disabled !== state.bulkBlocking) all.disabled = state.bulkBlocking;
+    if (done && done.disabled !== state.bulkBlocking) done.disabled = state.bulkBlocking;
     syncLaunchers();
   }
 
@@ -356,6 +357,26 @@
     for (const card of selectableCards()) syncSelectionVisual(card);
   }
 
+  function decorateSelectionSubtree(root) {
+    if (!state.selectionMode || !supportedListingRoute() || !(root instanceof Element) || DS.isQolOwnedNode?.(root)) return;
+    const cards = new Set();
+    const direct = cardFromTarget(root);
+    if (direct) cards.add(direct);
+    root.querySelectorAll?.(".ds-card-block-button").forEach(button => {
+      const card = cardForBlockButton(button);
+      if (card) cards.add(card);
+    });
+    root.querySelectorAll?.("a[href*='/chat/'],a[href*='/chatbot/']").forEach(anchor => {
+      const card = cardFromAnchor(anchor);
+      if (card) cards.add(card);
+    });
+    for (const card of cards) syncSelectionVisual(card);
+    if (cards.size) {
+      const perf = counters();
+      perf.bulkBlockScopedCardDecorations = Number(perf.bulkBlockScopedCardDecorations || 0) + cards.size;
+    }
+  }
+
   function removeSelectionDecorations() {
     document.querySelectorAll(`.${CARD_SELECT_CLASS}`).forEach(node => node.remove());
     document.querySelectorAll(`.${SELECTED_CLASS}`).forEach(node => node.classList.remove(SELECTED_CLASS));
@@ -373,8 +394,20 @@
   function startSelectionObserver() {
     if (state.selectionObserver || !document.body) return;
     state.selectionObserver = new MutationObserver(mutations => {
-      if (!state.selectionMode || !mutations.some(m => m.addedNodes?.length)) return;
-      scheduleDecorate();
+      if (!state.selectionMode) return;
+      let decorated = false;
+      for (const mutation of mutations) {
+        if (DS.mutationIsQolOnly?.(mutation)) continue;
+        for (const node of mutation.addedNodes || []) {
+          if (!(node instanceof Element) || DS.isQolOwnedNode?.(node)) continue;
+          decorateSelectionSubtree(node);
+          decorated = true;
+        }
+      }
+      // If React replaced a wrapper without exposing card descendants in the
+      // added subtree, keep one debounced fallback instead of rescanning on
+      // every mutation record.
+      if (!decorated && mutations.some(m => m.addedNodes?.length)) scheduleDecorate();
     });
     state.selectionObserver.observe(document.body, { childList: true, subtree: true });
   }
@@ -409,6 +442,7 @@
       const payload = state.quickDislikeQueue.slice(0, 200).map(item => ({
         botId: item.botId,
         queuedAt: item.queuedAt,
+        attempts: Math.max(0, Number(item.attempts || 0) || 0),
         message: item.message
       }));
       if (payload.length) sessionStorage.setItem(SESSION_QUEUE_KEY, JSON.stringify(payload));
@@ -426,6 +460,7 @@
         const item = {
           botId,
           queuedAt: Number(saved?.queuedAt) || Date.now(),
+          attempts: Math.max(0, Number(saved?.attempts || 0) || 0),
           message: {
             type: "DS_QUICK_DISLIKE_BOT",
             botId,
@@ -503,12 +538,40 @@
     persistQuickDislikeQueue();
     state.queueRunning = true;
     const perf = counters();
+    const attempt = Math.max(0, Number(item.attempts || 0) || 0) + 1;
+    const token = DS.diagOperationStart?.("quick-dislike", "queued-worker", { botId: item.botId, attempt });
     perf.quickDislikeIdleStarts = Number(perf.quickDislikeIdleStarts || 0) + 1;
     perf.quickDislikeIdleQueueSize = state.quickDislikeQueue.length;
 
-    await invokeQuickDislike(item.message);
-    state.quickDislikeByBotId.delete(item.botId);
-    perf.quickDislikeIdleCompleted = Number(perf.quickDislikeIdleCompleted || 0) + 1;
+    const response = await invokeQuickDislike({ ...item.message, queueAttempt: attempt });
+    const terminal = !!response?.ok;
+    let retrying = false;
+
+    if (terminal) {
+      state.quickDislikeByBotId.delete(item.botId);
+      perf.quickDislikeIdleCompleted = Number(perf.quickDislikeIdleCompleted || 0) + 1;
+    } else if (attempt < 3 && quickDislikeEnabled()) {
+      item.attempts = attempt;
+      item.queuedAt = Date.now();
+      state.quickDislikeQueue.push(item);
+      retrying = true;
+      perf.quickDislikeIdleRetries = Number(perf.quickDislikeIdleRetries || 0) + 1;
+      persistQuickDislikeQueue();
+    } else {
+      state.quickDislikeByBotId.delete(item.botId);
+      perf.quickDislikeIdleFailures = Number(perf.quickDislikeIdleFailures || 0) + 1;
+    }
+
+    DS.diagOperationEnd?.(token, {
+      scanned: 1,
+      changed: response?.status === "disliked" ? 1 : 0,
+      skipped: response?.ok && response?.status !== "disliked" ? 1 : 0,
+      status: response?.status || "no-response",
+      retrying,
+      attempt
+    });
+
+    perf.quickDislikeIdleQueueSize = state.quickDislikeQueue.length;
     state.queueRunning = false;
     if (state.quickDislikeQueue.length) scheduleQuickDislikeQueue(QUICK_DISLIKE_GAP_MS);
   }
@@ -533,6 +596,7 @@
     const item = {
       botId,
       queuedAt: Date.now(),
+      attempts: 0,
       message: {
         type: "DS_QUICK_DISLIKE_BOT",
         botId,
