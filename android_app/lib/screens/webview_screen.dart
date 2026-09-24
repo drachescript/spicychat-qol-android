@@ -2943,6 +2943,223 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  Future<void> _installAndroidEditableClipboardBridge(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+  const STATE_KEY = "__dsAndroidEditableClipboard";
+  const STYLE_ID = "ds-android-editable-selection-style";
+  const BUTTON_ID = "ds-android-editable-copy-button";
+
+  if (window[STATE_KEY]?.refresh) {
+    window[STATE_KEY].refresh();
+    return;
+  }
+
+  const isEditable = element => {
+    if (!(element instanceof Element)) return false;
+    if (element instanceof HTMLTextAreaElement) return true;
+    if (element instanceof HTMLInputElement) {
+      const type = String(element.type || "text").toLowerCase();
+      return ["", "text", "search", "url", "email", "tel"].includes(type);
+    }
+    return element.isContentEditable ||
+      element.getAttribute("contenteditable") === "true" ||
+      element.getAttribute("contenteditable") === "plaintext-only";
+  };
+
+  const selectedText = element => {
+    if (!isEditable(element)) return "";
+
+    if (
+      element instanceof HTMLTextAreaElement ||
+      element instanceof HTMLInputElement
+    ) {
+      const start = Number(element.selectionStart);
+      const end = Number(element.selectionEnd);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return "";
+      }
+      return String(element.value || "").slice(start, end);
+    }
+
+    try {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount < 1 || selection.isCollapsed) {
+        return "";
+      }
+      const range = selection.getRangeAt(0);
+      if (!element.contains(range.commonAncestorContainer)) return "";
+      return String(selection.toString() || "");
+    } catch {
+      return "";
+    }
+  };
+
+  const nativeCopy = async text => {
+    const value = String(text || "");
+    if (!value) return false;
+
+    try {
+      const result = await window.flutter_inappwebview?.callHandler(
+        "copyToClipboard",
+        value
+      );
+      if (result === true || result?.ok === true) return true;
+    } catch {}
+
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {}
+
+    return false;
+  };
+
+  const ensureStyle = () => {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      textarea,
+      input[type="text"],
+      input[type="search"],
+      input[type="url"],
+      input[type="email"],
+      input[type="tel"],
+      input:not([type]),
+      [contenteditable="true"],
+      [contenteditable="plaintext-only"] {
+        -webkit-user-select: text !important;
+        user-select: text !important;
+      }
+
+      #${BUTTON_ID} {
+        position: fixed !important;
+        right: 12px !important;
+        bottom: max(92px, calc(env(safe-area-inset-bottom) + 72px)) !important;
+        z-index: 2147483647 !important;
+        min-height: 38px !important;
+        padding: 7px 13px !important;
+        border: 1px solid rgba(255,255,255,.30) !important;
+        border-radius: 999px !important;
+        background: rgba(35,35,42,.96) !important;
+        color: white !important;
+        box-shadow: 0 4px 16px rgba(0,0,0,.38) !important;
+        font: 600 13px/1.2 system-ui, sans-serif !important;
+        touch-action: manipulation !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  };
+
+  const removeButton = () => {
+    document.getElementById(BUTTON_ID)?.remove();
+  };
+
+  let hideTimer = 0;
+
+  const refresh = () => {
+    clearTimeout(hideTimer);
+    const active = document.activeElement;
+    const text = selectedText(active);
+
+    if (!text) {
+      removeButton();
+      return;
+    }
+
+    let button = document.getElementById(BUTTON_ID);
+    if (!button) {
+      button = document.createElement("button");
+      button.id = BUTTON_ID;
+      button.type = "button";
+      button.textContent = "Copy";
+      button.setAttribute("aria-label", "Copy selected text");
+
+      button.addEventListener("pointerdown", event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+
+      button.addEventListener("click", async event => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const value = selectedText(document.activeElement);
+        if (!value) {
+          removeButton();
+          return;
+        }
+
+        if (await nativeCopy(value)) {
+          button.textContent = "Copied";
+          hideTimer = setTimeout(removeButton, 700);
+        } else {
+          button.textContent = "Copy failed";
+          hideTimer = setTimeout(removeButton, 1100);
+        }
+      }, true);
+
+      document.documentElement.appendChild(button);
+    }
+
+    hideTimer = setTimeout(removeButton, 10000);
+  };
+
+  const onCopy = event => {
+    const active = document.activeElement;
+    if (!isEditable(active)) return;
+
+    const value = selectedText(active);
+    if (!value) return;
+
+    event.preventDefault();
+    void nativeCopy(value);
+    removeButton();
+  };
+
+  ensureStyle();
+
+  document.addEventListener("copy", onCopy, true);
+  document.addEventListener("selectionchange", refresh, true);
+  document.addEventListener("select", refresh, true);
+  document.addEventListener("pointerup", event => {
+    if (isEditable(event.target) || isEditable(document.activeElement)) {
+      setTimeout(refresh, 0);
+    }
+  }, true);
+  document.addEventListener("keyup", event => {
+    if (isEditable(event.target)) setTimeout(refresh, 0);
+  }, true);
+
+  window[STATE_KEY] = {
+    refresh,
+    copySelection() {
+      const value = selectedText(document.activeElement);
+      return value ? nativeCopy(value) : Promise.resolve(false);
+    }
+  };
+
+  refresh();
+})()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-editable-clipboard-install')) {
+        unawaited(
+          _appLog.log(
+            'AndroidClipboard',
+            'Could not install Android editable clipboard bridge',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
   Future<void> _installAndroidFocusSafetyGuard(
     InAppWebViewController controller,
   ) async {
@@ -2965,10 +3182,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   let applying = false;
   let observer = null;
+  let nativeObserver = null;
+  let refreshTimer = 0;
 
   const ensureStyle = () => {
     if (document.getElementById(STYLE_ID)) return;
-
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
@@ -2985,12 +3203,99 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       .forEach(element => element.classList.remove(SAFE_HIDE_CLASS));
   };
 
+  const dangerSelector = [
+    "textarea",
+    "[contenteditable='true']",
+    "[contenteditable='plaintext-only']",
+    "button[aria-label='send-message']",
+    "button[aria-label='message-dropdown']",
+    "div[id^='message-']"
+  ].join(",");
+
+  const containsChatContent = element => {
+    if (!(element instanceof Element)) return true;
+    try { return !!element.querySelector(dangerSelector); }
+    catch { return true; }
+  };
+
+  const visibleRect = element => {
+    if (!(element instanceof HTMLElement)) return null;
+    try {
+      const style = getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden") return null;
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 20) return null;
+      return rect;
+    } catch {
+      return null;
+    }
+  };
+
+  const safeHeaderAncestor = (start, requiredSelectors = []) => {
+    if (!(start instanceof Element)) return null;
+
+    let best = null;
+    let bestScore = -1;
+    const viewportWidth = Math.max(1, window.innerWidth || 1);
+
+    for (
+      let node = start;
+      node && node !== document.body && node.id !== "root";
+      node = node.parentElement
+    ) {
+      const rect = visibleRect(node);
+      if (!rect) continue;
+
+      if (
+        rect.top < -8 ||
+        rect.top > 190 ||
+        rect.height > 150 ||
+        rect.width > viewportWidth * 1.08 ||
+        containsChatContent(node)
+      ) {
+        if (rect.height > 220 || containsChatContent(node)) break;
+        continue;
+      }
+
+      let score = 0;
+      for (const selector of requiredSelectors) {
+        try { if (node.querySelector(selector)) score += 2; } catch {}
+      }
+      if (rect.width > viewportWidth * 0.45) score += 3;
+      if (rect.height >= 36 && rect.height <= 110) score += 2;
+
+      if (score > bestScore) {
+        best = node;
+        bestScore = score;
+      }
+    }
+
+    return best;
+  };
+
+  const markSafeGroup = (starts, requiredSelectors) => {
+    for (const selector of starts) {
+      let start = null;
+      try { start = document.querySelector(selector); } catch {}
+      if (!start) continue;
+
+      const target = safeHeaderAncestor(start, requiredSelectors);
+      if (target) {
+        target.classList.add(SAFE_HIDE_CLASS);
+        return true;
+      }
+    }
+    return false;
+  };
+
   const markAll = selectors => {
     for (const selector of selectors) {
       try {
-        document
-          .querySelectorAll(selector)
-          .forEach(element => element.classList.add(SAFE_HIDE_CLASS));
+        document.querySelectorAll(selector).forEach(element => {
+          if (!containsChatContent(element)) {
+            element.classList.add(SAFE_HIDE_CLASS);
+          }
+        });
       } catch {}
     }
   };
@@ -3008,51 +3313,74 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         !!DS?.isFocusModeActive?.();
 
       clearSafeTargets();
+      if (!active) return;
 
-      if (!active) {
-        return;
-      }
-
-      // Never allow shared mobile target discovery to hide a large ancestor
-      // containing the conversation or composer. Android hides only known
-      // leaf/header controls instead.
-      root.classList.remove(
-        ROOT_HIDE_TOPBAR,
-        ROOT_HIDE_CHAT_HEADER
-      );
+      // Never let shared desktop ancestor targeting hide a mobile chat/page
+      // container. Android supplies safe header targets below.
+      root.classList.remove(ROOT_HIDE_TOPBAR, ROOT_HIDE_CHAT_HEADER);
 
       if (settings.focusHideTopBar !== false) {
-        markAll([
-          "a[aria-label='avatar']",
-          "[data-testid='LocaleSelector']",
-          "button[aria-label='notifications']",
-          "button[aria-label='theme']"
-        ]);
+        const grouped = markSafeGroup(
+          [
+            "a[aria-label='avatar']",
+            "[data-testid='LocaleSelector']",
+            "button[aria-label='notifications']"
+          ],
+          [
+            "a[aria-label='avatar']",
+            "[data-testid='LocaleSelector']"
+          ]
+        );
+
+        if (!grouped) {
+          markAll([
+            "a[aria-label='avatar']",
+            "[data-testid='LocaleSelector']",
+            "button[aria-label='notifications']",
+            "button[aria-label='theme']"
+          ]);
+        }
       }
 
       if (settings.focusHideChatHeader !== false) {
-        markAll([
-          "a[aria-label='chatbot-profile']",
-          "button[aria-label='chat-dropdown']",
-          "button[aria-label='ThumbsUp-button']",
-          "[data-testid='ChatModelTierCapabilityGate']"
-        ]);
+        const grouped = markSafeGroup(
+          [
+            "a[aria-label='chatbot-profile']",
+            "button[aria-label='chat-dropdown']",
+            "button[aria-label='ThumbsUp-button']"
+          ],
+          [
+            "a[aria-label='chatbot-profile']",
+            "button[aria-label='chat-dropdown']"
+          ]
+        );
+
+        if (!grouped) {
+          markAll([
+            "a[aria-label='chatbot-profile']",
+            "button[aria-label='chat-dropdown']",
+            "button[aria-label='ThumbsUp-button']",
+            "[data-testid='ChatModelTierCapabilityGate']"
+          ]);
+        }
       }
     } finally {
       applying = false;
     }
   };
 
+  const scheduleRefresh = () => {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, 80);
+  };
+
   ensureStyle();
 
   observer = new MutationObserver(records => {
-    if (
-      records.some(
-        record =>
-          record.type === "attributes" &&
-          record.attributeName === "class"
-      )
-    ) {
+    if (records.some(record =>
+      record.type === "attributes" &&
+      record.attributeName === "class"
+    )) {
       queueMicrotask(refresh);
     }
   });
@@ -3062,11 +3390,30 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     attributeFilter: ["class"]
   });
 
+  nativeObserver = new MutationObserver(records => {
+    const DS = window.DragonScriptQoL;
+    if (!DS?.isFocusModeActive?.()) return;
+    if (!records.some(record =>
+      record.addedNodes?.length || record.removedNodes?.length
+    )) return;
+    scheduleRefresh();
+  });
+
+  if (document.body) {
+    nativeObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
   window[STATE_KEY] = {
     refresh,
     disconnect() {
       observer?.disconnect();
+      nativeObserver?.disconnect();
       observer = null;
+      nativeObserver = null;
+      clearTimeout(refreshTimer);
       clearSafeTargets();
       document.getElementById(STYLE_ID)?.remove();
       delete window[STATE_KEY];
@@ -3175,6 +3522,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       // lightweight Android guard after the shared bundle exists so mobile
       // Focus Mode cannot hide the entire chat/composer container.
       await _installAndroidFocusSafetyGuard(controller);
+
+      // Keep normal Android selection UI, but make the final copy operation
+      // use Flutter's native clipboard when System WebView refuses to copy.
+      await _installAndroidEditableClipboardBridge(controller);
 
       // Android-only Save & Stay marker. Delegated click handling keeps
       // working when QoL recreates the editor toolbar dynamically.
@@ -4011,6 +4362,76 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   // ── Quick Menu ─────────────────────────────────────────────
 
+  Future<void> _showAndroidCogPositionPicker() async {
+    if (!mounted) return;
+
+    final androidUi = Provider.of<AndroidUiService>(
+      context,
+      listen: false,
+    );
+
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      backgroundColor: const Color(0xFF1A1A2E),
+      builder: (sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(
+                title: Text(
+                  'Move Android cog',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                subtitle: Text(
+                  'Choose where the native QoL button should sit.',
+                  style: TextStyle(color: Colors.white60),
+                ),
+              ),
+              for (final value in AndroidUiService.allowedPositions)
+                RadioListTile<String>(
+                  value: value,
+                  groupValue: androidUi.controlsPosition,
+                  title: Text(
+                    AndroidUiService.labelFor(value),
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                  onChanged: (next) {
+                    if (next != null) {
+                      Navigator.of(sheetContext).pop(next);
+                    }
+                  },
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (!mounted || selected == null) return;
+
+    await androidUi.setControlsPosition(selected);
+    await _syncAndroidChatHeaderGear();
+
+    if (mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Android cog: ${AndroidUiService.labelFor(selected)}',
+          ),
+          duration: const Duration(seconds: 1),
+        ),
+      );
+    }
+  }
   Future<void> _showQuickMenu({
     DateTime? requestedAt,
     DateTime? bridgeReceivedAt,
@@ -4066,6 +4487,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           onAndroidSettings: () {
           Navigator.pop(sheetContext);
           _openAndroidSettingsPage();
+        },
+        onMoveCog: () {
+          Navigator.pop(sheetContext);
+          _showAndroidCogPositionPicker();
         },
         onChatTabs: () {
           Navigator.pop(sheetContext);
@@ -4141,6 +4566,7 @@ class _QuickMenuSheet extends StatelessWidget {
   final bool tabsEnabled;
   final bool isChatPage;
   final VoidCallback onAndroidSettings;
+  final VoidCallback onMoveCog;
   final VoidCallback onChatTabs;
   final VoidCallback onCommandPalette;
   final VoidCallback onFocusMode;
@@ -4158,6 +4584,7 @@ class _QuickMenuSheet extends StatelessWidget {
     required this.tabsEnabled,
     required this.isChatPage,
     required this.onAndroidSettings,
+    required this.onMoveCog,
     required this.onChatTabs,
     required this.onCommandPalette,
     required this.onFocusMode,
@@ -4206,6 +4633,11 @@ class _QuickMenuSheet extends StatelessWidget {
             icon: Icons.phone_android,
             label: 'Android Settings',
             onTap: onAndroidSettings,
+          ),
+          _QuickMenuItem(
+            icon: Icons.open_with,
+            label: 'Move Android cog',
+            onTap: onMoveCog,
           ),
           if (tabsEnabled)
             _QuickMenuItem(
