@@ -244,8 +244,6 @@ class JsBundleService extends ChangeNotifier {
       }
     }
 
-    // Inline every local stylesheet referenced by current extension Options.
-    // This follows new files such as options-overhaul.css automatically.
     final stylesheetRegex = RegExp(
       r'''<link\b[^>]*\bhref=["']([^"']+\.css(?:[?#][^"']*)?)["'][^>]*>''',
       caseSensitive: false,
@@ -264,8 +262,6 @@ class JsBundleService extends ChangeNotifier {
         'assets/options/${_baseName(relative)}',
       );
 
-      // A stale optional stylesheet reference should not make the complete
-      // Android Options page unusable. options.css itself remains required.
       if (css == null) {
         if (_baseName(relative).toLowerCase() == 'options.css') {
           throw StateError('Required Android Options stylesheet is missing.');
@@ -291,9 +287,6 @@ class JsBundleService extends ChangeNotifier {
     final androidBridge =
         await rootBundle.loadString('assets/options/options-bridge.js');
 
-    // Inline every local script in source order. The APK-owned native bridge
-    // is inserted immediately before options.js and is never downloaded from
-    // the extension repository.
     final scriptRegex = RegExp(
       r'''<script\b[^>]*\bsrc=["']([^"']+\.js(?:[?#][^"']*)?)["'][^>]*>\s*</script>''',
       caseSensitive: false,
@@ -307,18 +300,19 @@ class JsBundleService extends ChangeNotifier {
       final relative = _cleanLocalOptionPath(rawPath);
       if (relative == null) continue;
 
-      if (_baseName(relative).toLowerCase() == 'options-bridge.js') {
+      final name = _baseName(relative).toLowerCase();
+
+      if (name == 'options-bridge.js') {
         html = html.replaceRange(match.start, match.end, '');
         continue;
       }
 
-      final source = await loadOptional(
+      var source = await loadOptional(
         relative,
         'assets/options/${_baseName(relative)}',
       );
 
       if (source == null) {
-        final name = _baseName(relative).toLowerCase();
         if (name == 'options.js' || name == 'feature-registry.js') {
           throw StateError(
             'Required Android Options script is missing: $relative',
@@ -328,8 +322,15 @@ class JsBundleService extends ChangeNotifier {
         continue;
       }
 
-      final prefix = _baseName(relative).toLowerCase() == 'options.js'
+      if (name == 'options.js') {
+        source = _androidCompatOptionsScript(source);
+      }
+
+      final prefix = name == 'options.js'
           ? '<script>${_safeScript(androidBridge)}</script>\n'
+          : '';
+      final suffix = name == 'options.js'
+          ? '\n<script>${_safeScript(_androidOptionsRecoveryScript())}</script>'
           : '';
 
       html = html.replaceRange(
@@ -337,7 +338,8 @@ class JsBundleService extends ChangeNotifier {
         match.end,
         '$prefix'
         '<script data-ds-options-source="${_htmlAttr(relative)}">'
-        '${_safeScript(source)}</script>',
+        '${_safeScript(source)}</script>'
+        '$suffix',
       );
     }
 
@@ -350,6 +352,122 @@ class JsBundleService extends ChangeNotifier {
         _optionsSupportText[name] = text;
       }
     }
+  }
+
+  /// The desktop Options script historically ran a long list of setup helpers
+  /// directly at top-level. One browser-only helper throwing in Android WebView
+  /// therefore prevented setupTabs() and load() from ever running, leaving the
+  /// page stuck on "Version loading..." and showing uninitialized defaults.
+  ///
+  /// Guard only that startup block for Android. The shared extension source is
+  /// left untouched and each helper still runs in its original order.
+  String _androidCompatOptionsScript(String source) {
+    const blockStartMarker = '\nreorderOptionsUi();\n';
+    const blockEndMarker = 'setupControlCenterControls();\n';
+
+    final startMarkerAt = source.indexOf(blockStartMarker);
+    if (startMarkerAt >= 0) {
+      final blockStart = startMarkerAt + 1;
+      final endCallAt = source.indexOf(blockEndMarker, blockStart);
+      if (endCallAt >= 0) {
+        final blockEnd = endCallAt + blockEndMarker.length;
+        final originalBlock = source.substring(blockStart, blockEnd);
+        final guarded = <String>[];
+
+        for (final rawLine in originalBlock.split('\n')) {
+          final line = rawLine.trim();
+          if (line.isEmpty) continue;
+          guarded.add(
+            'try { $line } catch (error) { '
+            'console.error("[DS Android Options] startup helper failed", '
+            '${jsonEncode(line)}, error); '
+            '(window.__dsAndroidOptionsBootErrors ||= []).push({'
+            'step: ${jsonEncode(line)}, error: String(error?.stack || error)'
+            '}); }',
+          );
+        }
+
+        source = source.replaceRange(
+          blockStart,
+          blockEnd,
+          '${guarded.join('\n')}\n',
+        );
+      }
+    }
+
+    const bootBlock = '\nsetupTabs();\nload();\n';
+    if (source.contains(bootBlock)) {
+      source = source.replaceFirst(
+        bootBlock,
+        '''
+try {
+  setupTabs();
+} catch (error) {
+  console.error("[DS Android Options] setupTabs failed", error);
+  (window.__dsAndroidOptionsBootErrors ||= []).push({
+    step: "setupTabs()",
+    error: String(error?.stack || error)
+  });
+}
+window.__dsAndroidOptionsLoadStarted = true;
+Promise.resolve()
+  .then(() => load())
+  .catch(error => {
+    window.__dsAndroidOptionsLoadError = String(error?.stack || error);
+    console.error("[DS Android Options] load failed", error);
+  });
+''',
+      );
+    }
+
+    return source;
+  }
+
+  /// Final APK-owned safety net. If an unexpected future extension change
+  /// aborts options.js before its normal boot block, run the two core boot
+  /// functions from a separate script and always replace the placeholder
+  /// version text with the active shared-QoL version.
+  String _androidOptionsRecoveryScript() {
+    final version = jsonEncode(_extensionVersion);
+    return '''
+(() => {
+  const activeVersion = $version;
+
+  const applyVersionFallback = () => {
+    const node = document.getElementById("versionText");
+    if (!node) return;
+    const text = String(node.textContent || "");
+    if (!text.trim() || /version\s+loading/i.test(text)) {
+      node.textContent = "v" + activeVersion;
+    }
+  };
+
+  queueMicrotask(async () => {
+    if (!window.__dsAndroidOptionsLoadStarted) {
+      try {
+        if (typeof setupTabs === "function") setupTabs();
+      } catch (error) {
+        console.error("[DS Android Options] recovery setupTabs failed", error);
+      }
+
+      try {
+        if (typeof load === "function") {
+          window.__dsAndroidOptionsLoadStarted = true;
+          await load();
+        }
+      } catch (error) {
+        window.__dsAndroidOptionsLoadError = String(error?.stack || error);
+        console.error("[DS Android Options] recovery load failed", error);
+      }
+    }
+
+    applyVersionFallback();
+  });
+
+  setTimeout(applyVersionFallback, 500);
+  setTimeout(applyVersionFallback, 1500);
+})();
+''';
   }
 
   String? _cleanLocalOptionPath(String source) {
