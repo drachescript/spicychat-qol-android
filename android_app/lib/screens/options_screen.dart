@@ -12,6 +12,7 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/settings_service.dart';
+import '../services/js_bundle_service.dart';
 
 /// Displays the extension's real options.html inside the Android app.
 ///
@@ -20,6 +21,7 @@ import '../services/settings_service.dart';
 class OptionsScreen extends StatefulWidget {
   final Future<void> Function() onSettingsChanged;
   final String extensionVersion;
+  final JsBundleService bundleService;
   final Future<Map<String, dynamic>?> Function() onQueryMainTab;
   final Future<dynamic> Function(dynamic message) onSendMainTabMessage;
 
@@ -27,6 +29,7 @@ class OptionsScreen extends StatefulWidget {
     super.key,
     required this.onSettingsChanged,
     required this.extensionVersion,
+    required this.bundleService,
     required this.onQueryMainTab,
     required this.onSendMainTabMessage,
   });
@@ -367,7 +370,8 @@ class _OptionsScreenState extends State<OptionsScreen> {
         }
 
         try {
-          return await rootBundle.loadString('assets/options/$name');
+          return widget.bundleService.optionsSupportText(name) ??
+              await rootBundle.loadString('assets/options/$name');
         } catch (e) {
           debugPrint('[Options] Could not read bundled $name: $e');
           return null;
@@ -429,7 +433,11 @@ class _OptionsScreenState extends State<OptionsScreen> {
       body: Stack(
         children: [
           InAppWebView(
-            initialFile: 'assets/options/options.html',
+            initialData: InAppWebViewInitialData(
+              data: widget.bundleService.optionsHtml,
+              mimeType: 'text/html',
+              encoding: 'utf-8',
+            ),
             initialUserScripts: UnmodifiableListView<UserScript>([
               UserScript(
                 source:

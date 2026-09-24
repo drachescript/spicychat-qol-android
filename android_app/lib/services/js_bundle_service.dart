@@ -1,21 +1,29 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-/// Loads all JS and CSS assets from the bundle and provides
-/// them as injectable strings for the WebView.
-class JsBundleService {
+import 'qol_update_service.dart';
+
+class JsBundleService extends ChangeNotifier {
+  static const bundledExtensionVersion = '0.2.0';
+
+  final QolUpdateService qolUpdates;
+
   String _cssContent = '';
   String _jsBundle = '';
-  String _extensionVersion = '0.2.0';
+  String _extensionVersion = bundledExtensionVersion;
+  String _optionsHtml = '';
+  final Map<String, String> _optionsSupportText = {};
+
+  JsBundleService({required this.qolUpdates});
 
   String get cssContent => _cssContent;
   String get jsBundle => _jsBundle;
   String get extensionVersion => _extensionVersion;
+  String get optionsHtml => _optionsHtml;
 
-  // Script injection order is generated from manifest.json by update_android.ps1.
-  static const _jsFiles = [
-    'assets/js/bridge.js',
+  static const _bundledJsFiles = [
     'assets/js/generation-metadata-loader.js',
     'assets/js/card-token-auth-loader.js',
     'assets/js/exact-message-counts-loader.js',
@@ -129,29 +137,149 @@ class JsBundleService {
   ];
 
   Future<void> loadAssets() async {
-    _cssContent = await rootBundle.loadString('assets/css/content.css');
+    final remoteActive = qolUpdates.hasDownloadedBundle;
 
-    final buffer = StringBuffer();
-    buffer.writeln('// SpicyChat QOL Android bundled injection');
-    buffer.writeln('// Injected by Flutter InAppWebView');
-    buffer.writeln(
-      'window.__spicyChatQolBundledVersion = ${jsonEncode(_extensionVersion)};',
-    );
-    buffer.writeln('');
+    final remoteCssPath = remoteActive && qolUpdates.runtimeCssPaths.isNotEmpty
+        ? qolUpdates.runtimeCssPaths.first
+        : null;
 
-    for (final path in _jsFiles) {
-      try {
+    _cssContent = remoteCssPath == null
+        ? await rootBundle.loadString('assets/css/content.css')
+        : (await qolUpdates.readDownloadedText(remoteCssPath) ??
+            await rootBundle.loadString('assets/css/content.css'));
+
+    _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
+        ? qolUpdates.activeVersion
+        : bundledExtensionVersion;
+
+    final bridge = await rootBundle.loadString('assets/js/bridge.js');
+    final buffer = StringBuffer()
+      ..writeln('// SpicyChat QOL Android bundled injection')
+      ..writeln('// Shared QoL source may be overlaid by the in-app updater.')
+      ..writeln(
+        'window.__spicyChatQolBundledVersion = ${jsonEncode(_extensionVersion)};',
+      )
+      ..writeln('// === Android native bridge (APK-owned) ===')
+      ..writeln(bridge)
+      ..writeln();
+
+    if (remoteActive) {
+      for (final relative in qolUpdates.runtimeJsPaths) {
+        final source = await qolUpdates.readDownloadedText(relative);
+        if (source == null) {
+          throw StateError(
+            'Active QoL update is missing runtime file: $relative',
+          );
+        }
+        buffer
+          ..writeln('// === downloaded $relative ===')
+          ..writeln(source)
+          ..writeln();
+      }
+    } else {
+      for (final path in _bundledJsFiles) {
         final source = await rootBundle.loadString(path);
-        buffer.writeln('// === $path ===');
-        buffer.writeln(source);
-        buffer.writeln('');
-      } catch (e) {
-        buffer.writeln('// ERROR loading $path: $e');
+        buffer
+          ..writeln('// === $path ===')
+          ..writeln(source)
+          ..writeln();
       }
     }
 
     _jsBundle = buffer.toString();
+    await _loadOptions(remoteActive: remoteActive);
+    notifyListeners();
   }
+
+  Future<void> reloadAfterQolUpdate() => loadAssets();
+
+  Future<void> _loadOptions({required bool remoteActive}) async {
+    Future<String> load(String remotePath, String bundledPath) async {
+      if (remoteActive) {
+        final remote = await qolUpdates.readDownloadedText(remotePath);
+        if (remote != null) return remote;
+      }
+      return rootBundle.loadString(bundledPath);
+    }
+
+    var html = await load('options.html', 'assets/options/options.html');
+    var css = await load('options.css', 'assets/options/options.css');
+    final featureRegistry = await load(
+      'feature-registry.js',
+      'assets/options/feature-registry.js',
+    );
+    final optionsJs = await load('options.js', 'assets/options/options.js');
+
+    final bundledCss =
+        await rootBundle.loadString('assets/options/options.css');
+    const mobileMarker = '/* Android WebView / phone layout */';
+    final markerAt = bundledCss.indexOf(mobileMarker);
+    if (markerAt >= 0 && !css.contains(mobileMarker)) {
+      css = '$css\n\n${bundledCss.substring(markerAt)}';
+    }
+
+    final androidBridge =
+        await rootBundle.loadString('assets/options/options-bridge.js');
+
+    if (!html.contains('name="viewport"')) {
+      html = html.replaceFirst(
+        RegExp(
+          r'''(<meta\s+charset=["'][^"']+["']\s*/?>)''',
+          caseSensitive: false,
+        ),
+        r'''$1
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">''',
+      );
+    }
+
+    html = html.replaceFirst(
+      RegExp(
+        r'''<link[^>]+href=["']options\.css["'][^>]*>''',
+        caseSensitive: false,
+      ),
+      '<style id="ds-android-options-css">${_safeStyle(css)}</style>',
+    );
+
+    html = html.replaceFirst(
+      RegExp(
+        r'''<script\s+src=["']feature-registry\.js["']\s*></script>''',
+        caseSensitive: false,
+      ),
+      '<script>${_safeScript(featureRegistry)}</script>',
+    );
+
+    html = html.replaceAll(
+      RegExp(
+        r'''<script\s+src=["']options-bridge\.js["']\s*></script>''',
+        caseSensitive: false,
+      ),
+      '',
+    );
+
+    html = html.replaceFirst(
+      RegExp(
+        r'''<script\s+src=["']options\.js["']\s*></script>''',
+        caseSensitive: false,
+      ),
+      '<script>${_safeScript(androidBridge)}</script>\n'
+      '<script>${_safeScript(optionsJs)}</script>',
+    );
+
+    _optionsHtml = html;
+
+    _optionsSupportText.clear();
+    for (final name in const ['CHANGELOG.md', 'features.md']) {
+      _optionsSupportText[name] = await load(name, 'assets/options/$name');
+    }
+  }
+
+  String _safeScript(String value) =>
+      value.replaceAll(RegExp(r'</script', caseSensitive: false), r'<\/script');
+
+  String _safeStyle(String value) =>
+      value.replaceAll(RegExp(r'</style', caseSensitive: false), r'<\/style');
+
+  String? optionsSupportText(String name) => _optionsSupportText[name];
 
   String get cssInjectionScript {
     final escaped = _cssContent
@@ -162,11 +290,13 @@ class JsBundleService {
 
     return '''
       (function() {
-        if (document.getElementById('ds-qol-injected-css')) return;
-        var style = document.createElement('style');
-        style.id = 'ds-qol-injected-css';
+        var style = document.getElementById('ds-qol-injected-css');
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'ds-qol-injected-css';
+          document.head.appendChild(style);
+        }
         style.textContent = '$escaped';
-        document.head.appendChild(style);
       })();
     ''';
   }

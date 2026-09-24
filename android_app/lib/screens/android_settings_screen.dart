@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import '../services/android_tabs_service.dart';
 import '../services/android_ui_service.dart';
 import '../services/android_update_service.dart';
+import '../services/qol_update_service.dart';
 
 class AndroidSettingsScreen extends StatelessWidget {
   const AndroidSettingsScreen({super.key});
@@ -133,6 +134,7 @@ class AndroidSettingsScreen extends StatelessWidget {
     final tabs = context.watch<AndroidTabsService>();
     final androidUi = context.watch<AndroidUiService>();
     final updates = context.watch<AndroidUpdateService>();
+    final qolUpdates = context.watch<QolUpdateService>();
 
     return Scaffold(
       appBar: AppBar(
@@ -150,6 +152,169 @@ class AndroidSettingsScreen extends StatelessWidget {
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
                 letterSpacing: 1.1,
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(
+                        Icons.extension,
+                        color: Colors.deepPurpleAccent,
+                      ),
+                      SizedBox(width: 10),
+                      Text(
+                        'QoL updates',
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    qolUpdates.hasDownloadedBundle
+                        ? 'Active QoL: v${qolUpdates.activeVersion}'
+                        : 'Active QoL: bundled fallback',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Source: spicychat-qol-extension / main',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Automatic checks: every 12 hours',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Last checked: '
+                    '${_formatLastChecked(qolUpdates.lastCheckedAt)}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.04),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      qolUpdates.checking
+                          ? 'Checking for QoL updatesâ€¦'
+                          : qolUpdates.status == QolUpdateStatus.updated
+                              ? 'Newest QoL files downloaded. They are now '
+                                  'the active bundle for new page loads.'
+                              : qolUpdates.status == QolUpdateStatus.upToDate
+                                  ? 'QoL files are up to date.'
+                                  : qolUpdates.status == QolUpdateStatus.error
+                                      ? (qolUpdates.errorMessage ??
+                                          'QoL update check failed.')
+                                      : 'The app automatically downloads '
+                                          'new shared QoL files without an '
+                                          'APK update.',
+                      style: TextStyle(
+                        color: qolUpdates.status == QolUpdateStatus.error
+                            ? Colors.redAccent
+                            : qolUpdates.status == QolUpdateStatus.updated
+                                ? Colors.lightGreenAccent
+                                : Colors.white70,
+                        fontSize: 13,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: qolUpdates.checking
+                        ? null
+                        : () async {
+                            final messenger =
+                                ScaffoldMessenger.of(context);
+                            await qolUpdates.checkForUpdates(manual: true);
+                            if (!context.mounted) return;
+
+                            if (qolUpdates.status ==
+                                QolUpdateStatus.updated) {
+                              messenger.showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'QoL updated to '
+                                    'v${qolUpdates.activeVersion}.',
+                                  ),
+                                ),
+                              );
+                            } else if (qolUpdates.status ==
+                                QolUpdateStatus.upToDate) {
+                              messenger.showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'QoL files are already up to date.',
+                                  ),
+                                  duration: Duration(seconds: 2),
+                                ),
+                              );
+                            } else if (qolUpdates.status ==
+                                QolUpdateStatus.error) {
+                              messenger.showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    qolUpdates.errorMessage ??
+                                        'QoL update check failed.',
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                    icon: qolUpdates.checking
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Icon(Icons.sync),
+                    label: Text(
+                      qolUpdates.checking
+                          ? 'Checkingâ€¦'
+                          : 'Check QoL updates now',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'This updater follows the extension repository directly. '
+                    'It downloads the shared runtime, CSS, Options page and '
+                    'support files into app storage. The APK-owned Android '
+                    'bridge stays bundled for safety. A newly downloaded '
+                    'runtime is used automatically on the next full page load '
+                    'or app restart.',
+                    style: TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),

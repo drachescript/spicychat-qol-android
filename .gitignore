@@ -113,3 +113,5 @@ android_app/android/key.properties copy.example
 PATCH_CONTENTS.txt
 APPLY_ANDROID_BATCH.bat
 apply_webview_quick_menu_fix.ps1
+PATCH_ANDROID_NEXT_BATCH.bat
+patch_android_next_batch.ps1

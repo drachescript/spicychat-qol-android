@@ -451,12 +451,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       listen: false,
     );
     final uri = Uri.tryParse(_lastKnownUrl);
-    final path = uri?.path ?? '';
-    final isHome =
-        path == '/' || path == '/home' || path.startsWith('/home/');
-    final isChat = _isChatUrl(_lastKnownUrl);
     final enabled =
-        androidUi.controlsInSpicyChatTopBar && (isHome || isChat);
+        androidUi.controlsInSpicyChatTopBar &&
+        uri != null &&
+        _isSpicyChat(uri);
 
     try {
       await controller.evaluateJavascript(
@@ -589,7 +587,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   const ensureButton = reason => {
     const kind = currentKind();
 
-    if (!enabled || kind === "other") {
+    if (!enabled) {
       removeButton();
       return false;
     }
@@ -798,7 +796,12 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   if (!state.observer) {
     const observer = new MutationObserver(() => {
-      schedule("mutation");
+      // Once the independent fixed button exists, message virtualization and
+      // long-chat DOM churn must not continuously re-anchor it. Only recover
+      // if React/site navigation actually removed the button.
+      if (!document.getElementById(BUTTON_ID)) {
+        schedule("mutation-recover");
+      }
     });
 
     observer.observe(document.documentElement, {
@@ -818,13 +821,16 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     );
   }
 
-  if (!state.scrollHandler) {
-    state.scrollHandler = () => schedule("scroll");
-    window.addEventListener(
+  // Older builds repositioned the fixed overlay on every scroll. Besides
+  // being unnecessary, a chat with a moving/virtualized anchor could drag the
+  // cog around the screen. Remove any old handler and leave scrolling alone.
+  if (state.scrollHandler) {
+    window.removeEventListener(
       "scroll",
       state.scrollHandler,
       true
     );
+    state.scrollHandler = null;
   }
 
   return true;
@@ -867,14 +873,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     final androidTabs = context.watch<AndroidTabsService>();
     final androidUi = context.watch<AndroidUiService>();
     final currentUri = Uri.tryParse(_lastKnownUrl);
-    final currentPath = currentUri?.path ?? '';
-    final isHomeTopBarRoute =
-        currentPath == '/' ||
-        currentPath == '/home' ||
-        currentPath.startsWith('/home/');
     final useSpicyChatTopBarGear =
         androidUi.controlsInSpicyChatTopBar &&
-        (isHomeTopBarRoute || _isChatUrl(_lastKnownUrl));
+        currentUri != null &&
+        _isSpicyChat(currentUri);
 
     return Scaffold(
       body: SafeArea(
@@ -2163,6 +2165,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           builder: (_) => OptionsScreen(
             onSettingsChanged: _pushSettingsToWebView,
             extensionVersion: widget.bundleService.extensionVersion,
+            bundleService: widget.bundleService,
             onQueryMainTab: _queryAndroidMainTab,
             onSendMainTabMessage: _sendAndroidMainTabMessage,
           ),

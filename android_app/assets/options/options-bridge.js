@@ -229,6 +229,86 @@
     ).catch(() => null);
   }
 
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  function androidEnvironmentSnapshot() {
+    return {
+      android: true,
+      webview: true,
+      installedApp: true,
+      displayMode: "standalone",
+      firefox: false,
+      waterfox: false,
+      opera: false,
+      chromium: true,
+      dedicatedApp: true
+    };
+  }
+
+  function normalizePageDiagnostics(raw) {
+    let value = raw;
+
+    if (typeof value === "string") {
+      try { value = JSON.parse(value); }
+      catch { return null; }
+    }
+
+    // Be tolerant of either a direct content response or a bridge envelope.
+    if (
+      value &&
+      typeof value === "object" &&
+      value.ok === true &&
+      Object.prototype.hasOwnProperty.call(value, "response")
+    ) {
+      value = value.response;
+    }
+
+    if (!value || typeof value !== "object") return null;
+
+    return {
+      ...value,
+      androidEnvironment: {
+        ...(value.androidEnvironment || {}),
+        ...androidEnvironmentSnapshot()
+      }
+    };
+  }
+
+  async function queryAndroidMainTabWithRetry() {
+    const delays = [0, 80, 180, 320];
+    for (const delay of delays) {
+      if (delay) await wait(delay);
+      const tab = await queryAndroidMainTab();
+      if (tab?.url) return tab;
+    }
+    return null;
+  }
+
+  async function queryAndroidPageDiagnosticsWithRetry() {
+    const delays = [0, 80, 180, 320];
+    for (const delay of delays) {
+      if (delay) await wait(delay);
+      const response = normalizePageDiagnostics(
+        await sendAndroidMainTabMessage({
+          type: "DS_GET_PAGE_DIAGNOSTICS"
+        })
+      );
+      if (response) return response;
+    }
+    return null;
+  }
+
+  function partialAndroidPageDiagnostics(tab) {
+    return {
+      androidEnvironment: androidEnvironmentSnapshot(),
+      runtimePerformance: {},
+      performance: [],
+      androidPartialDiagnostics: true,
+      androidNativeBridge: true,
+      url: String(tab?.url || "")
+    };
+  }
+
   const runtime = {
     id: "spicychat-qol-android",
     lastError: null,
@@ -253,27 +333,37 @@
     sendMessage(message, callback) {
       const promise = (async () => {
         if (message?.type === "DS_GET_DIAGNOSTIC_CONTEXT") {
-          const tab = await queryAndroidMainTab();
+          const tab = await queryAndroidMainTabWithRetry();
+
           if (!tab?.url) {
+            // Keep the Android identity visible even when the main WebView is
+            // between navigations. This also lets the baseline UI save a
+            // clearly marked Options-only partial snapshot instead of failing
+            // with "No performance baseline saved yet".
             return {
               ok: false,
+              runtimeAvailable: false,
               url: "",
               title: "",
-              pageDiagnostics: null,
-              androidNativeBridge: true
+              pageDiagnostics: partialAndroidPageDiagnostics(null),
+              androidNativeBridge: true,
+              androidPartialDiagnostics: true
             };
           }
 
-          const pageDiagnostics = await sendAndroidMainTabMessage({
-            type: "DS_GET_PAGE_DIAGNOSTICS"
-          });
+          const liveDiagnostics =
+            await queryAndroidPageDiagnosticsWithRetry();
+          const pageDiagnostics =
+            liveDiagnostics || partialAndroidPageDiagnostics(tab);
 
           return {
             ok: true,
+            runtimeAvailable: !!liveDiagnostics,
             url: tab.url || "",
             title: tab.title || "",
-            pageDiagnostics: pageDiagnostics || null,
-            androidNativeBridge: true
+            pageDiagnostics,
+            androidNativeBridge: true,
+            androidPartialDiagnostics: !liveDiagnostics
           };
         }
 
