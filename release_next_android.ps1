@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PubspecPath = Join-Path $Root "android_app\pubspec.yaml"
+$Repository = "drachescript/spicychat-qol-android"
 
 function Fail([string]$Message) {
     throw $Message
@@ -23,6 +24,66 @@ function Get-PubspecVersion([string]$Text) {
         Patch = [int]$m.Groups[3].Value
         Code  = [int]$m.Groups[4].Value
         Name  = "$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value)"
+    }
+}
+
+function Get-PublishedReleaseCode {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [int]$FallbackCode = 0
+    )
+
+    $Headers = @{
+        "Accept" = "application/vnd.github+json"
+        "User-Agent" = "SpicyChat-QOL-Android-Release-Helper"
+        "X-GitHub-Api-Version" = "2022-11-28"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+        $Headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+    }
+
+    try {
+        $Release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$Repository/releases/tags/$Tag" `
+            -Headers $Headers `
+            -Method Get `
+            -TimeoutSec 20
+
+        $Asset = @($Release.assets | Where-Object {
+            $_.name -eq "update.json"
+        }) | Select-Object -First 1
+
+        if ($null -eq $Asset) {
+            Write-Host "Published metadata: no update.json; using tag/pubspec fallback." -ForegroundColor Yellow
+            return $FallbackCode
+        }
+
+        $Metadata = Invoke-RestMethod `
+            -Uri $Asset.browser_download_url `
+            -Headers @{
+                "User-Agent" = "SpicyChat-QOL-Android-Release-Helper"
+                "Cache-Control" = "no-cache"
+            } `
+            -Method Get `
+            -TimeoutSec 20
+
+        $Code = 0
+        if (
+            $null -ne $Metadata.versionCode -and
+            [int]::TryParse([string]$Metadata.versionCode, [ref]$Code) -and
+            $Code -gt 0
+        ) {
+            return $Code
+        }
+
+        Write-Host "Published metadata had no usable versionCode; using fallback." -ForegroundColor Yellow
+        return $FallbackCode
+    }
+    catch {
+        Write-Host "Could not read published versionCode for $Tag; using fallback." -ForegroundColor Yellow
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor DarkGray
+        return $FallbackCode
     }
 }
 
@@ -91,12 +152,16 @@ if ($ParsedTags.Count -eq 0) {
     $BaseName = $Current.Name
     $BaseVersion = [version]$Current.Name
     $BaseCode = $Current.Code
+    $PublishedCode = 0
 
-    Write-Host "Latest tag:      none"
-    Write-Host "Baseline:        pubspec $($Current.Name)+$($Current.Code)"
+    Write-Host "Latest tag:       none"
+    Write-Host "Baseline:         pubspec $($Current.Name)+$($Current.Code)"
 }
 else {
-    $Latest = $ParsedTags | Sort-Object Version -Descending | Select-Object -First 1
+    $Latest = $ParsedTags |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
     $BaseTag = $Latest.Tag
     $BaseName = $Latest.Name
     $BaseVersion = $Latest.Version
@@ -111,15 +176,27 @@ else {
 
     $TaggedPubspec = $TaggedPubspecLines -join "`n"
     $Tagged = Get-PubspecVersion $TaggedPubspec
-    $BaseCode = $Tagged.Code
+    $PublishedCode = Get-PublishedReleaseCode `
+        -Tag $BaseTag `
+        -FallbackCode $Tagged.Code
 
-    Write-Host "Latest tag:      $BaseTag"
-    Write-Host "Baseline:        $BaseName+$BaseCode"
+    # Same-visible-version hotfixes can make the published versionCode newer
+    # than the immutable tag's pubspec. Always continue from the largest code
+    # we know about.
+    $BaseCode = [Math]::Max(
+        [Math]::Max($Tagged.Code, $PublishedCode),
+        $Current.Code
+    )
+
+    Write-Host "Latest tag:       $BaseTag"
+    Write-Host "Tagged pubspec:   $BaseName+$($Tagged.Code)"
+    Write-Host "Published code:   $PublishedCode"
+    Write-Host "Version baseline: $BaseName+$BaseCode"
 }
 
-$TargetName = "$($BaseVersion.Major).$($BaseVersion.Minor).$($BaseVersion.Build + 1)"
+$TargetName =
+    "$($BaseVersion.Major).$($BaseVersion.Minor).$($BaseVersion.Build + 1)"
 $TargetVersion = [version]$TargetName
-$TargetTag = "v$TargetName"
 
 if ($CurrentVersionObject -lt $BaseVersion) {
     Fail "Current pubspec version $($Current.Name) is older than release baseline $BaseName."
@@ -130,13 +207,13 @@ $PreparedName = $Current.Name
 $PreparedCode = $Current.Code
 
 if ($CurrentVersionObject -eq $BaseVersion) {
+    # Normal intentional visible-version bump.
     $PreparedName = $TargetName
-    $PreparedCode = [Math]::Max($Current.Code, $BaseCode) + 1
+    $PreparedCode = $BaseCode + 1
     $NeedsWrite = $true
 }
 elseif ($CurrentVersionObject -eq $TargetVersion) {
-    # Important for interrupted/previous helper runs:
-    # if the next version is already in pubspec, do not bump it again.
+    # Idempotent after an interrupted/previous helper run.
     $PreparedName = $Current.Name
     if ($Current.Code -le $BaseCode) {
         $PreparedCode = $BaseCode + 1
@@ -145,17 +222,40 @@ elseif ($CurrentVersionObject -eq $TargetVersion) {
 }
 else {
     # A manually prepared version newer than the automatic next patch is valid.
-    # Leave it alone rather than overwriting the user's explicit version.
+    # Keep its name, but never let its versionCode go backwards behind a
+    # same-version hotfix that was already published.
     $PreparedName = $Current.Name
     $PreparedCode = $Current.Code
+
+    if ($PreparedCode -le $BaseCode) {
+        $PreparedCode = $BaseCode + 1
+        $NeedsWrite = $true
+    }
 }
 
 $PreparedTag = "v$PreparedName"
 
-# Refuse to prepare a version whose tag already exists.
-& git -C $Root rev-parse -q --verify "refs/tags/$PreparedTag" *> $null
-if ($LASTEXITCODE -eq 0) {
-    Fail "Tag $PreparedTag already exists. pubspec must be bumped to a newer version before release."
+$MatchingPreparedTags = @(& git -C $Root tag --list $PreparedTag)
+if ($LASTEXITCODE -ne 0) {
+    Fail "Could not inspect whether $PreparedTag already exists."
+}
+
+if ($MatchingPreparedTags.Count -gt 0) {
+    Fail @"
+Tag $PreparedTag already exists.
+
+If you are making a same-visible-version Android hotfix, do NOT run
+release_next_android.bat. Keep the existing visible version and make the commit
+summary start with:
+
+  $PreparedTag ...
+
+Example:
+  $PreparedTag options fix
+
+The GitHub workflow will increment only the internal Android versionCode,
+rotate the old APK to _old, and replace the current APK automatically.
+"@
 }
 
 if ($NeedsWrite) {
@@ -180,9 +280,10 @@ if ($NeedsWrite) {
 else {
     Write-Host "VERSION ALREADY PREPARED" -ForegroundColor Green
 }
-Write-Host "Current pubspec: $($Current.Name)+$($Current.Code)"
-Write-Host "Prepared:        $PreparedName+$PreparedCode" -ForegroundColor Green
-Write-Host "Future tag:      $PreparedTag" -ForegroundColor Green
+
+Write-Host "Current pubspec:  $($Current.Name)+$($Current.Code)"
+Write-Host "Prepared:         $PreparedName+$PreparedCode" -ForegroundColor Green
+Write-Host "Future tag:       $PreparedTag" -ForegroundColor Green
 Write-Host ""
 Write-Host "Nothing was staged." -ForegroundColor Yellow
 Write-Host "Nothing was committed." -ForegroundColor Yellow

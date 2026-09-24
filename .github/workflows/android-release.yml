@@ -5,11 +5,29 @@ on:
     branches:
       - main
     paths:
+      # Visible version / native Flutter code.
       - "android_app/pubspec.yaml"
+      - "android_app/lib/**"
+      - "android_app/android/**"
+
+      # APK-owned bridge assets. Normal shared QoL JS/CSS is intentionally
+      # omitted because the Android QoL updater handles those without an APK.
+      - "android_app/assets/js/bridge.js"
+      - "android_app/assets/js/android-message-longpress.js"
+      - "android_app/assets/options/options-bridge.js"
+
+      # Build/release plumbing.
       - ".github/workflows/android-release.yml"
       - "build_android.ps1"
       - "update_android.ps1"
+
   workflow_dispatch:
+    inputs:
+      force_same_version_hotfix:
+        description: "Rebuild/replace the current visible version even if the commit summary does not start with vX.Y.Z"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -28,12 +46,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read Android release version
+      - name: Resolve Android release mode
         id: version
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          FORCE_SAME_VERSION_HOTFIX: ${{ inputs.force_same_version_hotfix || 'false' }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           $text = Get-Content -LiteralPath "android_app\pubspec.yaml" -Raw
           $m = [regex]::Match(
             $text,
@@ -45,64 +66,156 @@ jobs:
           }
 
           $version = $m.Groups[1].Value
-          $versionCode = $m.Groups[2].Value
+          $pubspecCode = [int]$m.Groups[2].Value
           $tag = "v$version"
+          $commitSummary = (& git log -1 --pretty=%s).Trim()
 
           git fetch --tags --force
           if ($LASTEXITCODE -ne 0) {
             throw "git fetch --tags failed."
           }
 
-          # git tag --list succeeds even when the tag does not exist.
-          # Do NOT use git rev-parse here: a missing tag intentionally returns
-          # exit code 1, which caused the previous v0.1.1 workflow to fail.
           $matchingTags = @(git tag --list $tag)
           if ($LASTEXITCODE -ne 0) {
             throw "Could not inspect existing Git tags."
           }
           $tagExists = $matchingTags.Count -gt 0
 
-          # Treat an existing GitHub Release as the completed state. This also
-          # lets a rerun recover if a tag was created but release publishing
-          # failed afterward.
+          $headers = @{
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "Accept" = "application/vnd.github+json"
+            "User-Agent" = "SpicyChat-QOL-Android-Release"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $release = $null
           $releaseExists = $false
+          $publishedCode = 0
+
           try {
-            gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName *> $null
-            $releaseExists = ($LASTEXITCODE -eq 0)
+            $release = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" `
+              -Headers $headers `
+              -Method Get `
+              -TimeoutSec 30
+
+            $releaseExists = $true
+
+            $updateAsset = @($release.assets | Where-Object {
+              $_.name -eq "update.json"
+            }) | Select-Object -First 1
+
+            if ($null -ne $updateAsset) {
+              try {
+                $metadata = Invoke-RestMethod `
+                  -Uri $updateAsset.browser_download_url `
+                  -Headers @{
+                    "User-Agent" = "SpicyChat-QOL-Android-Release"
+                    "Cache-Control" = "no-cache"
+                  } `
+                  -Method Get `
+                  -TimeoutSec 30
+
+                if ($null -ne $metadata.versionCode) {
+                  $parsedPublishedCode = 0
+                  if ([int]::TryParse(
+                    [string]$metadata.versionCode,
+                    [ref]$parsedPublishedCode
+                  )) {
+                    $publishedCode = $parsedPublishedCode
+                  }
+                }
+              }
+              catch {
+                Write-Warning "Could not read versionCode from existing update.json: $($_.Exception.Message)"
+              }
+            }
           }
           catch {
-            $releaseExists = $false
+            $status = $null
+            try {
+              $status = [int]$_.Exception.Response.StatusCode
+            }
+            catch {}
+
+            if ($status -ne 404) {
+              throw "Could not inspect GitHub Release $tag`: $($_.Exception.Message)"
+            }
           }
 
-          # gh returns a non-zero code when no release exists. That is expected.
-          # Explicit outputs + exit 0 prevent that probe from failing this step.
-          $needsTag = -not $tagExists
-          $shouldRelease = -not $releaseExists
+          $escapedVersion = [regex]::Escape($version)
+          $summaryRequestsHotfix =
+            $commitSummary -match "^v?$escapedVersion(?:$|[\s:_-])"
+
+          $manualHotfix =
+            $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and
+            $env:FORCE_SAME_VERSION_HOTFIX -eq "true"
+
+          $hotfixRequested =
+            $releaseExists -and ($summaryRequestsHotfix -or $manualHotfix)
+
+          $mode = "skip"
+          $shouldBuild = $false
+          $needsTag = $false
+          $effectiveCode = $pubspecCode
+
+          if (-not $releaseExists) {
+            # New visible version, or recovery after a tag was created but the
+            # GitHub Release failed before publishing.
+            $mode = "new"
+            $shouldBuild = $true
+            $needsTag = -not $tagExists
+          }
+          elseif ($hotfixRequested) {
+            # Same visible version, newer Android versionCode. The release/tag
+            # stays vX.Y.Z; only the APK build generation changes.
+            $mode = "hotfix"
+            $shouldBuild = $true
+            $effectiveCode = [Math]::Max($pubspecCode, $publishedCode) + 1
+          }
 
           "version=$version" >> $env:GITHUB_OUTPUT
-          "version_code=$versionCode" >> $env:GITHUB_OUTPUT
+          "pubspec_code=$pubspecCode" >> $env:GITHUB_OUTPUT
+          "effective_code=$effectiveCode" >> $env:GITHUB_OUTPUT
+          "published_code=$publishedCode" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "release_exists=$($releaseExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "needs_tag=$($needsTag.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          "should_release=$($shouldRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "should_build=$($shouldBuild.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "mode=$mode" >> $env:GITHUB_OUTPUT
 
-          Write-Host "pubspec:         $version+$versionCode"
-          Write-Host "tag:             $tag"
-          Write-Host "tag exists:      $tagExists"
-          Write-Host "release exists:  $releaseExists"
-          Write-Host "needs tag:       $needsTag"
-          Write-Host "should release:  $shouldRelease"
+          Write-Host ""
+          Write-Host "pubspec:              $version+$pubspecCode"
+          Write-Host "tag:                  $tag"
+          Write-Host "commit summary:       $commitSummary"
+          Write-Host "tag exists:           $tagExists"
+          Write-Host "release exists:       $releaseExists"
+          Write-Host "published versionCode:$publishedCode"
+          Write-Host "summary hotfix match: $summaryRequestsHotfix"
+          Write-Host "manual hotfix:        $manualHotfix"
+          Write-Host "mode:                 $mode"
+          Write-Host "effective versionCode:$effectiveCode"
+          Write-Host "should build:         $shouldBuild"
+          Write-Host ""
 
-          exit 0
-
-      - name: No new release needed
-        if: steps.version.outputs.should_release != 'true'
+      - name: No APK build requested
+        if: steps.version.outputs.should_build != 'true'
         shell: pwsh
         run: |
-          Write-Host "${{ steps.version.outputs.tag }} already has a published GitHub Release."
-          Write-Host "Nothing to build or publish."
+          Write-Host "${{ steps.version.outputs.tag }} already has a published release."
+          Write-Host ""
+          Write-Host "This Android/native change did not request a same-version hotfix."
+          Write-Host "To rebuild the current visible version, start the commit summary with:"
+          Write-Host "  ${{ steps.version.outputs.tag }} ..."
+          Write-Host ""
+          Write-Host "Example:"
+          Write-Host "  ${{ steps.version.outputs.tag }} options fix"
+          Write-Host ""
+          Write-Host "You can also use workflow_dispatch with force_same_version_hotfix=true."
 
       - name: Check out current SpicyChat QoL extension
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_build == 'true'
         uses: actions/checkout@v4
         with:
           repository: drachescript/spicychat-qol-extension
@@ -110,21 +223,21 @@ jobs:
           path: spicychat-qol-extension
 
       - name: Set up Java 17
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_build == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Flutter
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_build == 'true'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
       - name: Restore Android signing files
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -158,12 +271,45 @@ jobs:
           storeFile=../upload-keystore.jks
           "@ | Set-Content -LiteralPath $propertiesPath -Encoding UTF8
 
-      - name: Build signed Android APK
-        if: steps.version.outputs.should_release == 'true'
+      - name: Prepare same-version hotfix versionCode
+        if: steps.version.outputs.mode == 'hotfix'
         shell: pwsh
         env:
           ANDROID_VERSION: ${{ steps.version.outputs.version }}
-          ANDROID_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          ANDROID_VERSION_CODE: ${{ steps.version.outputs.effective_code }}
+        run: |
+          $path = "android_app\pubspec.yaml"
+          $text = Get-Content -LiteralPath $path -Raw
+
+          $updated = [regex]::Replace(
+            $text,
+            '(?m)^version:\s*\d+\.\d+\.\d+\+\d+\s*$',
+            "version: $env:ANDROID_VERSION+$env:ANDROID_VERSION_CODE",
+            1
+          )
+
+          if ($updated -eq $text) {
+            throw "Could not apply temporary same-version versionCode."
+          }
+
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path -LiteralPath $path).Path,
+            $updated,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Write-Host "Temporary CI build version:"
+          Write-Host "  $env:ANDROID_VERSION+$env:ANDROID_VERSION_CODE"
+          Write-Host ""
+          Write-Host "This changes only the Actions runner checkout."
+          Write-Host "The repository pubspec is not committed by the workflow."
+
+      - name: Build signed Android APK
+        if: steps.version.outputs.should_build == 'true'
+        shell: pwsh
+        env:
+          ANDROID_VERSION: ${{ steps.version.outputs.version }}
+          ANDROID_VERSION_CODE: ${{ steps.version.outputs.effective_code }}
         run: |
           $extensionRoot = Join-Path $env:GITHUB_WORKSPACE "spicychat-qol-extension"
 
@@ -178,7 +324,7 @@ jobs:
           }
 
       - name: Verify release files
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         env:
           ANDROID_TAG: ${{ steps.version.outputs.tag }}
@@ -187,7 +333,8 @@ jobs:
             "output\SpicyChat-QOL-Android-$env:ANDROID_TAG.apk",
             "output\SpicyChat-QOL-Android-$env:ANDROID_TAG.apk.sha256",
             "output\SHA256SUMS.txt",
-            "output\update.json"
+            "output\update.json",
+            "output\current-version.txt"
           )
 
           foreach ($path in $required) {
@@ -196,8 +343,15 @@ jobs:
             }
           }
 
+          $metadata = Get-Content -LiteralPath "output\update.json" -Raw |
+            ConvertFrom-Json
+
+          if ([int]$metadata.versionCode -ne [int]"${{ steps.version.outputs.effective_code }}") {
+            throw "update.json versionCode does not match the effective CI build code."
+          }
+
       - name: Create release tag on this commit
-        if: steps.version.outputs.should_release == 'true' && steps.version.outputs.needs_tag == 'true'
+        if: steps.version.outputs.mode == 'new' && steps.version.outputs.needs_tag == 'true'
         shell: pwsh
         env:
           ANDROID_TAG: ${{ steps.version.outputs.tag }}
@@ -215,8 +369,8 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: Publish GitHub Release
-        if: steps.version.outputs.should_release == 'true'
+      - name: Publish new GitHub Release
+        if: steps.version.outputs.mode == 'new'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -228,3 +382,165 @@ jobs:
             output/SHA256SUMS.txt
             output/update.json
             output/current-version.txt
+
+      - name: Rotate same-version APK and publish hotfix
+        if: steps.version.outputs.mode == 'hotfix'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_TAG: ${{ steps.version.outputs.tag }}
+          ANDROID_VERSION_CODE: ${{ steps.version.outputs.effective_code }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:ANDROID_TAG
+
+          $currentApk = "SpicyChat-QOL-Android-$tag.apk"
+          $currentSha = "$currentApk.sha256"
+          $oldApk = "SpicyChat-QOL-Android-${tag}_old.apk"
+          $oldSha = "$oldApk.sha256"
+
+          $release = gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $null -eq $release) {
+            throw "Could not read existing release $tag."
+          }
+
+          function Find-Asset([string]$Name) {
+            return @($release.assets | Where-Object {
+              $_.name -eq $Name
+            }) | Select-Object -First 1
+          }
+
+          # Keep only one previous APK. Delete any older _old copy first.
+          foreach ($oldName in @($oldApk, $oldSha)) {
+            $existingOld = Find-Asset $oldName
+            if ($null -ne $existingOld) {
+              Write-Host "Deleting previous rotated asset: $oldName"
+              gh api `
+                --method DELETE `
+                "repos/$repo/releases/assets/$($existingOld.id)"
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not delete previous rotated asset $oldName."
+              }
+            }
+          }
+
+          # Rename the currently published APK in place so its existing GitHub
+          # download count/history stays attached to the previous build.
+          $publishedApk = Find-Asset $currentApk
+          if ($null -eq $publishedApk) {
+            throw "Existing release does not contain $currentApk."
+          }
+
+          Write-Host "Rotating current APK:"
+          Write-Host "  $currentApk"
+          Write-Host "  -> $oldApk"
+
+          gh api `
+            --method PATCH `
+            "repos/$repo/releases/assets/$($publishedApk.id)" `
+            -f "name=$oldApk" | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not rename the previous APK asset."
+          }
+
+          # The old checksum file names the old current filename internally, so
+          # replace it with a freshly generated checksum for the rotated name.
+          $publishedSha = Find-Asset $currentSha
+          if ($null -ne $publishedSha) {
+            gh api `
+              --method DELETE `
+              "repos/$repo/releases/assets/$($publishedSha.id)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not delete previous checksum asset."
+            }
+          }
+
+          $previousDir = Join-Path $env:RUNNER_TEMP "previous-android-apk"
+          New-Item -ItemType Directory -Path $previousDir -Force | Out-Null
+
+          gh release download $tag `
+            --repo $repo `
+            --pattern $oldApk `
+            --dir $previousDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download rotated previous APK to regenerate its checksum."
+          }
+
+          $oldApkPath = Join-Path $previousDir $oldApk
+          $oldShaPath = Join-Path $previousDir $oldSha
+          $oldHash = (Get-FileHash -LiteralPath $oldApkPath -Algorithm SHA256).
+            Hash.ToLowerInvariant()
+
+          [System.IO.File]::WriteAllText(
+            $oldShaPath,
+            "$oldHash  $oldApk`r`n",
+            [System.Text.Encoding]::ASCII
+          )
+
+          gh release upload $tag `
+            --repo $repo `
+            $oldShaPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not upload checksum for rotated previous APK."
+          }
+
+          # Replace all current release metadata/assets with the newly built
+          # same-visible-version APK. --clobber is deliberate here.
+          gh release upload $tag `
+            --repo $repo `
+            --clobber `
+            "output\$currentApk" `
+            "output\$currentSha" `
+            "output\SHA256SUMS.txt" `
+            "output\update.json" `
+            "output\current-version.txt"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not upload same-version hotfix assets."
+          }
+
+          # Preserve the generated changelog and append provenance for the APK
+          # that now differs from the original immutable tag commit.
+          $releaseAfter = gh release view $tag `
+            --repo $repo `
+            --json body | ConvertFrom-Json
+
+          $body = [string]$releaseAfter.body
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $entry = "- Android build $env:ANDROID_VERSION_CODE from commit ``$shortSha``"
+
+          if (-not $body.Contains($entry)) {
+            $header = "### Same-version Android hotfix builds"
+
+            if ($body.Contains($header)) {
+              $body = "$body`r`n$entry"
+            }
+            else {
+              if (-not [string]::IsNullOrWhiteSpace($body)) {
+                $body = "$body`r`n`r`n"
+              }
+              $body = "$body$header`r`n$entry"
+            }
+
+            $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+            [System.IO.File]::WriteAllText(
+              $notesPath,
+              $body,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+
+            gh release edit $tag `
+              --repo $repo `
+              --notes-file $notesPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "APK assets were updated, but release notes could not be updated."
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Same-version hotfix published." -ForegroundColor Green
+          Write-Host "Visible version: $tag"
+          Write-Host "New versionCode: $env:ANDROID_VERSION_CODE"
+          Write-Host "Previous APK:     $oldApk"
+          Write-Host "Current APK:      $currentApk"
