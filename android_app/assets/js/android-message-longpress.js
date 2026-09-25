@@ -9,6 +9,9 @@
   const MOVE_CANCEL_PX = 14;
   const SELECT_TEXT_WINDOW_MS = 10000;
   const BRIDGE_ATTR = "data-ds-message-action-bridge";
+  const UI_STYLE_ID = "ds-android-native-ui-polish";
+  const LEGACY_COPY_ID = "ds-android-editable-copy-button";
+  const HEADER_GEAR_ID = "ds-android-native-header-settings";
 
   let active = null;
   let longPressTimer = 0;
@@ -17,6 +20,96 @@
   let selectTextUntil = 0;
 
   const clean = value => String(value || "").trim();
+
+  // APK-owned UI polish only. Shared mobile message-edit/composer fixes stay in
+  // the normal QoL extension so Android does not fork them.
+  function installAndroidUiPolish() {
+    // The old editable-text fallback created its own fixed Copy pill in
+    // addition to Android's native Cut / Copy / Paste selection toolbar. Keep
+    // the native clipboard bridge, but never show that duplicate visual button.
+    document.getElementById(LEGACY_COPY_ID)?.remove();
+
+    let style = document.getElementById(UI_STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = UI_STYLE_ID;
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    style.textContent = `
+      #${LEGACY_COPY_ID} {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+
+      /*
+       * The Android cog lives inside SpicyChat's document, so broad site button
+       * selectors can otherwise leak backgrounds, padding, min sizes or pseudo
+       * styles into it. Reset it completely and rebuild only the round control.
+       */
+      #${HEADER_GEAR_ID} {
+        all: initial !important;
+        position: fixed !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        width: 42px !important;
+        height: 42px !important;
+        min-width: 42px !important;
+        min-height: 42px !important;
+        max-width: 42px !important;
+        max-height: 42px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        border: 1px solid rgba(255,255,255,.28) !important;
+        border-radius: 999px !important;
+        background: #6d36d9 !important;
+        background-image: none !important;
+        color: #fff !important;
+        box-shadow: 0 4px 14px rgba(0,0,0,.35) !important;
+        box-sizing: border-box !important;
+        overflow: hidden !important;
+        appearance: none !important;
+        -webkit-appearance: none !important;
+        opacity: 1 !important;
+        cursor: pointer !important;
+        pointer-events: auto !important;
+        touch-action: manipulation !important;
+        user-select: none !important;
+        -webkit-user-select: none !important;
+        -webkit-tap-highlight-color: transparent !important;
+        z-index: 2147483646 !important;
+        font: inherit !important;
+        line-height: 1 !important;
+        text-decoration: none !important;
+        outline: none !important;
+      }
+
+      #${HEADER_GEAR_ID}::before,
+      #${HEADER_GEAR_ID}::after {
+        content: none !important;
+        display: none !important;
+      }
+
+      #${HEADER_GEAR_ID} > svg {
+        display: block !important;
+        width: 22px !important;
+        height: 22px !important;
+        min-width: 22px !important;
+        min-height: 22px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        color: #fff !important;
+        stroke: currentColor !important;
+        background: transparent !important;
+        box-shadow: none !important;
+        pointer-events: none !important;
+      }
+    `;
+  }
+
+  installAndroidUiPolish();
 
   function isInteractiveTarget(target) {
     if (!(target instanceof Element)) return false;
@@ -77,8 +170,6 @@
     const ai = isAiMessage(context);
     const actions = [];
 
-    // Copy/Edit are the core Android long-hold use case. If the visible QoL
-    // quick-action button is disabled, the fallback uses SpicyChat's own menu.
     actions.push("Copy", "Edit");
 
     if (ai) {
@@ -160,8 +251,6 @@
     const value = clean(text);
     if (!value) return false;
 
-    // WebView clipboard APIs can reject or silently no-op. The dedicated APK
-    // owns this action, so use Flutter's native Android Clipboard first.
     try {
       const nativeResult = await window.flutter_inappwebview?.callHandler(
         "copyToClipboard",
@@ -386,5 +475,5 @@
     event.stopPropagation();
   }, true);
 
-  console.log("[DS Android] Message long-press actions ready");
+  console.log("[DS Android] Message long-press actions + native UI polish ready");
 })();
