@@ -12,6 +12,7 @@
 
   const HEADER_GEAR_ID = "ds-android-native-header-settings";
   const LEGACY_COPY_ID = "ds-android-editable-copy-button";
+  const UI_STYLE_ID = "ds-android-native-ui-cleanup-style";
 
   let active = null;
   let longPressTimer = 0;
@@ -19,27 +20,75 @@
   let suppressContextMenuUntil = 0;
   let selectTextUntil = 0;
 
+  let cleanupQueued = false;
+  let cleanupApplying = false;
+  let gearStyleObserver = null;
+  let lastGear = null;
+
   const clean = value => String(value || "").trim();
 
   // ---------------------------------------------------------------------------
-  // Android UI cleanup
+  // Android visual cleanup
   //
-  // Keep Android-specific code functional, not layout-owning. The shared QoL
-  // extension owns mobile composer/message-edit fixes. This layer only:
-  //   * docks the native cog into SpicyChat's existing header action row;
-  //   * removes the obsolete duplicate Copy pill;
-  //   * applies a narrow send-wrapper fallback if SpicyChat/React replaced the
-  //     wrapper before shared QoL could tag it.
+  // Shared QoL owns mobile composer/message-edit sizing. Android only removes
+  // wrapper/pseudo-element artifacts around the APK-owned cog and SpicyChat's
+  // send control. Do not style the editor/composer itself.
   // ---------------------------------------------------------------------------
+
+  function ensureCleanupStyle() {
+    let style = document.getElementById(UI_STYLE_ID);
+    if (style) return style;
+
+    style = document.createElement("style");
+    style.id = UI_STYLE_ID;
+    style.textContent = `
+      #${HEADER_GEAR_ID}::before,
+      #${HEADER_GEAR_ID}::after,
+      #${HEADER_GEAR_ID} *::before,
+      #${HEADER_GEAR_ID} *::after {
+        content: none !important;
+        display: none !important;
+        background: transparent !important;
+        background-image: none !important;
+        box-shadow: none !important;
+      }
+
+      [data-ds-android-send-shell="1"],
+      [data-ds-android-send-shell="1"]::before,
+      [data-ds-android-send-shell="1"]::after,
+      .ds-mobile-chat-send-wrapper,
+      .ds-mobile-chat-send-wrapper::before,
+      .ds-mobile-chat-send-wrapper::after {
+        background: transparent !important;
+        background-image: none !important;
+        border: 0 !important;
+        box-shadow: none !important;
+      }
+
+      [data-ds-android-send-shell="1"]::before,
+      [data-ds-android-send-shell="1"]::after,
+      .ds-mobile-chat-send-wrapper::before,
+      .ds-mobile-chat-send-wrapper::after,
+      .ds-mobile-chat-send-button::before,
+      .ds-mobile-chat-send-button::after {
+        content: none !important;
+        display: none !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+    return style;
+  }
 
   function visible(element) {
     if (!(element instanceof HTMLElement)) return false;
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
-    return rect.width > 0 &&
+    return (
+      rect.width > 0 &&
       rect.height > 0 &&
       style.display !== "none" &&
-      style.visibility !== "hidden";
+      style.visibility !== "hidden"
+    );
   }
 
   function elementText(element) {
@@ -57,7 +106,7 @@
   }
 
   function topActions() {
-    const vw = Math.max(1, window.innerWidth || 1);
+    const viewportWidth = Math.max(1, window.innerWidth || 1);
 
     return Array.from(
       document.querySelectorAll(
@@ -69,14 +118,16 @@
         if (!visible(element)) return false;
 
         const rect = element.getBoundingClientRect();
-        return rect.top >= -2 &&
+        return (
+          rect.top >= -2 &&
           rect.top <= 135 &&
           rect.bottom <= 180 &&
-          rect.left >= vw * 0.35 &&
+          rect.left >= viewportWidth * 0.32 &&
           rect.width >= 26 &&
           rect.width <= 120 &&
           rect.height >= 26 &&
-          rect.height <= 100;
+          rect.height <= 100
+        );
       })
       .sort(
         (a, b) =>
@@ -104,13 +155,15 @@
           svg?.getAttribute?.("aria-label") || ""
         ).toLowerCase();
 
-        return /rating|rate\b|thumb|like\b/.test(text) ||
+        return (
+          /rating|rate\b|thumb|like\b/.test(text) ||
           /thumb|like/.test(svgClass) ||
           /thumb|like/.test(svgLabel) ||
           !!element.querySelector?.(
             'svg[class*="thumb"], svg[data-lucide*="thumb"], ' +
             '[data-icon*="thumb"], [class*="thumb"]'
-          );
+          )
+        );
       });
       if (rating) return rating;
     }
@@ -125,9 +178,11 @@
         .replace(/\s+/g, "")
         .trim();
 
-      return /language|locale|globe|translate/.test(text) ||
+      return (
+        /language|locale|globe|translate/.test(text) ||
         /globe|language|translate/.test(svgClass) ||
-        /^[A-Z]{2,3}$/.test(shortText);
+        /^[A-Z]{2,3}$/.test(shortText)
+      );
     });
 
     return locale || actions[0] || null;
@@ -137,7 +192,11 @@
     if (!(anchor instanceof HTMLElement)) return null;
 
     let node = anchor.parentElement;
-    for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+    for (
+      let depth = 0;
+      node && depth < 6;
+      depth++, node = node.parentElement
+    ) {
       if (!(node instanceof HTMLElement)) continue;
 
       const rect = node.getBoundingClientRect();
@@ -158,7 +217,9 @@
         node.querySelectorAll(
           'button, a[role="button"], [role="button"]'
         )
-      ).filter(item => item.id !== HEADER_GEAR_ID && visible(item)).length;
+      ).filter(
+        item => item.id !== HEADER_GEAR_ID && visible(item)
+      ).length;
 
       if (actionCount >= 2) return node;
     }
@@ -177,112 +238,152 @@
     return node?.parentElement === row ? node : null;
   }
 
-  function styleDockedGear(gear) {
+  function styleGearSvg(gear) {
+    const svg = gear.querySelector("svg");
+    if (!(svg instanceof SVGElement)) return;
+
     const styles = {
-      "all": "unset",
-      "position": "relative",
-      "display": "inline-flex",
-      "align-items": "center",
-      "justify-content": "center",
-      "flex": "0 0 42px",
-      "width": "42px",
-      "height": "42px",
-      "min-width": "42px",
-      "min-height": "42px",
-      "max-width": "42px",
-      "max-height": "42px",
-      "padding": "0",
-      "margin": "0",
-      "border": "1px solid rgba(255,255,255,.28)",
-      "border-radius": "999px",
-      "background": "#6d36d9",
+      display: "block",
+      width: "22px",
+      height: "22px",
+      "min-width": "22px",
+      "min-height": "22px",
+      margin: "0",
+      padding: "0",
+      color: "#fff",
+      stroke: "currentColor",
+      background: "transparent",
       "background-image": "none",
-      "color": "#fff",
-      "box-shadow": "0 2px 8px rgba(0,0,0,.28)",
-      "box-sizing": "border-box",
-      "overflow": "hidden",
-      "appearance": "none",
-      "-webkit-appearance": "none",
-      "opacity": "1",
-      "cursor": "pointer",
-      "pointer-events": "auto",
-      "touch-action": "manipulation",
-      "user-select": "none",
-      "-webkit-user-select": "none",
-      "-webkit-tap-highlight-color": "transparent",
-      "z-index": "2",
-      "font": "inherit",
-      "line-height": "1",
-      "text-decoration": "none",
-      "outline": "none"
+      "box-shadow": "none",
+      "pointer-events": "none"
     };
 
     for (const [name, value] of Object.entries(styles)) {
-      gear.style.setProperty(name, value, "important");
-    }
-
-    gear.style.removeProperty("left");
-    gear.style.removeProperty("right");
-    gear.style.removeProperty("top");
-    gear.style.removeProperty("bottom");
-    gear.dataset.dsAndroidDocked = "1";
-
-    const svg = gear.querySelector("svg");
-    if (svg instanceof SVGElement) {
-      svg.style.setProperty("display", "block", "important");
-      svg.style.setProperty("width", "22px", "important");
-      svg.style.setProperty("height", "22px", "important");
-      svg.style.setProperty("min-width", "22px", "important");
-      svg.style.setProperty("min-height", "22px", "important");
-      svg.style.setProperty("margin", "0", "important");
-      svg.style.setProperty("padding", "0", "important");
-      svg.style.setProperty("color", "#fff", "important");
-      svg.style.setProperty("stroke", "currentColor", "important");
-      svg.style.setProperty("background", "transparent", "important");
-      svg.style.setProperty("box-shadow", "none", "important");
-      svg.style.setProperty("pointer-events", "none", "important");
+      svg.style.setProperty(name, value, "important");
     }
   }
 
-  function styleFallbackGear(gear) {
-    const styles = {
-      "all": "unset",
-      "position": "fixed",
-      "display": "flex",
-      "align-items": "center",
-      "justify-content": "center",
-      "width": "42px",
-      "height": "42px",
-      "min-width": "42px",
-      "min-height": "42px",
-      "padding": "0",
-      "margin": "0",
-      "right": "12px",
-      "bottom": "92px",
-      "left": "auto",
-      "top": "auto",
-      "border": "1px solid rgba(255,255,255,.28)",
-      "border-radius": "999px",
-      "background": "#6d36d9",
-      "color": "#fff",
-      "box-shadow": "0 3px 10px rgba(0,0,0,.32)",
-      "box-sizing": "border-box",
-      "appearance": "none",
-      "-webkit-appearance": "none",
-      "pointer-events": "auto",
-      "touch-action": "manipulation",
-      "z-index": "2147483646"
-    };
+  function styleDockedGear(gear) {
+    gear.style.cssText = [
+      "all:unset!important",
+      "position:relative!important",
+      "display:inline-flex!important",
+      "align-items:center!important",
+      "justify-content:center!important",
+      "flex:0 0 42px!important",
+      "width:42px!important",
+      "height:42px!important",
+      "min-width:42px!important",
+      "min-height:42px!important",
+      "max-width:42px!important",
+      "max-height:42px!important",
+      "padding:0!important",
+      "margin:0!important",
+      "border:1px solid rgba(255,255,255,.28)!important",
+      "border-radius:999px!important",
+      "background:#6d36d9!important",
+      "background-image:none!important",
+      "color:#fff!important",
+      "box-shadow:0 2px 8px rgba(0,0,0,.28)!important",
+      "box-sizing:border-box!important",
+      "overflow:hidden!important",
+      "appearance:none!important",
+      "-webkit-appearance:none!important",
+      "opacity:1!important",
+      "cursor:pointer!important",
+      "pointer-events:auto!important",
+      "touch-action:manipulation!important",
+      "user-select:none!important",
+      "-webkit-user-select:none!important",
+      "-webkit-tap-highlight-color:transparent!important",
+      "z-index:2!important",
+      "font:inherit!important",
+      "line-height:1!important",
+      "text-decoration:none!important",
+      "outline:none!important"
+    ].join(";");
 
-    for (const [name, value] of Object.entries(styles)) {
-      gear.style.setProperty(name, value, "important");
-    }
+    gear.dataset.dsAndroidDocked = "1";
+    styleGearSvg(gear);
+  }
+
+  function styleFallbackGear(gear) {
+    gear.style.cssText = [
+      "all:unset!important",
+      "position:fixed!important",
+      "display:flex!important",
+      "align-items:center!important",
+      "justify-content:center!important",
+      "width:42px!important",
+      "height:42px!important",
+      "min-width:42px!important",
+      "min-height:42px!important",
+      "max-width:42px!important",
+      "max-height:42px!important",
+      "padding:0!important",
+      "margin:0!important",
+      "right:12px!important",
+      "bottom:92px!important",
+      "left:auto!important",
+      "top:auto!important",
+      "border:1px solid rgba(255,255,255,.28)!important",
+      "border-radius:999px!important",
+      "background:#6d36d9!important",
+      "background-image:none!important",
+      "color:#fff!important",
+      "box-shadow:0 3px 10px rgba(0,0,0,.32)!important",
+      "box-sizing:border-box!important",
+      "overflow:hidden!important",
+      "appearance:none!important",
+      "-webkit-appearance:none!important",
+      "pointer-events:auto!important",
+      "touch-action:manipulation!important",
+      "z-index:2147483646!important"
+    ].join(";");
+
     delete gear.dataset.dsAndroidDocked;
+    styleGearSvg(gear);
+  }
+
+  function watchGearStyle(gear) {
+    if (lastGear === gear && gearStyleObserver) return;
+
+    gearStyleObserver?.disconnect?.();
+    gearStyleObserver = null;
+    lastGear = gear;
+
+    if (!(gear instanceof HTMLElement)) return;
+
+    gearStyleObserver = new MutationObserver(() => {
+      if (cleanupApplying) return;
+
+      const docked = gear.dataset.dsAndroidDocked === "1";
+      if (!docked) return;
+
+      const style = getComputedStyle(gear);
+      const inlinePosition = gear.style.getPropertyValue("position");
+      const contaminated =
+        inlinePosition !== "relative" ||
+        style.position !== "relative" ||
+        gear.style.getPropertyValue("left") ||
+        gear.style.getPropertyValue("right") ||
+        gear.style.getPropertyValue("top") ||
+        gear.style.getPropertyValue("bottom");
+
+      if (contaminated) scheduleCleanup();
+    });
+
+    gearStyleObserver.observe(gear, {
+      attributes: true,
+      attributeFilter: ["style", "class"]
+    });
   }
 
   function dockAndroidGear() {
     const gear = document.getElementById(HEADER_GEAR_ID);
     if (!(gear instanceof HTMLButtonElement)) return false;
+
+    watchGearStyle(gear);
 
     const anchor = preferredHeaderAnchor();
     const row = actionRowFor(anchor);
@@ -306,87 +407,138 @@
     return true;
   }
 
+  function clearOldSendShellMarkers() {
+    document
+      .querySelectorAll('[data-ds-android-send-shell="1"]')
+      .forEach(element => {
+        element.removeAttribute("data-ds-android-send-shell");
+        element.style.removeProperty("background");
+        element.style.removeProperty("background-image");
+        element.style.removeProperty("border");
+        element.style.removeProperty("box-shadow");
+      });
+  }
+
+  function safeSendShells(send) {
+    const result = [];
+    let node = send.parentElement;
+
+    for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
+      if (!(node instanceof HTMLElement)) break;
+
+      // Never alter the composer/editor container itself.
+      if (
+        node.querySelector(
+          'textarea, input[type="text"], [contenteditable="true"], ' +
+          '[contenteditable="plaintext-only"]'
+        )
+      ) {
+        break;
+      }
+
+      const rect = node.getBoundingClientRect();
+      const buttonCount = node.querySelectorAll("button").length;
+
+      // Dedicated send wrappers on SpicyChat are small. Stop as soon as the
+      // ancestor starts looking like a general layout container.
+      if (
+        rect.width > 150 ||
+        rect.height > 130 ||
+        buttonCount > 1
+      ) {
+        break;
+      }
+
+      result.push(node);
+    }
+
+    return result;
+  }
+
   function normalizeSendWrapper() {
     const send = document.querySelector(
       'button[aria-label="send-message"]'
     );
-    if (!(send instanceof HTMLElement) || !visible(send)) return false;
 
-    send.classList.add("ds-mobile-chat-send-button");
+    clearOldSendShellMarkers();
 
-    const wrapper = send.parentElement;
-    if (!(wrapper instanceof HTMLElement)) return false;
-
-    // Never collapse the real composer. Only normalize a dedicated wrapper
-    // which does not itself contain the textarea/contenteditable input.
-    if (
-      wrapper.querySelector(
-        'textarea, input[type="text"], [contenteditable="true"], ' +
-        '[contenteditable="plaintext-only"]'
-      )
-    ) {
+    if (!(send instanceof HTMLElement) || !visible(send)) {
       return false;
     }
 
-    wrapper.classList.add("ds-mobile-chat-send-wrapper");
-    wrapper.dataset.dsAndroidSendWrapperNormalized = "1";
+    send.classList.add("ds-mobile-chat-send-button");
 
-    const styles = {
-      "width": "fit-content",
-      "min-width": "0",
-      "max-width": "fit-content",
-      "flex": "0 0 auto",
-      "padding": "0",
-      "margin": "0",
-      "background": "transparent",
-      "background-image": "none",
-      "border": "0",
-      "box-shadow": "none",
-      "overflow": "visible"
-    };
+    const shells = safeSendShells(send);
+    if (!shells.length) return false;
 
-    for (const [name, value] of Object.entries(styles)) {
-      wrapper.style.setProperty(name, value, "important");
+    for (const shell of shells) {
+      shell.dataset.dsAndroidSendShell = "1";
+      shell.style.setProperty(
+        "background",
+        "transparent",
+        "important"
+      );
+      shell.style.setProperty(
+        "background-image",
+        "none",
+        "important"
+      );
+      shell.style.setProperty("border", "0", "important");
+      shell.style.setProperty("box-shadow", "none", "important");
+      shell.style.setProperty("overflow", "visible", "important");
     }
+
+    const immediate = shells[0];
+    immediate.classList.add("ds-mobile-chat-send-wrapper");
+    immediate.dataset.dsAndroidSendWrapperNormalized = "1";
+    immediate.style.setProperty("width", "fit-content", "important");
+    immediate.style.setProperty("min-width", "0", "important");
+    immediate.style.setProperty("max-width", "fit-content", "important");
+    immediate.style.setProperty("flex", "0 0 auto", "important");
+    immediate.style.setProperty("padding", "0", "important");
+    immediate.style.setProperty("margin", "0", "important");
 
     return true;
   }
 
-  let cleanupScheduled = false;
+  function runCleanup() {
+    cleanupQueued = false;
+    cleanupApplying = true;
 
-  function runAndroidUiCleanup() {
-    cleanupScheduled = false;
+    try {
+      ensureCleanupStyle();
 
-    // The native Android text-selection toolbar is now the only visible copy
-    // UI. The Flutter clipboard bridge still handles the actual copy event.
-    document.getElementById(LEGACY_COPY_ID)?.remove();
+      document.getElementById(LEGACY_COPY_ID)?.remove();
 
-    dockAndroidGear();
-    normalizeSendWrapper();
-  }
-
-  function scheduleAndroidUiCleanup() {
-    if (cleanupScheduled) return;
-    cleanupScheduled = true;
-    requestAnimationFrame(runAndroidUiCleanup);
-  }
-
-  const cleanupObserver = new MutationObserver(() => {
-    const gear = document.getElementById(HEADER_GEAR_ID);
-    const send = document.querySelector(
-      'button[aria-label="send-message"]'
-    );
-    const legacyCopy = document.getElementById(LEGACY_COPY_ID);
-
-    if (
-      legacyCopy ||
-      !gear ||
-      gear.dataset.dsAndroidDocked !== "1" ||
-      (send &&
-        send.parentElement?.dataset?.dsAndroidSendWrapperNormalized !== "1")
-    ) {
-      scheduleAndroidUiCleanup();
+      dockAndroidGear();
+      normalizeSendWrapper();
+    } finally {
+      cleanupApplying = false;
     }
+  }
+
+  function scheduleCleanup() {
+    if (cleanupQueued) return;
+    cleanupQueued = true;
+    requestAnimationFrame(runCleanup);
+  }
+
+  function scheduleSettledCleanup() {
+    scheduleCleanup();
+    setTimeout(scheduleCleanup, 80);
+    setTimeout(scheduleCleanup, 240);
+  }
+
+  const cleanupObserver = new MutationObserver(records => {
+    if (cleanupApplying) return;
+
+    const changed = records.some(
+      record =>
+        record.addedNodes?.length ||
+        record.removedNodes?.length
+    );
+
+    if (changed) scheduleCleanup();
   });
 
   cleanupObserver.observe(document.documentElement, {
@@ -394,16 +546,23 @@
     subtree: true
   });
 
-  window.addEventListener("resize", scheduleAndroidUiCleanup, {
+  window.addEventListener("resize", scheduleSettledCleanup, {
     passive: true
   });
+
   window.visualViewport?.addEventListener(
     "resize",
-    scheduleAndroidUiCleanup,
+    scheduleSettledCleanup,
     { passive: true }
   );
 
-  scheduleAndroidUiCleanup();
+  window.addEventListener(
+    "popstate",
+    () => setTimeout(scheduleCleanup, 0),
+    { passive: true }
+  );
+
+  scheduleSettledCleanup();
 
   // ---------------------------------------------------------------------------
   // Native Android message long-press actions
@@ -422,7 +581,11 @@
     if (isInteractiveTarget(target)) return null;
 
     let node = target;
-    for (let i = 0; node && i < 14; i++, node = node.parentElement) {
+    for (
+      let i = 0;
+      node && i < 14;
+      i++, node = node.parentElement
+    ) {
       if (node === document.body || node.id === "root") break;
 
       const dropdown = node.querySelector?.(
@@ -442,8 +605,9 @@
       return {
         root,
         dropdown:
-          root.querySelector?.("button[aria-label='message-dropdown']") ||
-          dropdown
+          root.querySelector?.(
+            "button[aria-label='message-dropdown']"
+          ) || dropdown
       };
     }
 
@@ -484,7 +648,9 @@
       actions.push("Report");
     } else {
       if (quick.has("Resend")) actions.push("Resend");
-      if (quick.has("Remove Image")) actions.push("Remove Image");
+      if (quick.has("Remove Image")) {
+        actions.push("Remove Image");
+      }
     }
 
     actions.push("Select text");
@@ -519,10 +685,15 @@
     if (!root) return () => {};
 
     const previousUserSelect = root.style.userSelect;
-    const previousWebkitUserSelect = root.style.webkitUserSelect;
+    const previousWebkitUserSelect =
+      root.style.webkitUserSelect;
 
     root.style.setProperty("user-select", "none", "important");
-    root.style.setProperty("-webkit-user-select", "none", "important");
+    root.style.setProperty(
+      "-webkit-user-select",
+      "none",
+      "important"
+    );
 
     return () => {
       if (previousUserSelect) {
@@ -532,7 +703,8 @@
       }
 
       if (previousWebkitUserSelect) {
-        root.style.webkitUserSelect = previousWebkitUserSelect;
+        root.style.webkitUserSelect =
+          previousWebkitUserSelect;
       } else {
         root.style.removeProperty("-webkit-user-select");
       }
@@ -620,13 +792,11 @@
   function clickQuickAction(context, label) {
     if (!context?.root) return false;
 
-    const buttons = Array.from(
+    const button = Array.from(
       context.root.querySelectorAll(
         ".ds-message-quick-actions button[data-ds-message-action]"
       )
-    );
-
-    const button = buttons.find(
+    ).find(
       item =>
         clean(item.dataset.dsMessageAction).toLowerCase() ===
         label.toLowerCase()
@@ -645,7 +815,8 @@
   function menuButtons(label, context) {
     if (!context?.dropdown) return [];
 
-    const sourceRect = context.dropdown.getBoundingClientRect();
+    const sourceRect =
+      context.dropdown.getBoundingClientRect();
 
     return Array.from(document.querySelectorAll("button"))
       .filter(button => {
@@ -657,7 +828,9 @@
           return false;
         }
 
-        return clean(button.getAttribute("aria-label")) === label;
+        return (
+          clean(button.getAttribute("aria-label")) === label
+        );
       })
       .sort((a, b) => {
         const ar = a.getBoundingClientRect();
@@ -677,7 +850,10 @@
   async function runSpicyChatMenuAction(context, label) {
     if (!context?.dropdown) return false;
 
-    document.documentElement.setAttribute(BRIDGE_ATTR, "1");
+    document.documentElement.setAttribute(
+      BRIDGE_ATTR,
+      "1"
+    );
 
     try {
       try {
@@ -687,9 +863,12 @@
       let actionButton = null;
 
       for (let i = 0; i < 16; i++) {
-        actionButton = menuButtons(label, context)[0] || null;
+        actionButton =
+          menuButtons(label, context)[0] || null;
         if (actionButton) break;
-        await new Promise(resolve => setTimeout(resolve, 60));
+        await new Promise(
+          resolve => setTimeout(resolve, 60)
+        );
       }
 
       if (!actionButton) return false;
@@ -702,7 +881,9 @@
       }
     } finally {
       setTimeout(() => {
-        document.documentElement.removeAttribute(BRIDGE_ATTR);
+        document.documentElement.removeAttribute(
+          BRIDGE_ATTR
+        );
       }, 140);
     }
   }
@@ -719,7 +900,8 @@
     }
 
     if (action === "Select text") {
-      selectTextUntil = Date.now() + SELECT_TEXT_WINDOW_MS;
+      selectTextUntil =
+        Date.now() + SELECT_TEXT_WINDOW_MS;
       DS?.setQuickStatus?.(
         "Text selection enabled for 10 seconds. " +
         "Long-press the message again."
@@ -740,7 +922,9 @@
       }
     }
 
-    const ok = await runSpicyChatMenuAction(context, action);
+    const ok =
+      await runSpicyChatMenuAction(context, action);
+
     if (!ok) {
       DS?.setQuickStatus?.(
         `${action} is not available on this message.`
@@ -767,7 +951,10 @@
           })
         );
 
-      if (typeof selected === "string" && selected) {
+      if (
+        typeof selected === "string" &&
+        selected
+      ) {
         await performAction(rootKey, selected);
       }
     } catch (error) {
@@ -791,7 +978,8 @@
 
       if (active) cancelActive();
 
-      const context = findMessageContext(event.target);
+      const context =
+        findMessageContext(event.target);
       if (!context) return;
 
       const restoreSelection =
@@ -893,7 +1081,11 @@
     "contextmenu",
     event => {
       if (Date.now() < selectTextUntil) return;
-      if (Date.now() > suppressContextMenuUntil) return;
+      if (
+        Date.now() > suppressContextMenuUntil
+      ) {
+        return;
+      }
       if (!findMessageContext(event.target)) return;
 
       event.preventDefault();
@@ -915,6 +1107,6 @@
   );
 
   console.log(
-    "[DS Android] Message long-press + UI cleanup ready"
+    "[DS Android] Message long-press + visual cleanup ready"
   );
 })();
