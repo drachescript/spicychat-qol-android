@@ -74,6 +74,17 @@
         content: none !important;
         display: none !important;
       }
+
+      /* Android WebView can clip descenders (g/j/p/q/y) in SpicyChat's
+         in-message edit textarea when its native line-height is too tight.
+         Keep this typography-only: do not own or resize the editor height. */
+      div[id^="message-"] textarea {
+        line-height: 1.5 !important;
+        padding-top: 0.4em !important;
+        padding-bottom: 0.55em !important;
+        box-sizing: border-box !important;
+        overflow-y: auto !important;
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
     return style;

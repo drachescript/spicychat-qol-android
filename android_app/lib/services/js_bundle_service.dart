@@ -427,6 +427,12 @@ Promise.resolve()
   /// aborts options.js before its normal boot block, run the two core boot
   /// functions from a separate script and always replace the placeholder
   /// version text with the active shared-QoL version.
+  ///
+  /// It also owns one bounded Android-only Changelog fallback. The extension
+  /// still gets first chance to render CHANGELOG.md normally; if the Options
+  /// WebView is still stuck on "Loading changelog...", Android reads the same
+  /// active/bundled text through the native handler and renders a simple,
+  /// readable fallback instead of leaving the page loading forever.
   String _androidOptionsRecoveryScript() {
     final version = jsonEncode(_extensionVersion);
     return '''
@@ -437,8 +443,128 @@ Promise.resolve()
     const node = document.getElementById("versionText");
     if (!node) return;
     const text = String(node.textContent || "");
-    if (!text.trim() || /version\s+loading/i.test(text)) {
+    if (!text.trim() || /version\\s+loading/i.test(text)) {
       node.textContent = "v" + activeVersion;
+    }
+  };
+
+  const changelogStillLoading = host => {
+    if (!host || host.dataset.loaded === "1") return false;
+    const text = String(host.textContent || "").trim();
+    return !text || /loading\\s+changelog/i.test(text);
+  };
+
+  const waitForFlutterBridge = (timeoutMs = 1800) => new Promise(resolve => {
+    const started = Date.now();
+    const poll = () => {
+      if (window.flutter_inappwebview?.callHandler) {
+        resolve(window.flutter_inappwebview);
+        return;
+      }
+      if (Date.now() - started >= timeoutMs) {
+        resolve(null);
+        return;
+      }
+      setTimeout(poll, 50);
+    };
+    poll();
+  });
+
+  const renderChangelogFallback = text => {
+    const host = document.getElementById("changelogContent");
+    if (!changelogStillLoading(host)) return true;
+
+    const source = String(text || "").trim();
+    if (!source) return false;
+
+    host.replaceChildren();
+    host.dataset.loaded = "1";
+    host.dataset.dsAndroidFallback = "1";
+
+    const blocks = source
+      .split(/\\n(?=##\\s+)/g)
+      .map(block => block.trim())
+      .filter(Boolean);
+
+    for (const block of blocks) {
+      const lines = block.split(/\\r?\\n/);
+      const headingLine = String(lines.shift() || "").trim();
+      const card = document.createElement("section");
+      card.className = "card ds-android-changelog-fallback-card";
+      card.style.cssText =
+        "padding:12px 14px;margin:10px 0;border-radius:10px;" +
+        "background:rgba(255,255,255,.035);" +
+        "border:1px solid rgba(255,255,255,.08);";
+
+      const heading = document.createElement("h3");
+      heading.textContent = headingLine.replace(/^#+\\s*/, "") || "Changelog";
+      heading.style.cssText = "margin:0 0 8px;font-size:16px;";
+      card.appendChild(heading);
+
+      let list = null;
+      const flushList = () => {
+        if (!list) return;
+        card.appendChild(list);
+        list = null;
+      };
+
+      for (const rawLine of lines) {
+        const line = String(rawLine || "").trim();
+        if (!line) {
+          flushList();
+          continue;
+        }
+
+        if (/^-\\s+/.test(line)) {
+          list ??= document.createElement("ul");
+          list.style.cssText = "margin:6px 0 0;padding-left:20px;";
+          const item = document.createElement("li");
+          item.textContent = line.replace(/^-\\s+/, "");
+          item.style.cssText = "margin:4px 0;line-height:1.45;";
+          list.appendChild(item);
+          continue;
+        }
+
+        flushList();
+        const paragraph = document.createElement("p");
+        paragraph.textContent = line.replace(/^#+\\s*/, "");
+        paragraph.style.cssText = "margin:6px 0;line-height:1.45;";
+        card.appendChild(paragraph);
+      }
+
+      flushList();
+      host.appendChild(card);
+    }
+
+    return host.childElementCount > 0;
+  };
+
+  const recoverChangelog = async () => {
+    const host = document.getElementById("changelogContent");
+    if (!changelogStillLoading(host)) return;
+
+    const bridge = await waitForFlutterBridge();
+    if (!bridge?.callHandler) {
+      if (changelogStillLoading(host)) {
+        host.textContent = "Could not load changelog.";
+        host.dataset.dsAndroidFallback = "error";
+      }
+      return;
+    }
+
+    let text = null;
+    try {
+      text = await Promise.race([
+        bridge.callHandler("optionsReadBundledText", "CHANGELOG.md"),
+        new Promise(resolve => setTimeout(() => resolve(null), 2200))
+      ]);
+    } catch (error) {
+      console.warn("[DS Android Options] Changelog fallback read failed", error);
+    }
+
+    if (!renderChangelogFallback(text) && changelogStillLoading(host)) {
+      host.textContent = "Could not load changelog.";
+      host.dataset.dsAndroidFallback = "error";
     }
   };
 
@@ -466,6 +592,10 @@ Promise.resolve()
 
   setTimeout(applyVersionFallback, 500);
   setTimeout(applyVersionFallback, 1500);
+
+  // Let the extension's own loadChangelog() win when it works. Only take over
+  // after a bounded delay if Android is still showing the placeholder.
+  setTimeout(() => { void recoverChangelog(); }, 1400);
 })();
 ''';
   }

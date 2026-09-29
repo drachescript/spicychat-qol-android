@@ -17,6 +17,8 @@
 - Kept Android message long-press actions such as Copy, Edit, Report, Resend, Remove Image, and Select text.
 - Shared QoL now handles the mobile message-edit box correctly: the editor can grow when text is added and shrink again when text is removed instead of getting larger on every edit.
 - Shared mobile composer/edit fixes stay in the extension so Android does not need a second competing layout implementation.
+- Added an Android Options fallback so the Changelog cannot stay on **Loading changelog...** forever. Android now reads the active downloaded `CHANGELOG.md`, falls back to the APK copy, and shows a clear error if neither can be read.
+- Added a narrow Android WebView typography safeguard for in-message editing so letters with descenders such as **g, j, p, q, y** are not clipped between lines. This does not resize the edit box.
 
 ## v0.1.7
 
