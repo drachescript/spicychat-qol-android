@@ -4,8 +4,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import 'app_log_service.dart';
 
@@ -85,6 +85,13 @@ class AndroidUpdateService extends ChangeNotifier {
   AndroidUpdateStatus _status = AndroidUpdateStatus.idle;
   String? _errorMessage;
 
+  bool _downloading = false;
+  double? _downloadProgress;
+  String? _installMessage;
+  String? _downloadedApkPath;
+  String? _downloadedVersionName;
+  int? _downloadedVersionCode;
+
   bool get initialized => _initialized;
   bool get checking => _checking;
   String get currentVersionName => _currentVersionName;
@@ -93,6 +100,22 @@ class AndroidUpdateService extends ChangeNotifier {
   AndroidUpdateInfo? get latest => _latest;
   AndroidUpdateStatus get status => _status;
   String? get errorMessage => _errorMessage;
+
+  bool get downloading => _downloading;
+  double? get downloadProgress => _downloadProgress;
+  String? get installMessage => _installMessage;
+
+  bool get hasDownloadedApk {
+    final path = _downloadedApkPath;
+    final info = _latest;
+    if (path == null || path.isEmpty || info == null) return false;
+
+    if (info.versionCode != null && _downloadedVersionCode != null) {
+      return info.versionCode == _downloadedVersionCode;
+    }
+
+    return info.versionName == _downloadedVersionName;
+  }
 
   bool get automaticCheckDue {
     final last = _lastCheckedAt;
@@ -183,9 +206,6 @@ class AndroidUpdateService extends ChangeNotifier {
       return false;
     }
 
-    // A failed/degraded network check must not count as a completed automatic
-    // check. Returning the real result also prevents startup UI from treating
-    // an inconclusive attempt as successful.
     return checkForUpdates(manual: false);
   }
 
@@ -203,6 +223,7 @@ class AndroidUpdateService extends ChangeNotifier {
     _checking = true;
     _status = AndroidUpdateStatus.checking;
     _errorMessage = null;
+    _installMessage = null;
     notifyListeners();
 
     final candidates = <AndroidUpdateInfo>[];
@@ -248,7 +269,6 @@ class AndroidUpdateService extends ChangeNotifier {
             );
           }
         } catch (e) {
-          // The release itself is still enough for semantic-version checking.
           unawaited(
             _appLog.log(
               'AndroidUpdate',
@@ -287,11 +307,6 @@ class AndroidUpdateService extends ChangeNotifier {
 
     _latest = candidates.reduce(_newerInfo);
 
-    // The website copy can briefly lag behind a just-published GitHub release.
-    // If GitHub itself could not be reached, an older website manifest must not
-    // be treated as proof that this installation is current. In that degraded
-    // case we leave lastCheckedAt untouched so the next launch retries instead
-    // of suppressing checks for another 12 hours.
     final websiteConclusive = websiteSucceeded &&
         websiteInfo != null &&
         _compareInfoToInstalled(websiteInfo) >= 0;
@@ -337,8 +352,6 @@ class AndroidUpdateService extends ChangeNotifier {
         : AndroidUpdateStatus.upToDate;
     _errorMessage = null;
 
-    // "Last checked" means last successful/conclusive check, not merely the
-    // last network attempt. This is the timestamp used by the 12-hour gate.
     _lastCheckedAt = DateTime.now();
     await _prefs?.setInt(
       _lastCheckedKey,
@@ -373,35 +386,277 @@ class AndroidUpdateService extends ChangeNotifier {
     return _compareVersions(info.versionName, _currentVersionName);
   }
 
-  Future<bool> openLatestUpdatePage() async {
-    final info = _latest;
-    final target = info != null && info.releaseUrl.trim().isNotEmpty
-        ? info.releaseUrl
-        : androidDownloadPageUrl;
+  String? _effectiveApkUrl(AndroidUpdateInfo info) {
+    final explicit = info.apkUrl?.trim();
+    if (explicit != null && explicit.isNotEmpty) return explicit;
 
-    final uri = Uri.tryParse(target);
-    if (uri == null) return false;
+    final tag = info.tag.trim().isNotEmpty
+        ? info.tag.trim()
+        : 'v${info.versionName}';
 
-    return launchUrl(
-      uri,
-      mode: LaunchMode.externalApplication,
-    );
+    final filename = 'SpicyChat-QOL-Android-$tag.apk';
+    return 'https://github.com/drachescript/spicychat-qol-android/'
+        'releases/download/$tag/$filename';
   }
 
-  Future<bool> openLatestApk() async {
-    final apk = _latest?.apkUrl?.trim();
-    if (apk == null || apk.isEmpty) {
-      return openLatestUpdatePage();
+  Future<bool> downloadAndInstallLatestApk() async {
+    if (!_initialized) {
+      await init();
     }
 
-    final uri = Uri.tryParse(apk);
-    if (uri == null) return openLatestUpdatePage();
+    if (_downloading) return false;
 
-    return launchUrl(
-      uri,
-      mode: LaunchMode.externalApplication,
-    );
+    if (_latest == null) {
+      await checkForUpdates(manual: true);
+    }
+
+    final info = _latest;
+    if (info == null) {
+      _errorMessage = 'Could not find the latest Android release.';
+      _status = AndroidUpdateStatus.error;
+      notifyListeners();
+      return false;
+    }
+
+    if (!updateAvailable && !hasDownloadedApk) {
+      _installMessage = 'You already have the latest Android app version.';
+      notifyListeners();
+      return false;
+    }
+
+    if (hasDownloadedApk) {
+      return installDownloadedUpdate();
+    }
+
+    final apkUrl = _effectiveApkUrl(info);
+    if (apkUrl == null || apkUrl.isEmpty) {
+      _errorMessage = 'The latest release does not include an APK download.';
+      _status = AndroidUpdateStatus.error;
+      notifyListeners();
+      return false;
+    }
+
+    _downloading = true;
+    _downloadProgress = 0;
+    _installMessage = 'Downloading update inside the app…';
+    _errorMessage = null;
+    notifyListeners();
+
+    HttpClient? client;
+    IOSink? sink;
+
+    try {
+      final cache = await getTemporaryDirectory();
+      final safeTag = info.tag
+          .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '-')
+          .replaceAll(RegExp(r'-+'), '-');
+      final file = File(
+        '${cache.path}${Platform.pathSeparator}'
+        'SpicyChat-QOL-Android-${safeTag.isEmpty ? info.versionName : safeTag}.apk',
+      );
+
+      if (await file.exists()) {
+        await file.delete();
+      }
+
+      client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 15)
+        ..idleTimeout = const Duration(seconds: 30);
+
+      final request = await client.getUrl(Uri.parse(apkUrl));
+      request.followRedirects = true;
+      request.maxRedirects = 8;
+      request.headers.set(
+        HttpHeaders.userAgentHeader,
+        'SpicyChat-QOL-Android/$_currentVersionName',
+      );
+      request.headers.set(
+        HttpHeaders.acceptHeader,
+        'application/vnd.android.package-archive,application/octet-stream,*/*',
+      );
+
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        await response.drain<void>();
+        throw HttpException(
+          'APK download returned HTTP ${response.statusCode}.',
+          uri: Uri.parse(apkUrl),
+        );
+      }
+
+      final total = response.contentLength;
+      var received = 0;
+      var lastReported = -1;
+
+      sink = file.openWrite();
+
+      await for (final chunk in response.timeout(const Duration(seconds: 45))) {
+        sink.add(chunk);
+        received += chunk.length;
+
+        if (total > 0) {
+          final percent = ((received * 100) / total).floor().clamp(0, 100);
+          if (percent != lastReported && (percent == 100 || percent % 2 == 0)) {
+            lastReported = percent;
+            _downloadProgress = percent / 100;
+            notifyListeners();
+          }
+        }
+      }
+
+      await sink.flush();
+      await sink.close();
+      sink = null;
+
+      if (!await file.exists() || await file.length() < 1024 * 1024) {
+        throw const FormatException('Downloaded APK was missing or too small.');
+      }
+
+      _downloadedApkPath = file.path;
+      _downloadedVersionName = info.versionName;
+      _downloadedVersionCode = info.versionCode;
+      _downloadProgress = 1;
+      _installMessage = 'Download complete. Opening Android installer…';
+      notifyListeners();
+
+      unawaited(
+        _appLog.log(
+          'AndroidUpdate',
+          'Downloaded update APK in-app: '
+              '${info.versionName}+${info.versionCode ?? '?'} '
+              '(${await file.length()} bytes)',
+        ),
+      );
+
+      return await installDownloadedUpdate();
+    } catch (e, stackTrace) {
+      try {
+        await sink?.close();
+      } catch (_) {}
+
+      _status = AndroidUpdateStatus.error;
+      _errorMessage = 'Could not download the Android update: $e';
+      _installMessage = null;
+
+      unawaited(
+        _appLog.log(
+          'AndroidUpdate',
+          'In-app APK download failed',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+
+      return false;
+    } finally {
+      client?.close(force: true);
+      _downloading = false;
+      notifyListeners();
+    }
   }
+
+  Future<bool> installDownloadedUpdate() async {
+    final info = _latest;
+    final path = _downloadedApkPath;
+
+    if (info == null || path == null || path.isEmpty) {
+      return downloadAndInstallLatestApk();
+    }
+
+    final file = File(path);
+    if (!await file.exists()) {
+      _downloadedApkPath = null;
+      _downloadedVersionName = null;
+      _downloadedVersionCode = null;
+      _installMessage = null;
+      notifyListeners();
+      return downloadAndInstallLatestApk();
+    }
+
+    try {
+      final raw = await _appInfoChannel.invokeMapMethod<String, dynamic>(
+        'installApk',
+        <String, dynamic>{
+          'path': file.path,
+          'sha256': info.sha256 ?? '',
+          'versionName': info.versionName,
+          'versionCode': info.versionCode ?? 0,
+        },
+      );
+
+      final ok = raw?['ok'] == true;
+      final permissionRequired = raw?['permissionRequired'] == true;
+
+      if (permissionRequired) {
+        _installMessage =
+            'Android needs permission to install updates from this app. '
+            'Enable it on the screen that opened, come back here, then tap '
+            'Install downloaded update.';
+        notifyListeners();
+        return false;
+      }
+
+      if (!ok) {
+        final error = (raw?['error'] ?? 'Android installer could not be opened.')
+            .toString();
+        _status = AndroidUpdateStatus.error;
+        _errorMessage = error;
+        _installMessage = null;
+        notifyListeners();
+        return false;
+      }
+
+      _installMessage =
+          'Android installer opened. Confirm the update to finish installing.';
+      notifyListeners();
+      return true;
+    } on PlatformException catch (e, stackTrace) {
+      _status = AndroidUpdateStatus.error;
+      _errorMessage = e.message ?? 'Android installer could not be opened.';
+      _installMessage = null;
+
+      unawaited(
+        _appLog.log(
+          'AndroidUpdate',
+          'Native APK install handoff failed',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+
+      notifyListeners();
+      return false;
+    } catch (e, stackTrace) {
+      _status = AndroidUpdateStatus.error;
+      _errorMessage = 'Android installer could not be opened: $e';
+      _installMessage = null;
+
+      unawaited(
+        _appLog.log(
+          'AndroidUpdate',
+          'Native APK install handoff failed',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// Kept for old call sites. "Open update" now means download the newest APK
+  /// inside the app and hand it directly to Android's package installer.
+  Future<bool> openLatestUpdatePage() => downloadAndInstallLatestApk();
+
+  /// Kept for old call sites. No external browser/GitHub page is opened.
+  Future<bool> openLatestApk() => downloadAndInstallLatestApk();
 
   Future<Map<String, dynamic>> _fetchJson(String url) async {
     final client = HttpClient()
@@ -507,7 +762,7 @@ class AndroidUpdateService extends ChangeNotifier {
         if (raw is! Map) continue;
         final asset = Map<String, dynamic>.from(raw);
         final name = (asset['name'] ?? '').toString().toLowerCase();
-        if (name.endsWith('.apk')) {
+        if (name.endsWith('.apk') && !name.contains('_old.apk')) {
           apkUrl = _nullableText(asset['browser_download_url']);
           if (apkUrl != null) break;
         }

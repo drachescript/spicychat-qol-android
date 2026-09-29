@@ -61,6 +61,17 @@ class AndroidSettingsScreen extends StatelessWidget {
   }
 
   String _updateStatusText(AndroidUpdateService updates) {
+    if (updates.downloading) {
+      final progress = updates.downloadProgress;
+      if (progress == null) return 'Downloading update inside the app…';
+      final percent = (progress * 100).round().clamp(0, 100);
+      return 'Downloading update… $percent%';
+    }
+
+    if (updates.installMessage?.trim().isNotEmpty == true) {
+      return updates.installMessage!;
+    }
+
     if (updates.checking) return 'Checking for updates…';
 
     switch (updates.status) {
@@ -76,7 +87,52 @@ class AndroidSettingsScreen extends StatelessWidget {
       case AndroidUpdateStatus.checking:
         return 'Checking for updates…';
       case AndroidUpdateStatus.idle:
-        return 'No manual update check has been run yet.';
+        return updates.lastCheckedAt == null
+            ? 'No update check has been run yet.'
+            : 'Automatic update checks are on.';
+    }
+  }
+
+  Future<void> _downloadAndInstallUpdate(
+    BuildContext context,
+    AndroidUpdateService updates,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = updates.hasDownloadedApk
+        ? await updates.installDownloadedUpdate()
+        : await updates.downloadAndInstallLatestApk();
+
+    if (!context.mounted) return;
+
+    if (ok) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Android installer opened. Confirm the update to finish.',
+          ),
+          duration: Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    if (updates.installMessage?.trim().isNotEmpty == true) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(updates.installMessage!),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+      return;
+    }
+
+    if (updates.errorMessage?.trim().isNotEmpty == true) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(updates.errorMessage!),
+          duration: const Duration(seconds: 5),
+        ),
+      );
     }
   }
 
@@ -99,9 +155,9 @@ class AndroidSettingsScreen extends StatelessWidget {
                 : 'Android update available: v${latest.versionName}',
           ),
           action: SnackBarAction(
-            label: 'OPEN',
+            label: 'DOWNLOAD',
             onPressed: () {
-              unawaited(updates.openLatestUpdatePage());
+              unawaited(_downloadAndInstallUpdate(context, updates));
             },
           ),
         ),
@@ -220,7 +276,7 @@ class AndroidSettingsScreen extends StatelessWidget {
                     ),
                     child: Text(
                       qolUpdates.checking
-                          ? 'Checking for QoL updatesâ€¦'
+                          ? 'Checking for QoL updates…'
                           : qolUpdates.status == QolUpdateStatus.updated
                               ? 'Newest QoL files downloaded. They are now '
                                   'the active bundle for new page loads.'
@@ -296,7 +352,7 @@ class AndroidSettingsScreen extends StatelessWidget {
                         : const Icon(Icons.sync),
                     label: Text(
                       qolUpdates.checking
-                          ? 'Checkingâ€¦'
+                          ? 'Checking…'
                           : 'Check QoL updates now',
                     ),
                   ),
@@ -350,9 +406,9 @@ class AndroidSettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  Text(
+                  const Text(
                     'Automatic checks: every 12 hours',
-                    style: const TextStyle(
+                    style: TextStyle(
                       color: Colors.white70,
                       fontSize: 13,
                     ),
@@ -393,7 +449,7 @@ class AndroidSettingsScreen extends StatelessWidget {
                     runSpacing: 8,
                     children: [
                       FilledButton.icon(
-                        onPressed: updates.checking
+                        onPressed: updates.checking || updates.downloading
                             ? null
                             : () => _runManualUpdateCheck(
                                   context,
@@ -414,21 +470,44 @@ class AndroidSettingsScreen extends StatelessWidget {
                               : 'Check for updates now',
                         ),
                       ),
-                      if (updates.updateAvailable)
+                      if (updates.updateAvailable || updates.hasDownloadedApk)
                         OutlinedButton.icon(
-                          onPressed: () {
-                            unawaited(updates.openLatestUpdatePage());
-                          },
-                          icon: const Icon(Icons.open_in_new),
-                          label: const Text('Open update'),
+                          onPressed: updates.downloading
+                              ? null
+                              : () => _downloadAndInstallUpdate(
+                                    context,
+                                    updates,
+                                  ),
+                          icon: updates.downloading
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : Icon(
+                                  updates.hasDownloadedApk
+                                      ? Icons.install_mobile
+                                      : Icons.download,
+                                ),
+                          label: Text(
+                            updates.downloading
+                                ? 'Downloading…'
+                                : updates.hasDownloadedApk
+                                    ? 'Install downloaded update'
+                                    : 'Download & install',
+                          ),
                         ),
                     ],
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'Manual checks bypass the 12-hour automatic-check timer. '
-                    'The app checks the website update manifest and the latest '
-                    'GitHub Android release, then compares the installed build.',
+                    'The app checks for Android updates automatically every '
+                    '12 hours. When an update is available, it downloads the '
+                    'APK inside the app and hands it directly to Android’s '
+                    'installer. No GitHub/browser page is opened. Android will '
+                    'still ask you to confirm the install.',
                     style: TextStyle(
                       color: Colors.white54,
                       fontSize: 12,
