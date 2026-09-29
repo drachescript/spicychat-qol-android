@@ -75,15 +75,13 @@
         display: none !important;
       }
 
-      /* Android WebView can clip descenders (g/j/p/q/y) in SpicyChat's
-         in-message edit textarea when its native line-height is too tight.
-         Keep this typography-only: do not own or resize the editor height. */
-      div[id^="message-"] textarea {
-        line-height: 1.5 !important;
-        padding-top: 0.4em !important;
-        padding-bottom: 0.55em !important;
+      /* Android-only message-edit typography. Height is managed below from
+         the textarea's natural scrollHeight so new lines appear immediately. */
+      textarea[data-ds-android-message-edit="1"] {
+        line-height: 1.45 !important;
+        padding-top: 8px !important;
+        padding-bottom: 10px !important;
         box-sizing: border-box !important;
-        overflow-y: auto !important;
       }
     `;
     (document.head || document.documentElement).appendChild(style);
@@ -202,10 +200,15 @@
   function actionRowFor(anchor) {
     if (!(anchor instanceof HTMLElement)) return null;
 
+    const viewportWidth = Math.max(1, window.innerWidth || 1);
+    const maxRowWidth = Math.min(460, viewportWidth * 0.72);
+    let best = null;
+    let bestWidth = Infinity;
     let node = anchor.parentElement;
+
     for (
       let depth = 0;
-      node && depth < 6;
+      node && depth < 7;
       depth++, node = node.parentElement
     ) {
       if (!(node instanceof HTMLElement)) continue;
@@ -216,26 +219,34 @@
         rect.top > 150 ||
         rect.height < 28 ||
         rect.height > 125 ||
-        rect.width < 80
+        rect.width < 80 ||
+        rect.width > maxRowWidth
       ) {
         continue;
       }
 
-      const display = getComputedStyle(node).display;
-      if (!["flex", "inline-flex"].includes(display)) continue;
-
+      // Prefer the smallest ancestor that actually contains the header action
+      // controls. Do not require display:flex: SpicyChat currently wraps the
+      // action group in a non-flex shell. Requiring flex made us climb to the
+      // whole header and insert the cog between the title and action group,
+      // creating the dark-blue rectangular gap seen on Android.
       const actionCount = Array.from(
         node.querySelectorAll(
           'button, a[role="button"], [role="button"]'
         )
-      ).filter(
-        item => item.id !== HEADER_GEAR_ID && visible(item)
-      ).length;
+      ).filter(item => {
+        if (item.id === HEADER_GEAR_ID || !visible(item)) return false;
+        const itemRect = item.getBoundingClientRect();
+        return itemRect.top >= -2 && itemRect.bottom <= 180;
+      }).length;
 
-      if (actionCount >= 2) return node;
+      if (actionCount >= 2 && rect.width < bestWidth) {
+        best = node;
+        bestWidth = rect.width;
+      }
     }
 
-    return null;
+    return best;
   }
 
   function directChildInside(row, element) {
@@ -418,6 +429,59 @@
     return true;
   }
 
+  function isMessageEditTextarea(textarea) {
+    if (!(textarea instanceof HTMLTextAreaElement)) return false;
+    if (textarea.dataset.dsAndroidMessageEdit === "1") return true;
+    if (textarea.closest('div[id^="message-"]')) return true;
+
+    // Fallback for site builds where the message wrapper no longer exposes an
+    // id. A real edit form has nearby Save + Cancel controls; the normal chat
+    // composer does not.
+    let node = textarea.parentElement;
+    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+      const labels = Array.from(node.querySelectorAll("button"))
+        .map(button => String(button.textContent || "").trim().toLowerCase());
+      if (labels.includes("save") && labels.includes("cancel")) return true;
+    }
+
+    return false;
+  }
+
+  function resizeMessageEditTextarea(textarea) {
+    if (!isMessageEditTextarea(textarea) || !textarea.isConnected) return false;
+
+    textarea.dataset.dsAndroidMessageEdit = "1";
+
+    const viewportHeight = Math.max(320,
+      window.visualViewport?.height || window.innerHeight || 640);
+    const maxHeight = Math.max(180, Math.min(440, viewportHeight * 0.46));
+    const minHeight = 96;
+
+    // Measure natural content height from a clean baseline. This is the key
+    // difference from the old growing-every-keystroke bug: never measure while
+    // the previous explicit height is still applied.
+    textarea.style.setProperty("height", "0px", "important");
+    const naturalHeight = Math.ceil(textarea.scrollHeight + 2);
+    const wanted = Math.max(minHeight, Math.min(maxHeight, naturalHeight));
+
+    textarea.style.setProperty("height", `${wanted}px`, "important");
+    textarea.style.setProperty("min-height", `${minHeight}px`, "important");
+    textarea.style.setProperty("max-height", `${maxHeight}px`, "important");
+    textarea.style.setProperty(
+      "overflow-y",
+      naturalHeight > maxHeight ? "auto" : "hidden",
+      "important"
+    );
+
+    return true;
+  }
+
+  function normalizeMessageEditTextareas() {
+    document.querySelectorAll("textarea").forEach(textarea => {
+      if (isMessageEditTextarea(textarea)) resizeMessageEditTextarea(textarea);
+    });
+  }
+
   function clearOldSendShellMarkers() {
     document
       .querySelectorAll('[data-ds-android-send-shell="1"]')
@@ -523,6 +587,7 @@
 
       dockAndroidGear();
       normalizeSendWrapper();
+      normalizeMessageEditTextareas();
     } finally {
       cleanupApplying = false;
     }
@@ -556,6 +621,19 @@
     childList: true,
     subtree: true
   });
+
+  document.addEventListener("focusin", event => {
+    const textarea = event.target;
+    if (!isMessageEditTextarea(textarea)) return;
+    requestAnimationFrame(() => resizeMessageEditTextarea(textarea));
+    setTimeout(() => resizeMessageEditTextarea(textarea), 80);
+  }, true);
+
+  document.addEventListener("input", event => {
+    const textarea = event.target;
+    if (!isMessageEditTextarea(textarea)) return;
+    requestAnimationFrame(() => resizeMessageEditTextarea(textarea));
+  }, true);
 
   window.addEventListener("resize", scheduleSettledCleanup, {
     passive: true
