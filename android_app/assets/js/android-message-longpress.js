@@ -9,6 +9,8 @@
   const MOVE_CANCEL_PX = 14;
   const SELECT_TEXT_WINDOW_MS = 10000;
   const BRIDGE_ATTR = "data-ds-message-action-bridge";
+  const HEADER_GEAR_ID = "ds-android-native-header-settings";
+  const COG_STYLE_ID = "ds-android-native-cog-appearance";
   const LEGACY_COPY_ID = "ds-android-editable-copy-button";
   const OLD_UI_STYLE_ID = "ds-android-native-ui-cleanup-style";
 
@@ -20,26 +22,10 @@
 
   const clean = value => String(value || "").trim();
 
-  // ---------------------------------------------------------------------------
-  // Ownership cleanup
-  //
-  // This file owns ONLY Android message long-press actions.
-  //
-  // It deliberately does NOT:
-  // - position/style/reparent the Android cog
-  // - style/resize message-edit textareas
-  // - style the composer/send button or its wrappers
-  //
-  // Cog ownership stays in webview_screen.dart.
-  // Mobile editor/composer ownership stays with SpicyChat + shared QoL.
-  // ---------------------------------------------------------------------------
-
   function clearLegacyAndroidLayoutOverrides() {
     document.getElementById(LEGACY_COPY_ID)?.remove();
     document.getElementById(OLD_UI_STYLE_ID)?.remove();
 
-    // Remove only leftovers created by older Android cleanup builds.
-    // Do not remove shared QoL classes: the extension may still use them.
     document
       .querySelectorAll('[data-ds-android-send-shell="1"]')
       .forEach(element => {
@@ -83,10 +69,88 @@
       });
   }
 
+  // webview_screen.dart owns creation + position.
+  // This only neutralizes global button CSS/pseudo-elements around the cog.
+  function ensureCogAppearanceStyle() {
+    let style = document.getElementById(COG_STYLE_ID);
+    if (style) return style;
+
+    style = document.createElement("style");
+    style.id = COG_STYLE_ID;
+    style.textContent = `
+      #${HEADER_GEAR_ID} {
+        width: 42px !important;
+        height: 42px !important;
+        min-width: 42px !important;
+        min-height: 42px !important;
+        max-width: 42px !important;
+        max-height: 42px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        border: 0 !important;
+        border-radius: 999px !important;
+        outline: 0 !important;
+        box-shadow: none !important;
+        background: #6d36d9 !important;
+        background-image: none !important;
+        color: #fff !important;
+        box-sizing: border-box !important;
+        overflow: hidden !important;
+        appearance: none !important;
+        -webkit-appearance: none !important;
+        -webkit-tap-highlight-color: transparent !important;
+        isolation: isolate !important;
+      }
+
+      #${HEADER_GEAR_ID}::before,
+      #${HEADER_GEAR_ID}::after,
+      #${HEADER_GEAR_ID} *::before,
+      #${HEADER_GEAR_ID} *::after {
+        content: none !important;
+        display: none !important;
+        width: 0 !important;
+        height: 0 !important;
+        border: 0 !important;
+        outline: 0 !important;
+        box-shadow: none !important;
+        background: transparent !important;
+        background-image: none !important;
+      }
+
+      #${HEADER_GEAR_ID} svg {
+        display: block !important;
+        width: 22px !important;
+        height: 22px !important;
+        min-width: 22px !important;
+        min-height: 22px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        outline: 0 !important;
+        box-shadow: none !important;
+        background: transparent !important;
+        pointer-events: none !important;
+      }
+    `;
+
+    (document.head || document.documentElement).appendChild(style);
+    return style;
+  }
+
   clearLegacyAndroidLayoutOverrides();
+  ensureCogAppearanceStyle();
+
+  const cogStyleObserver = new MutationObserver(() => {
+    if (!document.getElementById(COG_STYLE_ID)) ensureCogAppearanceStyle();
+  });
+
+  cogStyleObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: false
+  });
 
   // ---------------------------------------------------------------------------
-  // Native Android message long-press actions
+  // Native Android message long-press actions only.
   // ---------------------------------------------------------------------------
 
   function isInteractiveTarget(target) {
@@ -102,11 +166,7 @@
     if (isInteractiveTarget(target)) return null;
 
     let node = target;
-    for (
-      let i = 0;
-      node && i < 14;
-      i++, node = node.parentElement
-    ) {
+    for (let i = 0; node && i < 14; i++, node = node.parentElement) {
       if (node === document.body || node.id === "root") break;
 
       const dropdown = node.querySelector?.(
@@ -119,9 +179,7 @@
       );
       if (!hasBody) continue;
 
-      const root =
-        node.closest?.("div[id^='message-']") ||
-        node;
+      const root = node.closest?.("div[id^='message-']") || node;
 
       return {
         root,
@@ -169,9 +227,7 @@
       actions.push("Report");
     } else {
       if (quick.has("Resend")) actions.push("Resend");
-      if (quick.has("Remove Image")) {
-        actions.push("Remove Image");
-      }
+      if (quick.has("Remove Image")) actions.push("Remove Image");
     }
 
     actions.push("Select text");
@@ -206,15 +262,10 @@
     if (!root) return () => {};
 
     const previousUserSelect = root.style.userSelect;
-    const previousWebkitUserSelect =
-      root.style.webkitUserSelect;
+    const previousWebkitUserSelect = root.style.webkitUserSelect;
 
     root.style.setProperty("user-select", "none", "important");
-    root.style.setProperty(
-      "-webkit-user-select",
-      "none",
-      "important"
-    );
+    root.style.setProperty("-webkit-user-select", "none", "important");
 
     return () => {
       if (previousUserSelect) {
@@ -224,8 +275,7 @@
       }
 
       if (previousWebkitUserSelect) {
-        root.style.webkitUserSelect =
-          previousWebkitUserSelect;
+        root.style.webkitUserSelect = previousWebkitUserSelect;
       } else {
         root.style.removeProperty("-webkit-user-select");
       }
@@ -336,8 +386,7 @@
   function menuButtons(label, context) {
     if (!context?.dropdown) return [];
 
-    const sourceRect =
-      context.dropdown.getBoundingClientRect();
+    const sourceRect = context.dropdown.getBoundingClientRect();
 
     return Array.from(document.querySelectorAll("button"))
       .filter(button => {
@@ -349,9 +398,7 @@
           return false;
         }
 
-        return (
-          clean(button.getAttribute("aria-label")) === label
-        );
+        return clean(button.getAttribute("aria-label")) === label;
       })
       .sort((a, b) => {
         const ar = a.getBoundingClientRect();
@@ -371,10 +418,7 @@
   async function runSpicyChatMenuAction(context, label) {
     if (!context?.dropdown) return false;
 
-    document.documentElement.setAttribute(
-      BRIDGE_ATTR,
-      "1"
-    );
+    document.documentElement.setAttribute(BRIDGE_ATTR, "1");
 
     try {
       try {
@@ -384,12 +428,9 @@
       let actionButton = null;
 
       for (let i = 0; i < 16; i++) {
-        actionButton =
-          menuButtons(label, context)[0] || null;
+        actionButton = menuButtons(label, context)[0] || null;
         if (actionButton) break;
-        await new Promise(
-          resolve => setTimeout(resolve, 60)
-        );
+        await new Promise(resolve => setTimeout(resolve, 60));
       }
 
       if (!actionButton) return false;
@@ -402,9 +443,7 @@
       }
     } finally {
       setTimeout(() => {
-        document.documentElement.removeAttribute(
-          BRIDGE_ATTR
-        );
+        document.documentElement.removeAttribute(BRIDGE_ATTR);
       }, 140);
     }
   }
@@ -421,8 +460,7 @@
     }
 
     if (action === "Select text") {
-      selectTextUntil =
-        Date.now() + SELECT_TEXT_WINDOW_MS;
+      selectTextUntil = Date.now() + SELECT_TEXT_WINDOW_MS;
       DS?.setQuickStatus?.(
         "Text selection enabled for 10 seconds. " +
         "Long-press the message again."
@@ -443,8 +481,7 @@
       }
     }
 
-    const ok =
-      await runSpicyChatMenuAction(context, action);
+    const ok = await runSpicyChatMenuAction(context, action);
 
     if (!ok) {
       DS?.setQuickStatus?.(
@@ -472,10 +509,7 @@
           })
         );
 
-      if (
-        typeof selected === "string" &&
-        selected
-      ) {
+      if (typeof selected === "string" && selected) {
         await performAction(rootKey, selected);
       }
     } catch (error) {
@@ -499,8 +533,7 @@
 
       if (active) cancelActive();
 
-      const context =
-        findMessageContext(event.target);
+      const context = findMessageContext(event.target);
       if (!context) return;
 
       const restoreSelection =
@@ -559,9 +592,7 @@
       const dx = event.clientX - active.startX;
       const dy = event.clientY - active.startY;
 
-      if (
-        Math.hypot(dx, dy) > MOVE_CANCEL_PX
-      ) {
+      if (Math.hypot(dx, dy) > MOVE_CANCEL_PX) {
         cancelActive();
       }
     },
@@ -602,11 +633,7 @@
     "contextmenu",
     event => {
       if (Date.now() < selectTextUntil) return;
-      if (
-        Date.now() > suppressContextMenuUntil
-      ) {
-        return;
-      }
+      if (Date.now() > suppressContextMenuUntil) return;
       if (!findMessageContext(event.target)) return;
 
       event.preventDefault();
@@ -628,6 +655,6 @@
   );
 
   console.log(
-    "[DS Android] Message long-press ready (layout ownership cleanup)"
+    "[DS Android] Message long-press + cog appearance reset ready"
   );
 })();
