@@ -18,6 +18,12 @@ class SettingsService extends ChangeNotifier {
   static const _settingsKey = 'settings';
   static const _largeValueThresholdBytes = 32 * 1024;
   static const _largeStorageFolder = 'qol_large_storage_v1';
+  // Account/device credentials are intentionally device-local and must never
+  // be copied into ordinary QoL backup files.
+  static const _qolSyncPrivateBackupKeys = <String>{
+    'qolSyncAuthV1',
+    'qolSyncStateV1',
+  };
 
   SharedPreferences? _prefs;
   Directory? _largeStorageDir;
@@ -432,7 +438,9 @@ class SettingsService extends ChangeNotifier {
   }
 
   String exportFullBackup() {
-    return jsonEncode(getAllStorageAsJson());
+    final backup = getAllStorageAsJson()
+      ..removeWhere((key, _) => _qolSyncPrivateBackupKeys.contains(key));
+    return jsonEncode(backup);
   }
 
   Future<void> importFullBackup(Map<String, dynamic> backup) async {
@@ -440,6 +448,7 @@ class SettingsService extends ChangeNotifier {
 
     try {
       for (final entry in backup.entries) {
+        if (_qolSyncPrivateBackupKeys.contains(entry.key)) continue;
         final value = entry.value;
         if (value is String) {
           await _setRaw(entry.key, value);
