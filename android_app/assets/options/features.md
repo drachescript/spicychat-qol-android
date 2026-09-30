@@ -21,7 +21,7 @@ Everything is optional. Fresh installs keep the main extension switch on, while 
 - Safe diagnostic copy for bug reports without chat text or saved private content.
 
 ## Saved lists and bot discovery
-- Bot Status Center combines opened-history tracking/hiding/management with on-demand availability checks, Character Update Watch, saved local bot copies, duplicate/reupload hints, last-seen public profile preservation, importable JSON export, and revisioned local backups for your own bots while editing.
+- Bot Status Center checks saved bots by ID, repairs known names/descriptions from live character data, distinguishes deleted/private/unknown results safely, keeps Saved Bot Info recovery copies, and has a separate Deleted / Unavailable Saved Bots view with old chat links when available. It reuses a signed-in SpicyChat page for API checks and only creates one Home helper when needed; it does not open every bot profile.
 - Favorite bot history, including bots that were later unfavorited on SpicyChat.
 - Favorite creators with optional filter protection.
 - Local Follow Creator list with Follow / Following buttons and Saved Lists management.
@@ -74,9 +74,10 @@ Everything is optional. Fresh installs keep the main extension switch on, while 
 - Generation profiles plus independently configurable timestamps, model/engine details, elapsed time, and captured generation settings where available; the combined metadata switch is only a one-click default and is no longer required for the individual detail options.
 - Optional RP context-full warning with a configurable threshold. QoL prefers prompt/context usage exposed by SpicyChat, can use a manual context-window size when auto-detection is unavailable, and otherwise uses a conservative local token estimate from captured message metadata. The warning can stay in-chat or also use the existing optional browser-notification permission.
 - Optional customizable model menus with synced favorite hearts/order across the quick picker, Available models, and Explore all models, plus hidden models and favorites-only quick views.
+- Optional stacked chat message layout aligns user and AI message boxes in one vertical column without rebuilding message DOM or removing native controls.
 - Optional CSS-driven AI/user chat bubble appearance with independent colors, borders, opacity, shapes, shadows, contrast presets, and granular reset controls. An optional My messages appearance lock can capture SpicyChat’s native background/normal-text colors and locally reapply them if a site update resets the rendered user bubble.
 - Optional RP Format Repair for AI messages that locally detects messy speech/action/narration formatting, converts bold/parenthetical action blocks, repairs stray Markdown, preserves inline emphasis/meaningful quotes/backtick dialogue, and can show clean unquoted or quoted-dialogue RP styles without silently editing the saved response.
-- Chat Export with one-click plain-text copy plus TXT, Markdown, HTML and JSON exports. It can load older messages first, keeps basic message formatting, and supports optional bot info, OOC notes, generation details, message numbers and avatars.
+- Chat Export with one-click plain-text copy plus TXT, Markdown, HTML and JSON exports. Full-history API export paginates without mounting old messages into the live chat, with the native Load Previous Messages path kept as a compatibility fallback; optional bot info, OOC notes, generation details, message numbers and avatars are supported.
 - Persona saving and quick switching, plus an optional local Persona Manager with favorites, folders, private notes, duplicate-persona prefill, profile-picture copying, search, custom ordering, matching order/metadata in the in-chat picker, and a Local Persona Library with saved-text/avatar status, preview/copy, rendered-page refresh for incomplete/older copies, compressed local avatar preservation, and restore tools without bypassing SpicyChat persona limits.
 - Lorebook entry Show full text / Show less controls.
 - Auto voice for new AI replies using SpicyChat's native Listen control when available.
@@ -120,7 +121,7 @@ Everything is optional. Fresh installs keep the main extension switch on, while 
 - Chat composer cleanup for plus/image/voice controls and voice upsells.
 - Premium, notification, model, and advert/banner cleanup.
 - Optional browser-tab notification badge hiding and background product-update clearing.
-- Mini Panel with configurable placement, drag position, sizing, visible controls, Auto voice/Auto */translation controls, and an optional current-page feature summary.
+- Mini Panel with configurable placement, drag position, sizing, visible controls, Auto voice/Auto */translation controls, an optional current-page feature summary, and an opt-in counter for messages currently loaded in a chat.
 - Optional Mini Panel one-click shortcuts for up to three pinned Smart Filter presets on bot listings.
 - Mobile/compact-aware controls with a separate opt-in settings area, Mobile Recommended preset, and compact chat top-bar QoL menu for OOC, actions/formatting, navigation, persona, model, and optional translation. Manual enable works on Firefox/Chrome desktop, Firefox Android, installed web apps, and the Android APK. Mobile Bot Organizer bulk mode uses card-tap selection/protected touch targets so nearby native Favorite controls cannot be triggered accidentally.
 - Optional Auto-AFK cleanup for inactive SpicyChat tabs.
@@ -141,3 +142,7 @@ Everything is optional. Fresh installs keep the main extension switch on, while 
 - Checks for orphaned/duplicate local data, with cleanup only after you choose it.
 - Recently Seen history is a separate selectable backup/import/storage category.
 - Chatbot Editor Draft History and pinned Smart Filter presets are separate selectable backup/import/storage categories.
+
+
+## Planned
+- **Planned — Bot Recovery Assistant:** build a reviewable remake draft for a deleted bot from exact saved profile fields plus surviving chat history. Recovered data and AI-reconstructed Personality/Scenario stay clearly labeled and separate, and nothing is published automatically.

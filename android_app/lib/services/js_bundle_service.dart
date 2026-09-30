@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 import 'qol_update_service.dart';
 
 class JsBundleService extends ChangeNotifier {
-  static const bundledExtensionVersion = '0.2.15';
+  static const bundledExtensionVersion = '0.2.24';
 
   final QolUpdateService qolUpdates;
 
@@ -24,6 +24,7 @@ class JsBundleService extends ChangeNotifier {
   String get optionsHtml => _optionsHtml;
 
   static const _bundledJsFiles = [
+    'assets/js/card-token-main.js',
     'assets/js/generation-metadata-loader.js',
     'assets/js/card-token-auth-loader.js',
     'assets/js/exact-message-counts-loader.js',
@@ -37,6 +38,7 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/diagnostic-protocol.js',
     'assets/js/tab-diagnostics.js',
     'assets/js/quick-panel.js',
+    'assets/js/qol23-ui-fixes.js',
     'assets/js/accessibility.js',
     'assets/js/command-palette.js',
     'assets/js/tag-aliases.js',

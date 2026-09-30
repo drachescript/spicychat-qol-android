@@ -16,6 +16,37 @@
   const METRICS_INTERVAL_MS = 15000;
   const PRESENCE_INTERVAL_MS = 60000;
   const ACTIVE_TTL_MS = 30 * 60 * 1000;
+  const MODULE_HASHES = Object.freeze({
+    main: "sha256-4fd1aecdce301c47",
+    chatExport: "sha256-a915b9a4154e4613",
+    performanceMode: "sha256-45de174d5cabc231",
+    failedMessageHelper: "sha256-3ef0a4001b7b450c",
+    cardTokenInfo: "sha256-2f91f11a928a5585",
+    cardTokenMain: "sha256-8cfce077e7384568",
+    composer: "sha256-3dfe6a03ed53d28b",
+    quickDislikePage: "sha256-4d6511d16af0d917",
+    background: "sha256-e6889b3dc9285137",
+    listings: "sha256-6f962e90cff0f8ea",
+    sidebar: "sha256-5da9ff3689094626",
+    core: "sha256-68a26fdf61ed89ba",
+    messageOptions: "sha256-31b04492a9aeeeaf",
+    generationMetadata: "sha256-2ea2eeaf12f7cda0",
+    exactMessageCounts: "sha256-15fe59ecf8e0f621",
+    exactMessageCountsLoader: "sha256-e8f887f052840a62",
+    generationMetadataLoader: "sha256-57fc7a5f0e2088a1",
+    options: "sha256-31d5b370d72836d0",
+    botStatusWorkerManager: "sha256-4860a9fd79ddb904",
+    runtimePlan: "sha256-55adb9a5b251865f",
+    backgroundWorkerCoordinator: "sha256-e6889b3dc9285137",
+    topBar: "sha256-0bfe298c950c4fb0",
+    premiumNotifications: "sha256-51db5eaf035bdd13",
+    alternateDialogue: "sha256-48e127cb8c009b8f",
+    rpFormatRepair: "sha256-7d8d4eccc00fd171",
+    chatBookmarks: "sha256-b5bef9dc7ccc5007",
+    contextKeeper: "sha256-84cc997669a2d44d",
+    textReplacements: "sha256-50c3a17a336a277d",
+    translation: "sha256-4da617738c52b5bb",
+  });
 
   const sessionId = (() => {
     try { return crypto.randomUUID(); } catch {}
@@ -25,7 +56,6 @@
   const state = {
     inspectorActiveUntil: 0,
     lastKnownVersion: "",
-    lastKnownTechnicalVersion: "",
     inspectorVersion: "",
     inspectorSessionId: "",
     metricsTimer: null,
@@ -37,6 +67,7 @@
     networkStarted: 0,
     networkEnded: 0,
     lastHandshakeAt: 0,
+    lastHandshakeSignature: "",
     lastMetricsAt: 0,
     activeOperations: new Map(),
     ownershipObserver: null,
@@ -49,13 +80,10 @@
       const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime || null;
       const manifest = runtime?.getManifest?.() || {};
       const version = String(manifest.version_name || manifest.version || "").trim();
-      const technicalVersion = String(manifest.version || "").trim();
       if (version && version !== "unknown") state.lastKnownVersion = version;
-      if (technicalVersion && technicalVersion !== "unknown") state.lastKnownTechnicalVersion = technicalVersion;
     } catch {}
     return {
-      version: state.lastKnownVersion || "unknown",
-      technicalVersion: state.lastKnownTechnicalVersion || "unknown"
+      version: state.lastKnownVersion || "unknown"
     };
   }
 
@@ -87,7 +115,9 @@
         id: String(build?.id || "full").slice(0, 80),
         label: String(build?.label || "Full").slice(0, 80),
         generated: !!build?.generated,
-        bundles: Array.isArray(build?.bundles) ? build.bundles.map(value => String(value).slice(0, 60)).slice(0, 20) : []
+        revision: String(build?.revision || "unknown").slice(0, 100),
+        bundles: Array.isArray(build?.bundles) ? build.bundles.map(value => String(value).slice(0, 60)).slice(0, 20) : [],
+        moduleHashes: MODULE_HASHES
       },
       activeBundles
     };
@@ -99,6 +129,27 @@
     if (settings.enabled === false) return "disabled";
     if (tabPaused) return "paused";
     return "active";
+  }
+
+  function settingsSnapshot() {
+    const settings = DS.state?.settings || {};
+    return {
+      enabled: settings.enabled !== false,
+      runtimePerformanceMode: String(settings.runtimePerformanceMode || "adaptive").slice(0, 40),
+      chatPerformanceMode: !!settings.chatPerformanceMode,
+      performanceDiagnostics: !!settings.performanceDiagnostics,
+      desktopAppPerformanceGuard: settings.desktopAppPerformanceGuard !== false,
+      pauseQolInHiddenTabs: settings.pauseQolInHiddenTabs !== false,
+      deepSleepDisabledFeatures: settings.deepSleepDisabledFeatures !== false,
+      showChatExportButton: !!settings.showChatExportButton,
+      chatExportLoadPreviousMessages: !!settings.chatExportLoadPreviousMessages,
+      chatExportHistoryMode: String(settings.chatExportHistoryMode || "api").slice(0, 20),
+      showQolSidebarButton: !!settings.showQolSidebarButton,
+      qolSidebarButtonPlacement: String(settings.qolSidebarButtonPlacement || "after-sai").slice(0, 40),
+      autoRetryFailedMessageSends: !!settings.autoRetryFailedMessageSends,
+      autoFillListings: !!settings.autoFillListings,
+      quickDislikeIdleEnabled: !!settings.quickDislikeIdleEnabled
+    };
   }
 
   function safeValue(value, depth = 0) {
@@ -197,7 +248,6 @@
         type,
         feature: String(payload?.feature || "").slice(0, 80),
         version: versions.version,
-        technicalVersion: versions.technicalVersion,
         build: String(page?.build?.id || "full").slice(0, 80),
         sessionId,
         protocol: PROTOCOL,
@@ -236,7 +286,12 @@
         "historyBatches", "historyBatchDeferrals", "messageCountIncrementalUpdates", "messageCountIncrementalRoots",
         "loadedMessageRootCacheHits", "loadedMessageRootCacheMisses", "messageLaneDirtyRoots",
         "rpFormatHistoryDeferrals", "rpFormatChunkPasses", "rpFormatChunkMessages",
-        "generationMetadataScopedPasses", "generationMetadataScopedMessages", "generationMetadataHistoryDeferrals"
+        "generationMetadataScopedPasses", "generationMetadataScopedMessages", "generationMetadataHistoryDeferrals",
+        "chatExportApiRuns", "chatExportApiFailures", "chatExportApiLastMessages", "chatExportApiLastExpected",
+        "chatExportApiLastPages", "chatExportApiLastMs", "chatExportApiLastNetworkMs", "chatExportApiLastRequestMs",
+        "chatExportApiLastProcessingMs", "chatExportApiLastRetries", "chatExportApiLastAuthRefreshes",
+        "chatExportNativeRuns", "chatExportNativeLastMessages", "chatExportNativeLastMounted", "chatExportNativeLastParsedRoots",
+        "chatExportNativeLastRetries", "chatExportNativeLastMs", "chatExportLastSerializeMs", "chatExportLastSerializedChars"
       ]),
       storage: pick([
         "storageWriteRequests", "storageWriteBatches", "storageWriteKeys", "storageWriteMergedKeys",
@@ -265,6 +320,8 @@
       },
       routeType: page.routeType,
       runtimePlan: page.runtimePlan,
+      settings: settingsSnapshot(),
+      timings: DS.getPerformanceReport?.().slice(0, 30) || [],
       counters: selectedRuntimeCounters()
     };
   }
@@ -295,7 +352,6 @@
       reason,
       protocolVersion: 1,
       qolVersion: versions.version,
-      qolTechnicalVersion: versions.technicalVersion,
       browser: browserName(),
       presenceState: "present",
       runState: runState(),
@@ -303,6 +359,9 @@
       routeType: page.routeType,
       runtimePlan: page.runtimePlan,
       build: page.build,
+      buildRevision: page.build.revision,
+      moduleHashes: MODULE_HASHES,
+      settings: settingsSnapshot(),
       activeBundles: page.activeBundles,
       enabledModules: page.activeBundles,
       privacy: {
@@ -316,8 +375,24 @@
   }
 
   function sendHandshake(reason = "hello") {
-    state.lastHandshakeAt = Date.now();
-    emit("handshake", handshakePayload(reason), { force: true });
+    const payload = handshakePayload(reason);
+    const now = Date.now();
+    const signature = JSON.stringify({
+      qolVersion: payload.qolVersion,
+      runState: payload.runState,
+      routeType: payload.routeType,
+      runtimePlan: payload.runtimePlan,
+      buildRevision: payload.buildRevision,
+      settings: payload.settings,
+      activeBundles: payload.activeBundles
+    });
+    if (signature === state.lastHandshakeSignature && now - Number(state.lastHandshakeAt || 0) < 2500 && !["startup", "visible", "version-recovery"].includes(reason)) {
+      return false;
+    }
+    state.lastHandshakeSignature = signature;
+    state.lastHandshakeAt = now;
+    emit("handshake", payload, { force: true });
+    return true;
   }
 
   function fnv1a(value) {
@@ -358,6 +433,14 @@
     return element;
   };
 
+  DS.diagEvent = function diagEvent(feature, event, meta = {}) {
+    return emit("feature-event", {
+      feature: String(feature || "qol").slice(0, 80),
+      event: String(event || "event").slice(0, 100),
+      ...safeValue(meta || {})
+    });
+  };
+
   DS.diagOperationStart = function diagOperationStart(feature, operation = "run", meta = {}) {
     if (!active()) return null;
     const token = {
@@ -385,6 +468,15 @@
     state.operationsEnded += 1;
     const durationMs = Math.max(0, performance.now() - Number(token.startedAt || performance.now()));
     const counts = result?.counts && typeof result.counts === "object" ? result.counts : result;
+    const extraMeta = result && typeof result === "object" ? { ...result } : {};
+    const explicitMeta = extraMeta.meta && typeof extraMeta.meta === "object" ? { ...extraMeta.meta } : {};
+    delete extraMeta.meta;
+    delete extraMeta.counts;
+    delete extraMeta.scanned;
+    delete extraMeta.changed;
+    delete extraMeta.skipped;
+    delete extraMeta.errors;
+    delete extraMeta.outcome;
     emit("operation-end", {
       id: token.id,
       attribution: "confirmed-qol",
@@ -397,7 +489,8 @@
         skipped: Number(counts?.skipped || 0),
         errors: Number(counts?.errors || 0)
       },
-      outcome: String(result?.outcome || "ok").slice(0, 40)
+      outcome: String(result?.outcome || "ok").slice(0, 40),
+      meta: safeValue({ ...explicitMeta, ...extraMeta })
     });
     return true;
   };
@@ -449,13 +542,17 @@
     return true;
   };
 
+  DS.isDiagnosticInspectorConnected = () => active();
+
   DS.getDiagnosticProtocolState = function getDiagnosticProtocolState() {
     const versions = manifestInfo();
     return {
       protocol: PROTOCOL,
       protocolVersion: 1,
       qolVersion: versions.version,
-      qolTechnicalVersion: versions.technicalVersion,
+      buildRevision: pageState().build.revision,
+      moduleHashes: MODULE_HASHES,
+      settings: settingsSnapshot(),
       pageSessionId: sessionId,
       inspectorConnected: active(),
       inspectorVersion: state.inspectorVersion || "",
@@ -479,8 +576,7 @@
     const type = String(data.type || "");
     activatePeer(data);
     if (type === "hello" || type === "ping") {
-      sendHandshake(type);
-      emitMetrics(type);
+      if (sendHandshake(type)) emitMetrics(type);
       return;
     }
     if (type === "request-metrics" || type === "snapshot") {
@@ -511,8 +607,9 @@
     const page = pageState();
     DS.setDatasetIfChanged?.(root, "dsQolDiagnosticProtocol", PROTOCOL);
     if (versions.version !== "unknown" || !root.dataset.dsQolVersion) DS.setDatasetIfChanged?.(root, "dsQolVersion", versions.version);
-    if (versions.technicalVersion !== "unknown" || !root.dataset.dsQolTechnicalVersion) DS.setDatasetIfChanged?.(root, "dsQolTechnicalVersion", versions.technicalVersion);
+    if (root.hasAttribute("data-ds-qol-technical-version")) root.removeAttribute("data-ds-qol-technical-version");
     DS.setDatasetIfChanged?.(root, "dsQolBuild", String(page?.build?.id || "full"));
+    DS.setDatasetIfChanged?.(root, "dsQolRevision", String(page?.build?.revision || "unknown"));
     DS.setDatasetIfChanged?.(root, "dsQolPageSession", sessionId);
   }
 
@@ -541,8 +638,10 @@
   // entire page session.
   [250, 1000, 3000].forEach(delay => setTimeout(() => {
     const before = manifestInfo();
+    if (before.version !== "unknown") return;
     publishDiscoveryMarkers();
-    if (before.version !== "unknown" || before.technicalVersion !== "unknown") sendHandshake("version-recovery");
+    const after = manifestInfo();
+    if (after.version !== "unknown") sendHandshake("version-recovery");
   }, delay));
 
   // A tiny discovery marker lets the Inspector know which protocol to ask for

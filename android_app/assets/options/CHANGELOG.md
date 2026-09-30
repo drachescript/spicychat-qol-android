@@ -1,3 +1,118 @@
+## 0.2.24
+- Feature catalogue categories now remember whether you left each group expanded or collapsed when reopening Settings. The state is mirrored synchronously and stored in extension storage, survives immediate Settings closes, and is preserved across search/filter/sort rerenders; new categories still default to expanded.
+- Strengthened long-chat Performance Mode with safe DOM windowing: older message cards stay in SpicyChat's DOM but are folded out of layout/paint once a chat becomes large, while the newest 40-70 messages remain active depending on performance mode.
+- Added a small large-chat performance bar with Show older / Show all / Fold old controls so hidden history can be revealed in chunks without deleting or rewriting any messages.
+- Added a manual Refresh chat performance action that snapshots the current composer text to QoL-only session storage, reloads the chat, restores the draft only when the native composer is empty, and returns to the bottom. It refuses to refresh while a generation is still running.
+- Long chats now give SpicyChat's native message render/streaming a 0.95-1.4 second quiet period before nonessential QoL message decorators resume, with the resume scheduled through requestIdleCallback when available.
+- Windowed old messages are skipped by shared QoL message-enhancer scans, and visible older messages use stronger animation/transition/shadow/filter suppression while Performance Mode is active.
+- QoL deliberately does not intercept, debounce, or rewrite SpicyChat's own chatDraft sessionStorage writes; the separate refresh snapshot is only a safety net for the explicit performance reload button.
+
+## 0.2.23
+- Reduced Bot Status stale-refresh finish stalls by persisting only touched availability/archive IDs through a service-worker merge, avoiding full-state re-normalization, skipping unchanged multi-megabyte archive rewrites, yielding between commits, and deferring heavy Saved-manager/storage-usage refreshes.
+- Suppressed duplicate Options-page storage-change reprocessing for Bot Status commits so the same large state is not normalized and rerendered again immediately after it was saved.
+- Unavailable-bot cleanup now writes and verifies a compact recovery ledger before removing active memberships; if recovery cannot be verified, cleanup is cancelled and no IDs are removed.
+- Confirmed-unavailable cleanup no longer erases completed Less Like / Dislike history or creator seen-history. Unfinished bulk queues are cleaned, while historical evidence is preserved.
+- Cleaned unavailable bots remain tracked through the recovery ledger even when no rich saved copy exists, and memberships are automatically restored if a later Bot Status check confirms the bot is available again.
+- Fixed Bot Status scan-speed labels to match the actual 600/450/350 ms Safe/Normal/Fast pacing values.
+- Kept bulk Stop recommending / Less Like on the validated dedicated API-only recommendation helper and made large jobs substantially faster without adding concurrency.
+- Replaced fixed Less Like pacing with centralized adaptive serial pacing: 750 ms default start, gradual success-based step-down to 350 ms, and immediate slowdown/backoff on 429, 5xx, network, or timeout signals.
+- Removed the apparent every-25-item stall by moving expensive full Less Like history compaction from every 25 successes to a 500-item / 5-minute checkpoint while retaining a crash-safe per-success journal.
+- Added bounded retry/backoff for explicitly retryable Less Like failures while never retrying successful 2xx responses or ambiguous POST failures that may already have reached Recombee.
+- Added durable bulk Less Like job checkpoints with job ID, queue position, totals, failures, pacing state, and resumable pending work; input IDs are deduplicated before execution.
+- Throttled Less Like progress UI and availability/job-state persistence so multi-thousand-bot jobs do not rebuild or rewrite large state after every success.
+- Added Less Like run statistics for attempted/succeeded/failed/retried/skipped/duplicates, elapsed time, ETA, current interval/state, recent median POST latency, 429/5xx counts, and queue position.
+- Reused the already-ready recommendation worker during a bulk run instead of repeatedly revalidating the same helper before every bot.
+- Fixed the public bot-profile Export button stretching across the whole profile column; it now stays a compact content-width control.
+- Fixed stacked chat layout to use one centered shared message lane with matching user/AI card widths, matching the older Stylist-style behavior instead of only aligning one edge.
+- Hid the Quick Panel entirely when the current route has no enabled/usable panel controls, so pages such as `/chats` no longer show an empty “SpicyChat QoL” shell.
+
+## 0.2.22
+- Fixed periodic freezes while SpicyChat's persona picker is open by putting QoL into a low-impact modal pass instead of repeatedly running the full chat runtime.
+- Persona Organizer no longer re-appends already correctly ordered picker rows or rebuilds unchanged local folder/note metadata on every pass.
+- Centered the optional stacked chat column inside SpicyChat's native message lane instead of leaving the stacked bubbles visually offset to the left.
+- “Show full bot descriptions on cards” now removes the native line clamp completely instead of stopping at five lines, so the full description is readable without hover.
+- Clarified the existing chat appearance controls: custom backgrounds, bubble/text colors, font families, global chat text size, and line spacing are already available under Appearance & Interface.
+- Fixed the Bot Status helper reload loop caused by treating `?dsQolBotStatusWorker=1` as permanent worker identity after SpicyChat's Home router removed the query marker.
+- Bot Status workers now keep durable background tab/session identity, send a 3-second heartbeat, tolerate the router URL rewrite, and only get replaced after an actual request/liveness timeout with restart backoff.
+- Added a dedicated `worker:bot-status` runtime plan so Bot Status helpers skip normal listing/UI processing; exact-message-count and generation-metadata bridges are also skipped on worker bootstrap.
+- Tuned serial Bot Status pacing to 600 ms Safe / 450 ms Normal / 350 ms Fast while retaining adaptive 429/5xx backoff.
+- Expanded diagnostic module fingerprints to include Options, Bot Status worker management, runtime-plan and background-worker coordinator code so future Inspector captures can identify which worker code actually changed.
+- Fixed the Changelog staying on “Loading changelog...” indefinitely in the Android app by using the native bundled-text bridge directly with bounded fallbacks.
+- Reverted QoL's mobile message-edit textarea resizing so SpicyChat controls the editor height again, fixing edited messages collapsing into a tiny scrollable text box on Android.
+- Kept the separate mobile send-button wrapper fix without changing message-editor sizing.
+
+## 0.2.21
+- Added opt-in anonymous Bot Status Center contributions to the public SpicyChat Archive review queue. Public submissions go to `/api/submissions/bot-status` and never use or expose the private archive-import token.
+- Public Archive contributions send only saved bot snapshots plus a locally generated, one-way hashed random extension-install identifier for basic anti-spam/rate limiting; chats, personas, Favorites/Later membership, settings, account data, cookies, and SpicyChat login/session data are not included.
+- Public contributions remember per-bot fingerprints locally, send all saved copies on the first submission, default to new/changed copies afterwards, and retain the latest pending submission ID/status for the Bot Status Center UI.
+- Added direct Bot Status Center → SpicyChat Archive upload to `https://spicychat-archive-import.dragongraf.workers.dev/api/imports/bot-status`, with gzip, Bearer-token authentication, a Worker health test, a 60 MB safety limit, and automatic chunking for unusually large exports.
+- Archive import tokens are stored only in extension local storage and are never included in QoL backup/export/import payloads.
+- Archive upload remembers per-bot fingerprints, shows how many saved copies changed since the last upload, sends all copies on the first run, and defaults to new/changed copies afterwards; a full resend remains available and local Bot Status copies are never deleted after upload.
+- Added Refresh stale bots with configurable 1/7/14/30-day age, plus Safe/Normal/Fast serial Bot Status scan pacing and automatic backoff on HTTP 429/5xx responses.
+- HTTP-200 empty character objects are now unavailable candidates first and require a second independent empty-object result before becoming confirmed unavailable / cleanup-eligible.
+- Bot Status helper identity is hardened across router URL changes/reloads, and worker/run lifecycle telemetry now records opens, ready/lost/restart state, item outcomes, and completion.
+- Large Bot Status scans throttle Options-page progress repainting and avoid changing saved-copy timestamps when the bot snapshot itself did not change.
+- Added a Bot Status Center → SpicyChat Archive export for saved bot copies as compressed `.json.gz`.
+- The archive export uses a versioned schema, preserves snapshot timestamps and historical availability observations, and is designed for repeat/import-and-dedupe workflows by bot ID.
+- Exported unavailable/private/404-style results are explicitly historical observations only; the archive importer must still verify current status and keep its own repeated-404 deletion rule authoritative.
+- The export is conservative: it includes public/Bot Status snapshot fields and safe public revision history, but excludes manual creator/editor backups, local private notes, folder/tag organization, and other personal list metadata.
+- Large exports stream records directly into gzip so thousands of rich saved copies do not require a second giant uncompressed JSON string in memory.
+
+## 0.2.20
+- Fixed Bot Status Center slow starts and scans getting stuck on a single bot.
+- Bulk status scans now use one background SpicyChat Home helper, continue past temporary API/auth problems, and avoid repeated large saves during a scan.
+- Added a Check unchecked bots option for finishing interrupted scans or checking newly discovered chats.
+- Made tracked status results, saved bot copies, and confirmed deleted-bot recovery clearly separate.
+- Improved Saved Bots & Lists performance and fixed missing bot pictures and false update notices caused by avatar/creator formatting differences.
+- Chat List Load all now stays API-only, keeps visible progress while it runs, and no longer silently falls back to native Load More.
+- After one complete chat import, Load all becomes an incremental Refresh chats that stops at already-known history; Full rescan remains available for repair.
+- Added lightweight background-job coordination so chat imports, Less Like, and Bot Status do not send their API requests at the same instant.
+- Reduced Stop recommending / Less Like per-bot storage churn, added detailed timing telemetry, and use a lighter /chats helper when a known-good Recombee token is already cached.
+- Fixed Refresh duplicate matches changing already-checked bot statuses to Unknown.
+
+## 0.2.19
+- Added an optional stacked chat layout and fixed its missing Settings switch.
+- Improved Stop recommending / Less Like with one background helper, faster startup, reliable bulk processing, clearer progress, and fewer retries.
+- Less Like now skips invalid or unavailable bots and can clean confirmed deleted bots out of active saved lists.
+- Improved Bot Status Center with faster bot availability checks, better saved names/descriptions, and safer deleted/private detection.
+- Added a Deleted / Unavailable Saved Bots recovery view with saved bot details and old chat links when available.
+- Added Bot Recovery Assistant to planned features for rebuilding deleted bots from saved data and old chats.
+- Saved bot copies now refresh only when live bot data is still available.
+- Added cleanup for broken saved bot records without deleting archived/recovery copies.
+- Fixed expanded long descriptions in My Creations.
+- Added an automatic check for missing Settings switches.
+
+## 0.2.18
+- Fixed API-only Chat Export authentication on long chats by keeping the MAIN-world auth bridge available for Chat Export and starting it early enough to capture SpicyChat's authenticated message-history request.
+- Stopped Chat Export from blindly repeating the same unauthenticated 401 request and added a clearer auth-capture error.
+
+## 0.2.17
+- Fixed Chat Export:
+  - Fixed Copy / Export controls not appearing where enabled.
+  - Fixed older messages not automatically loading before export.
+  - Fixed exports stopping early when SpicyChat took longer to load a history batch.
+  - Improved long-chat capture, progress/cancelling and available bot info.
+  - Exporting now pauses interfering QoL message tools while the chat history is loading.
+  - Confirmed working on a 600+ message chat.
+- Added an opt-in Mini Panel counter for messages currently shown in a chat.
+- Added separate font choices for normal text, actions and dialogue in AI/user chat bubbles.
+- Added an optional horizontal expander for cut-off bot names.
+- Added an optional page-number box above chatbot listings.
+- Improved mobile message editing and fixed the oversized mobile send-button wrapper.
+- Improved Quick Dislike helper reuse.
+
+## 0.2.16
+- Fixed Bot Organizer folders/status/notes and its organize button crowding native card titles and creator names.
+- Fixed Bot Organizer sometimes using the card description instead of the bot name.
+- Bot Organizer backups now include folder definitions and its organizer settings, including empty folders.
+- Fixed Listing Refill repeatedly opening later pages when the current listing has no next page.
+- Fixed bot creation dates getting cut off on some cards and stopped the date layout fix from being reapplied to the same cards over and over.
+- The `...` pagination control is now a page-number box. Type any page from 1 to 20,000 and press Enter.
+- Added an estimated last-page shortcut when SpicyChat reports more results than its normal pagination shows.
+- Reduced repeated card/listing work, notification state changes and profile-name rewrites found with the Diagnostic Extension.
+- Listing Refill now rejects obvious blocked/duplicate cards before building them, spaces out page loads more, and pauses after repeated very low-yield pages until you scroll farther.
+- Reduced more same-value button, grid and performance-class writes.
+
 ## 0.2.15
 - Fixed bot names disappearing on Android/WebView when Bot Organizer was enabled.
 - Cleaned up Support Information so it only shows the normal QoL version and correctly detects Android/WebView when the page runtime does not answer.

@@ -9,10 +9,8 @@
   const MOVE_CANCEL_PX = 14;
   const SELECT_TEXT_WINDOW_MS = 10000;
   const BRIDGE_ATTR = "data-ds-message-action-bridge";
-
-  const HEADER_GEAR_ID = "ds-android-native-header-settings";
   const LEGACY_COPY_ID = "ds-android-editable-copy-button";
-  const UI_STYLE_ID = "ds-android-native-ui-cleanup-style";
+  const OLD_UI_STYLE_ID = "ds-android-native-ui-cleanup-style";
 
   let active = null;
   let longPressTimer = 0;
@@ -20,638 +18,72 @@
   let suppressContextMenuUntil = 0;
   let selectTextUntil = 0;
 
-  let cleanupQueued = false;
-  let cleanupApplying = false;
-  let gearStyleObserver = null;
-  let lastGear = null;
-
   const clean = value => String(value || "").trim();
 
   // ---------------------------------------------------------------------------
-  // Android visual cleanup
+  // Ownership cleanup
   //
-  // Shared QoL owns mobile composer/message-edit sizing. Android only removes
-  // wrapper/pseudo-element artifacts around the APK-owned cog and SpicyChat's
-  // send control. Do not style the editor/composer itself.
+  // This file owns ONLY Android message long-press actions.
+  //
+  // It deliberately does NOT:
+  // - position/style/reparent the Android cog
+  // - style/resize message-edit textareas
+  // - style the composer/send button or its wrappers
+  //
+  // Cog ownership stays in webview_screen.dart.
+  // Mobile editor/composer ownership stays with SpicyChat + shared QoL.
   // ---------------------------------------------------------------------------
 
-  function ensureCleanupStyle() {
-    let style = document.getElementById(UI_STYLE_ID);
-    if (style) return style;
+  function clearLegacyAndroidLayoutOverrides() {
+    document.getElementById(LEGACY_COPY_ID)?.remove();
+    document.getElementById(OLD_UI_STYLE_ID)?.remove();
 
-    style = document.createElement("style");
-    style.id = UI_STYLE_ID;
-    style.textContent = `
-      #${HEADER_GEAR_ID}::before,
-      #${HEADER_GEAR_ID}::after,
-      #${HEADER_GEAR_ID} *::before,
-      #${HEADER_GEAR_ID} *::after {
-        content: none !important;
-        display: none !important;
-        background: transparent !important;
-        background-image: none !important;
-        box-shadow: none !important;
-      }
-
-      [data-ds-android-send-shell="1"],
-      [data-ds-android-send-shell="1"]::before,
-      [data-ds-android-send-shell="1"]::after,
-      .ds-mobile-chat-send-wrapper,
-      .ds-mobile-chat-send-wrapper::before,
-      .ds-mobile-chat-send-wrapper::after {
-        background: transparent !important;
-        background-image: none !important;
-        border: 0 !important;
-        box-shadow: none !important;
-      }
-
-      [data-ds-android-send-shell="1"]::before,
-      [data-ds-android-send-shell="1"]::after,
-      .ds-mobile-chat-send-wrapper::before,
-      .ds-mobile-chat-send-wrapper::after,
-      .ds-mobile-chat-send-button::before,
-      .ds-mobile-chat-send-button::after {
-        content: none !important;
-        display: none !important;
-      }
-
-      /* Android-only message-edit typography. Height is managed below from
-         the textarea's natural scrollHeight so new lines appear immediately. */
-      textarea[data-ds-android-message-edit="1"] {
-        line-height: 1.45 !important;
-        padding-top: 8px !important;
-        padding-bottom: 10px !important;
-        box-sizing: border-box !important;
-      }
-    `;
-    (document.head || document.documentElement).appendChild(style);
-    return style;
-  }
-
-  function visible(element) {
-    if (!(element instanceof HTMLElement)) return false;
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    return (
-      rect.width > 0 &&
-      rect.height > 0 &&
-      style.display !== "none" &&
-      style.visibility !== "hidden"
-    );
-  }
-
-  function elementText(element) {
-    return [
-      element?.getAttribute?.("aria-label"),
-      element?.getAttribute?.("title"),
-      element?.getAttribute?.("data-testid"),
-      element?.textContent
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
-  }
-
-  function topActions() {
-    const viewportWidth = Math.max(1, window.innerWidth || 1);
-
-    return Array.from(
-      document.querySelectorAll(
-        'button, a[role="button"], [role="button"]'
-      )
-    )
-      .filter(element => {
-        if (element.id === HEADER_GEAR_ID) return false;
-        if (!visible(element)) return false;
-
-        const rect = element.getBoundingClientRect();
-        return (
-          rect.top >= -2 &&
-          rect.top <= 135 &&
-          rect.bottom <= 180 &&
-          rect.left >= viewportWidth * 0.32 &&
-          rect.width >= 26 &&
-          rect.width <= 120 &&
-          rect.height >= 26 &&
-          rect.height <= 100
-        );
-      })
-      .sort(
-        (a, b) =>
-          a.getBoundingClientRect().left -
-          b.getBoundingClientRect().left
-      );
-  }
-
-  function preferredHeaderAnchor() {
-    const actions = topActions();
-    if (!actions.length) return null;
-
-    const chatPage =
-      location.pathname === "/chat" ||
-      location.pathname.startsWith("/chat/");
-
-    if (chatPage) {
-      const rating = actions.find(element => {
-        const text = elementText(element);
-        const svg = element.querySelector?.("svg");
-        const svgClass = String(
-          svg?.getAttribute?.("class") || ""
-        ).toLowerCase();
-        const svgLabel = String(
-          svg?.getAttribute?.("aria-label") || ""
-        ).toLowerCase();
-
-        return (
-          /rating|rate\b|thumb|like\b/.test(text) ||
-          /thumb|like/.test(svgClass) ||
-          /thumb|like/.test(svgLabel) ||
-          !!element.querySelector?.(
-            'svg[class*="thumb"], svg[data-lucide*="thumb"], ' +
-            '[data-icon*="thumb"], [class*="thumb"]'
-          )
-        );
-      });
-      if (rating) return rating;
-    }
-
-    const locale = actions.find(element => {
-      const text = elementText(element);
-      const svg = element.querySelector?.("svg");
-      const svgClass = String(
-        svg?.getAttribute?.("class") || ""
-      ).toLowerCase();
-      const shortText = String(element.textContent || "")
-        .replace(/\s+/g, "")
-        .trim();
-
-      return (
-        /language|locale|globe|translate/.test(text) ||
-        /globe|language|translate/.test(svgClass) ||
-        /^[A-Z]{2,3}$/.test(shortText)
-      );
-    });
-
-    return locale || actions[0] || null;
-  }
-
-  function actionRowFor(anchor) {
-    if (!(anchor instanceof HTMLElement)) return null;
-
-    const viewportWidth = Math.max(1, window.innerWidth || 1);
-    const maxRowWidth = Math.min(460, viewportWidth * 0.72);
-    let best = null;
-    let bestWidth = Infinity;
-    let node = anchor.parentElement;
-
-    for (
-      let depth = 0;
-      node && depth < 7;
-      depth++, node = node.parentElement
-    ) {
-      if (!(node instanceof HTMLElement)) continue;
-
-      const rect = node.getBoundingClientRect();
-      if (
-        rect.top < -8 ||
-        rect.top > 150 ||
-        rect.height < 28 ||
-        rect.height > 125 ||
-        rect.width < 80 ||
-        rect.width > maxRowWidth
-      ) {
-        continue;
-      }
-
-      // Prefer the smallest ancestor that actually contains the header action
-      // controls. Do not require display:flex: SpicyChat currently wraps the
-      // action group in a non-flex shell. Requiring flex made us climb to the
-      // whole header and insert the cog between the title and action group,
-      // creating the dark-blue rectangular gap seen on Android.
-      const actionCount = Array.from(
-        node.querySelectorAll(
-          'button, a[role="button"], [role="button"]'
-        )
-      ).filter(item => {
-        if (item.id === HEADER_GEAR_ID || !visible(item)) return false;
-        const itemRect = item.getBoundingClientRect();
-        return itemRect.top >= -2 && itemRect.bottom <= 180;
-      }).length;
-
-      if (actionCount >= 2 && rect.width < bestWidth) {
-        best = node;
-        bestWidth = rect.width;
-      }
-    }
-
-    return best;
-  }
-
-  function directChildInside(row, element) {
-    let node = element;
-    while (
-      node?.parentElement &&
-      node.parentElement !== row
-    ) {
-      node = node.parentElement;
-    }
-    return node?.parentElement === row ? node : null;
-  }
-
-  function styleGearSvg(gear) {
-    const svg = gear.querySelector("svg");
-    if (!(svg instanceof SVGElement)) return;
-
-    const styles = {
-      display: "block",
-      width: "22px",
-      height: "22px",
-      "min-width": "22px",
-      "min-height": "22px",
-      margin: "0",
-      padding: "0",
-      color: "#fff",
-      stroke: "currentColor",
-      background: "transparent",
-      "background-image": "none",
-      "box-shadow": "none",
-      "pointer-events": "none"
-    };
-
-    for (const [name, value] of Object.entries(styles)) {
-      svg.style.setProperty(name, value, "important");
-    }
-  }
-
-  function styleDockedGear(gear) {
-    gear.style.cssText = [
-      "all:unset!important",
-      "position:relative!important",
-      "display:inline-flex!important",
-      "align-items:center!important",
-      "justify-content:center!important",
-      "flex:0 0 42px!important",
-      "width:42px!important",
-      "height:42px!important",
-      "min-width:42px!important",
-      "min-height:42px!important",
-      "max-width:42px!important",
-      "max-height:42px!important",
-      "padding:0!important",
-      "margin:0!important",
-      "border:1px solid rgba(255,255,255,.28)!important",
-      "border-radius:999px!important",
-      "background:#6d36d9!important",
-      "background-image:none!important",
-      "color:#fff!important",
-      "box-shadow:0 2px 8px rgba(0,0,0,.28)!important",
-      "box-sizing:border-box!important",
-      "overflow:hidden!important",
-      "appearance:none!important",
-      "-webkit-appearance:none!important",
-      "opacity:1!important",
-      "cursor:pointer!important",
-      "pointer-events:auto!important",
-      "touch-action:manipulation!important",
-      "user-select:none!important",
-      "-webkit-user-select:none!important",
-      "-webkit-tap-highlight-color:transparent!important",
-      "z-index:2!important",
-      "font:inherit!important",
-      "line-height:1!important",
-      "text-decoration:none!important",
-      "outline:none!important"
-    ].join(";");
-
-    gear.dataset.dsAndroidDocked = "1";
-    styleGearSvg(gear);
-  }
-
-  function styleFallbackGear(gear) {
-    gear.style.cssText = [
-      "all:unset!important",
-      "position:fixed!important",
-      "display:flex!important",
-      "align-items:center!important",
-      "justify-content:center!important",
-      "width:42px!important",
-      "height:42px!important",
-      "min-width:42px!important",
-      "min-height:42px!important",
-      "max-width:42px!important",
-      "max-height:42px!important",
-      "padding:0!important",
-      "margin:0!important",
-      "right:12px!important",
-      "bottom:92px!important",
-      "left:auto!important",
-      "top:auto!important",
-      "border:1px solid rgba(255,255,255,.28)!important",
-      "border-radius:999px!important",
-      "background:#6d36d9!important",
-      "background-image:none!important",
-      "color:#fff!important",
-      "box-shadow:0 3px 10px rgba(0,0,0,.32)!important",
-      "box-sizing:border-box!important",
-      "overflow:hidden!important",
-      "appearance:none!important",
-      "-webkit-appearance:none!important",
-      "pointer-events:auto!important",
-      "touch-action:manipulation!important",
-      "z-index:2147483646!important"
-    ].join(";");
-
-    delete gear.dataset.dsAndroidDocked;
-    styleGearSvg(gear);
-  }
-
-  function watchGearStyle(gear) {
-    if (lastGear === gear && gearStyleObserver) return;
-
-    gearStyleObserver?.disconnect?.();
-    gearStyleObserver = null;
-    lastGear = gear;
-
-    if (!(gear instanceof HTMLElement)) return;
-
-    gearStyleObserver = new MutationObserver(() => {
-      if (cleanupApplying) return;
-
-      const docked = gear.dataset.dsAndroidDocked === "1";
-      if (!docked) return;
-
-      const style = getComputedStyle(gear);
-      const inlinePosition = gear.style.getPropertyValue("position");
-      const contaminated =
-        inlinePosition !== "relative" ||
-        style.position !== "relative" ||
-        gear.style.getPropertyValue("left") ||
-        gear.style.getPropertyValue("right") ||
-        gear.style.getPropertyValue("top") ||
-        gear.style.getPropertyValue("bottom");
-
-      if (contaminated) scheduleCleanup();
-    });
-
-    gearStyleObserver.observe(gear, {
-      attributes: true,
-      attributeFilter: ["style", "class"]
-    });
-  }
-
-  function dockAndroidGear() {
-    const gear = document.getElementById(HEADER_GEAR_ID);
-    if (!(gear instanceof HTMLButtonElement)) return false;
-
-    watchGearStyle(gear);
-
-    const anchor = preferredHeaderAnchor();
-    const row = actionRowFor(anchor);
-
-    if (!anchor || !row) {
-      styleFallbackGear(gear);
-      return false;
-    }
-
-    const slot = directChildInside(row, anchor);
-    if (!slot) {
-      styleFallbackGear(gear);
-      return false;
-    }
-
-    if (gear.parentElement !== row || gear.nextSibling !== slot) {
-      row.insertBefore(gear, slot);
-    }
-
-    styleDockedGear(gear);
-    return true;
-  }
-
-  function isMessageEditTextarea(textarea) {
-    if (!(textarea instanceof HTMLTextAreaElement)) return false;
-    if (textarea.dataset.dsAndroidMessageEdit === "1") return true;
-    if (textarea.closest('div[id^="message-"]')) return true;
-
-    // Fallback for site builds where the message wrapper no longer exposes an
-    // id. A real edit form has nearby Save + Cancel controls; the normal chat
-    // composer does not.
-    let node = textarea.parentElement;
-    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
-      const labels = Array.from(node.querySelectorAll("button"))
-        .map(button => String(button.textContent || "").trim().toLowerCase());
-      if (labels.includes("save") && labels.includes("cancel")) return true;
-    }
-
-    return false;
-  }
-
-  function resizeMessageEditTextarea(textarea) {
-    if (!isMessageEditTextarea(textarea) || !textarea.isConnected) return false;
-
-    textarea.dataset.dsAndroidMessageEdit = "1";
-
-    const viewportHeight = Math.max(320,
-      window.visualViewport?.height || window.innerHeight || 640);
-    const maxHeight = Math.max(180, Math.min(440, viewportHeight * 0.46));
-    const minHeight = 96;
-
-    // Measure natural content height from a clean baseline. This is the key
-    // difference from the old growing-every-keystroke bug: never measure while
-    // the previous explicit height is still applied.
-    textarea.style.setProperty("height", "0px", "important");
-    const naturalHeight = Math.ceil(textarea.scrollHeight + 2);
-    const wanted = Math.max(minHeight, Math.min(maxHeight, naturalHeight));
-
-    textarea.style.setProperty("height", `${wanted}px`, "important");
-    textarea.style.setProperty("min-height", `${minHeight}px`, "important");
-    textarea.style.setProperty("max-height", `${maxHeight}px`, "important");
-    textarea.style.setProperty(
-      "overflow-y",
-      naturalHeight > maxHeight ? "auto" : "hidden",
-      "important"
-    );
-
-    return true;
-  }
-
-  function normalizeMessageEditTextareas() {
-    document.querySelectorAll("textarea").forEach(textarea => {
-      if (isMessageEditTextarea(textarea)) resizeMessageEditTextarea(textarea);
-    });
-  }
-
-  function clearOldSendShellMarkers() {
+    // Remove only leftovers created by older Android cleanup builds.
+    // Do not remove shared QoL classes: the extension may still use them.
     document
       .querySelectorAll('[data-ds-android-send-shell="1"]')
       .forEach(element => {
         element.removeAttribute("data-ds-android-send-shell");
-        element.style.removeProperty("background");
-        element.style.removeProperty("background-image");
-        element.style.removeProperty("border");
-        element.style.removeProperty("box-shadow");
+        element.removeAttribute("data-ds-android-send-wrapper-normalized");
+
+        for (const property of [
+          "background",
+          "background-image",
+          "border",
+          "box-shadow",
+          "overflow",
+          "width",
+          "min-width",
+          "max-width",
+          "flex",
+          "padding",
+          "margin"
+        ]) {
+          element.style.removeProperty(property);
+        }
+      });
+
+    document
+      .querySelectorAll('textarea[data-ds-android-message-edit="1"]')
+      .forEach(textarea => {
+        textarea.removeAttribute("data-ds-android-message-edit");
+
+        for (const property of [
+          "height",
+          "min-height",
+          "max-height",
+          "overflow-y",
+          "line-height",
+          "padding-top",
+          "padding-bottom",
+          "box-sizing"
+        ]) {
+          textarea.style.removeProperty(property);
+        }
       });
   }
 
-  function safeSendShells(send) {
-    const result = [];
-    let node = send.parentElement;
-
-    for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
-      if (!(node instanceof HTMLElement)) break;
-
-      // Never alter the composer/editor container itself.
-      if (
-        node.querySelector(
-          'textarea, input[type="text"], [contenteditable="true"], ' +
-          '[contenteditable="plaintext-only"]'
-        )
-      ) {
-        break;
-      }
-
-      const rect = node.getBoundingClientRect();
-      const buttonCount = node.querySelectorAll("button").length;
-
-      // Dedicated send wrappers on SpicyChat are small. Stop as soon as the
-      // ancestor starts looking like a general layout container.
-      if (
-        rect.width > 150 ||
-        rect.height > 130 ||
-        buttonCount > 1
-      ) {
-        break;
-      }
-
-      result.push(node);
-    }
-
-    return result;
-  }
-
-  function normalizeSendWrapper() {
-    const send = document.querySelector(
-      'button[aria-label="send-message"]'
-    );
-
-    clearOldSendShellMarkers();
-
-    if (!(send instanceof HTMLElement) || !visible(send)) {
-      return false;
-    }
-
-    send.classList.add("ds-mobile-chat-send-button");
-
-    const shells = safeSendShells(send);
-    if (!shells.length) return false;
-
-    for (const shell of shells) {
-      shell.dataset.dsAndroidSendShell = "1";
-      shell.style.setProperty(
-        "background",
-        "transparent",
-        "important"
-      );
-      shell.style.setProperty(
-        "background-image",
-        "none",
-        "important"
-      );
-      shell.style.setProperty("border", "0", "important");
-      shell.style.setProperty("box-shadow", "none", "important");
-      shell.style.setProperty("overflow", "visible", "important");
-    }
-
-    const immediate = shells[0];
-    immediate.classList.add("ds-mobile-chat-send-wrapper");
-    immediate.dataset.dsAndroidSendWrapperNormalized = "1";
-    immediate.style.setProperty("width", "fit-content", "important");
-    immediate.style.setProperty("min-width", "0", "important");
-    immediate.style.setProperty("max-width", "fit-content", "important");
-    immediate.style.setProperty("flex", "0 0 auto", "important");
-    immediate.style.setProperty("padding", "0", "important");
-    immediate.style.setProperty("margin", "0", "important");
-
-    return true;
-  }
-
-  function runCleanup() {
-    cleanupQueued = false;
-    cleanupApplying = true;
-
-    try {
-      ensureCleanupStyle();
-
-      document.getElementById(LEGACY_COPY_ID)?.remove();
-
-      dockAndroidGear();
-      normalizeSendWrapper();
-      normalizeMessageEditTextareas();
-    } finally {
-      cleanupApplying = false;
-    }
-  }
-
-  function scheduleCleanup() {
-    if (cleanupQueued) return;
-    cleanupQueued = true;
-    requestAnimationFrame(runCleanup);
-  }
-
-  function scheduleSettledCleanup() {
-    scheduleCleanup();
-    setTimeout(scheduleCleanup, 80);
-    setTimeout(scheduleCleanup, 240);
-  }
-
-  const cleanupObserver = new MutationObserver(records => {
-    if (cleanupApplying) return;
-
-    const changed = records.some(
-      record =>
-        record.addedNodes?.length ||
-        record.removedNodes?.length
-    );
-
-    if (changed) scheduleCleanup();
-  });
-
-  cleanupObserver.observe(document.documentElement, {
-    childList: true,
-    subtree: true
-  });
-
-  document.addEventListener("focusin", event => {
-    const textarea = event.target;
-    if (!isMessageEditTextarea(textarea)) return;
-    requestAnimationFrame(() => resizeMessageEditTextarea(textarea));
-    setTimeout(() => resizeMessageEditTextarea(textarea), 80);
-  }, true);
-
-  document.addEventListener("input", event => {
-    const textarea = event.target;
-    if (!isMessageEditTextarea(textarea)) return;
-    requestAnimationFrame(() => resizeMessageEditTextarea(textarea));
-  }, true);
-
-  window.addEventListener("resize", scheduleSettledCleanup, {
-    passive: true
-  });
-
-  window.visualViewport?.addEventListener(
-    "resize",
-    scheduleSettledCleanup,
-    { passive: true }
-  );
-
-  window.addEventListener(
-    "popstate",
-    () => setTimeout(scheduleCleanup, 0),
-    { passive: true }
-  );
-
-  scheduleSettledCleanup();
+  clearLegacyAndroidLayoutOverrides();
 
   // ---------------------------------------------------------------------------
   // Native Android message long-press actions
@@ -1196,6 +628,6 @@
   );
 
   console.log(
-    "[DS Android] Message long-press + visual cleanup ready"
+    "[DS Android] Message long-press ready (layout ownership cleanup)"
   );
 })();

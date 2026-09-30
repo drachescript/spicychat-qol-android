@@ -67,7 +67,7 @@
 </div></div>
 <div class="tab-group" data-tab-group="data"><span class="tab-group-label">Data &amp; advanced</span><div class="tab-group-buttons">
 <button class="tab-button" data-tab="data" type="button">Data &amp; Backup</button>
-<button class="tab-button" data-tab="advanced" type="button">Advanced</button>
+<button class="tab-button" data-tab="advanced" type="button">Advanced / Compatibility</button>
 </div></div>
 <div class="tab-group" data-tab-group="about"><span class="tab-group-label">Project</span><div class="tab-group-buttons">
 <button class="tab-button" data-tab="changelog" type="button">Changelog <span class="tab-update-badge" hidden="" id="changelogUpdateBadge"></span></button>
@@ -408,7 +408,7 @@ Testing"></textarea></label>
 <div class="tab-page" data-page="saved"><p class="page-intro">Review Bot Status Center history/checks first, then Saved Bots Hub, local organization, Favorite, Followed, Later, and saved-copy data.</p>
 <section class="card" id="botAvailabilityCard">
 <h2>Bot Status Center</h2>
-<p class="hint">Combines the Deleted / Unavailable Bot Detector with Character Update Watch and a local Duplicate / Reupload Finder. Network checks only run when you start them; duplicate matching itself uses locally known bot data.</p>
+<p class="hint">Checks tracked bots by ID and refreshes their saved details when live data is available. It reuses a signed-in SpicyChat page when possible and only opens one background Home helper if needed; it never opens every bot profile just to scan them. Duplicate matching uses locally known bot data. Large scans keep new results in memory and save them when you press Stop or when the scan finishes, so leave Settings open while a scan is running.</p>
 <fieldset class="bot-status-opened-tracking">
 <legend>Opened history tracking</legend>
 <label class="row"><input id="trackOpenedChats" type="checkbox"/><span>Track chats I open in Bot Status Center</span></label>
@@ -448,6 +448,10 @@ Testing"></textarea></label>
 <option value="all">All tracked bots</option>
 <option value="favorite">Favorites only</option>
 <option value="later">Later only</option>
+<option value="blocked">Blocked bots only</option>
+<option value="notInterested">Not Interested only</option>
+<option value="recent">Recently Seen only</option>
+<option value="creatorWatch">Followed creator detections only</option>
 <option value="organizer">Bot Organizer only</option>
 <option value="opened">Opened history only</option>
 <option value="archive">Saved bot copies only</option>
@@ -468,15 +472,76 @@ Testing"></textarea></label>
 <input id="botAvailabilitySearch" placeholder="Search bot status, changes or duplicates" type="search"/>
 <span class="manager-count" id="botAvailabilitySummary">0 tracked</span>
 </div>
+<div class="bot-availability-controls">
+<label>Scan speed
+<select id="botStatusScanSpeed" aria-label="Bot Status scan speed">
+<option value="safe">Safe · ~600 ms after response</option>
+<option value="normal">Normal · ~450 ms after response</option>
+<option value="fast">Fast · ~350 ms after response</option>
+</select>
+</label>
+<label>Refresh stale after
+<select id="botStatusStaleDays" aria-label="Refresh Bot Status entries stale after">
+<option value="1">1 day</option>
+<option value="7">7 days</option>
+<option value="14">14 days</option>
+<option value="30">30 days</option>
+</select>
+</label>
+<span class="manager-count" id="botAvailabilityUnavailableSummary"></span>
+</div>
 <div class="button-row">
 <button id="scanBotAvailability" type="button">Scan / refresh tracked bots</button>
+<button id="scanUncheckedBotAvailability" type="button">Check unchecked bots</button>
+<button id="scanStaleBotAvailability" type="button">Refresh stale bots</button>
 <button disabled="" id="stopBotAvailabilityScan" type="button">Stop scan</button>
 <button id="refreshBotDuplicateMatches" type="button">Refresh duplicate matches</button>
 <button id="acceptAllBotUpdates" type="button">Accept all detected updates</button>
+<button id="cleanUnavailableBots" type="button">Archive + clean confirmed unavailable bots</button>
 <button id="clearBotAvailabilityResults" type="button">Clear status history</button>
 <button id="clearBotArchive" type="button">Clear saved bot copies</button>
+<button id="exportBotStatusArchiveJsonGz" type="button">Export saved copies for Archive (.json.gz)</button>
 <span class="count" id="botAvailabilityScanStatus"></span>
+<span class="count" id="botStatusArchiveExportStatus"></span>
 </div>
+<div class="button-row" id="botStatusArchiveUploadActions" hidden>
+<button id="sendBotStatusArchiveChanged" type="button">Send saved copies to Archive</button>
+<button id="sendBotStatusArchiveAll" type="button" hidden>Send all saved copies</button>
+<span class="count" id="botStatusArchiveUploadStatus"></span>
+</div>
+<fieldset id="botStatusArchiveContributionSettings">
+<legend>Public Archive contribution</legend>
+<label class="row"><input id="enableBotStatusArchiveContribution" type="checkbox"/><span>Allow my saved Bot Status copies to be submitted anonymously to the public SpicyChat Archive for review</span></label>
+<p class="hint">Only saved bot snapshots are submitted. QoL does not include chats, personas, Favorites/Later membership, settings, account details, cookies, or SpicyChat login/session data. A random extension-install identifier is hashed locally and sent only for basic anti-spam/rate limiting.</p>
+<div class="button-row" id="botStatusArchiveContributionActions" hidden>
+<button id="submitBotStatusArchiveChanged" type="button">Submit saved copies for review</button>
+<button id="submitBotStatusArchiveAll" type="button" hidden>Submit all saved copies for review</button>
+<span class="count" id="botStatusArchiveContributionStatus"></span>
+</div>
+<p class="hint" id="botStatusArchiveContributionSummary">Contribution is off.</p>
+</fieldset>
+<fieldset id="botStatusArchiveUploadSettings">
+<legend>Archive owner upload (private)</legend>
+<label>Endpoint
+<input id="botStatusArchiveEndpoint" type="url" spellcheck="false" value="https://spicychat-archive-import.dragongraf.workers.dev/api/imports/bot-status"/>
+</label>
+<label>Import token
+<input id="botStatusArchiveToken" type="password" autocomplete="off" spellcheck="false" placeholder="SPICYCHAT_ARCHIVE_IMPORT_TOKEN"/>
+</label>
+<div class="button-row"><button id="testBotStatusArchiveEndpoint" type="button">Test endpoint</button><span class="count" id="botStatusArchiveConfigStatus"></span></div>
+<p class="hint" id="botStatusArchiveUploadSummary">Configure the endpoint and private import token to enable archive upload.</p>
+<p class="hint">The import token is stored only in extension local storage. It is deliberately excluded from QoL settings backup/export/import. Uploading never deletes your local Bot Status saved copies.</p>
+</fieldset>
+<fieldset id="botAvailabilityResultsCard">
+<legend>Tracked Bot Status Results</legend>
+<p class="hint">Live availability results for all tracked bots. Available bots belong here; only confirmed deleted/unavailable recovery copies appear in the separate section below.</p>
+<div class="bot-manager-list" id="botAvailabilityManager"></div>
+<div class="bot-manager-pager">
+<button id="botAvailabilityShowMore" type="button">Show 20 more</button>
+<button id="botAvailabilityShowLess" type="button">Show first 20</button>
+<button id="botAvailabilityCollapse" type="button">Show 100</button>
+</div>
+</fieldset>
 <fieldset>
 <legend>Local Bot Archive</legend>
 <label class="row"><input id="botArchiveRememberSeenPublic" type="checkbox"/><span>Remember the last public bot data QoL sees (including Greeting when available)</span></label>
@@ -491,16 +556,39 @@ Testing"></textarea></label>
 </select>
 </label>
 <p class="hint"><strong>Bot Profile Snapshots:</strong> when enabled, opening a chatbot profile stores the bot ID, name/title, creator, image, tags, Greeting, description and any definition/scenario/example fields, stats or other metadata that SpicyChat actually exposes to QoL. Meaningful profile changes are kept in profile history; stats-only observations stay separate where possible. QoL never unlocks or guesses private/hidden definition fields.</p>
-<p class="hint">Successful Bot Status Center checks still update the local copy. The optional chat-open refresh uses a normal SpicyChat profile request only when the saved copy is older than this interval.</p>
+<p class="hint">Successful Bot Status Center checks still update the local copy. The optional chat-open refresh only updates an older saved copy when live SpicyChat character data is still readable; opening an old chat by itself never overwrites a recovery copy for a deleted/unavailable bot.</p>
 <p class="hint"><strong>Public archive JSON:</strong> saved copies can be exported using only fields QoL actually captured. QoL never unlocks private/hidden definition fields.</p>
 </fieldset>
-<div class="bot-manager-list" id="botAvailabilityManager"></div>
-<div class="bot-manager-pager">
-<button id="botAvailabilityShowMore" type="button">Show 20 more</button>
-<button id="botAvailabilityShowLess" type="button">Show first 20</button>
-<button id="botAvailabilityCollapse" type="button">Show 100</button>
+<fieldset id="savedBotInfoCard">
+<legend>Saved Bot Copies / Recovery</legend>
+<p class="hint">Browse bot data QoL has saved locally. This list can include bots that are still Available; confirmed deleted/unavailable recovery copies are shown separately below. Currently blocked bots stay out of recovery views and are not added by Bot Status scans; any older recovery data is kept locally rather than deleted. Only fields SpicyChat actually exposed to QoL are stored.</p>
+<div class="bot-manager-toolbar">
+<input id="savedBotInfoSearch" placeholder="Search saved bot copies, creators or IDs" type="search"/>
+<span class="manager-count" id="savedBotInfoSummary">0 saved copies</span>
 </div>
+<div class="bot-manager-list" id="savedBotInfoManager"></div>
+<div class="bot-manager-pager">
+<button id="savedBotInfoShowMore" type="button">Show 20 more</button>
+<button id="savedBotInfoShowLess" type="button">Show first 20</button>
+<button id="savedBotInfoCollapse" type="button">Show 100</button>
+</div>
+</fieldset>
+<fieldset id="deletedSavedBotsCard">
+<legend>Deleted / Unavailable Saved Bots</legend>
+<p class="hint">Confirmed deleted/unavailable bots that still have a local recovery copy. Currently blocked bots stay hidden here. Active-list cleanup never removes recovery copies. Open an old chat when one is still available, or use the saved fields to rebuild the bot later.</p>
+<div class="bot-manager-toolbar">
+<input id="deletedSavedBotSearch" placeholder="Search deleted saved bots, creators or IDs" type="search"/>
+<span class="manager-count" id="deletedSavedBotSummary">0 recoverable deleted bots</span>
+</div>
+<div class="bot-manager-list" id="deletedSavedBotManager"></div>
+<div class="bot-manager-pager">
+<button id="deletedSavedBotShowMore" type="button">Show 20 more</button>
+<button id="deletedSavedBotShowLess" type="button">Show first 20</button>
+<button id="deletedSavedBotCollapse" type="button">Show 100</button>
+</div>
+</fieldset>
 <p class="hint"><strong>Saved bot copies:</strong> successful profile checks can preserve the accessible name, description, greeting, personality/definition, scenario, example dialogues, tags, creator, visible stats and avatar URL in extension storage. A saved copy stays available here even if the live bot later disappears. Clearing status history does not clear these copies.</p>
+<p class="hint"><strong>Archive export:</strong> creates a versioned compressed JSON backup for the SpicyChat Archive importer. It exports only public / Bot Status snapshot data, skips manual creator/editor backups and private local notes, makes no live API calls, and treats unavailable/private status as historical observations that still need current verification.</p>
 <p class="hint"><strong>Update Watch:</strong> the first successful profile check becomes that bot's baseline. Later successful checks compare stable profile fields such as name, description, greeting, personality, scenario, tags, visibility, creator and avatar when SpicyChat exposes them. Missing fields are ignored instead of being treated as edits; use Accept update after reviewing a real change.</p>
 <p class="hint"><strong>Duplicate / Reupload Finder:</strong> compares local names, avatars and captured profile text and labels matches as Exact, Likely or Possible. These are hints only and can have false positives; QoL never hides, blocks or deletes a bot because of a match.</p>
 <p class="hint">Availability checks only mark clear results. Deleted/404 pages show as unavailable, private/restricted pages stay restricted, and timeouts or rate limits stay Unknown instead of being guessed as deleted.</p>
@@ -904,6 +992,8 @@ Meta | &lt; | &gt;" spellcheck="false"></textarea>
 <label class="row"><input id="keepChatPositionWhileTyping" type="checkbox"/><span>Keep my current chat position while typing</span></label>
 <label class="row"><input id="protectDraftDuringMessageRemoval" type="checkbox"/><span>Keep typed draft text when using Remove Messages</span></label>
 <label class="row"><input id="failedMessageHelper" type="checkbox"/><span>Save sent drafts for Resubmit errors</span></label>
+<label class="row"><input id="autoRetryFailedMessageSends" type="checkbox"/><span>Automatically retry failed message sends</span></label>
+<p class="hint">Auto retry watches SpicyChat's native send-error banner, retries with backoff, and stops if the message succeeds, you edit the draft, leave the chat, or five retries fail.</p>
 <p class="hint">The send button may still wait for SpicyChat to finish, but this lets you keep drafting your next message.</p>
 </section><section class="card" id="savedSnippetsCard">
 <h2>Saved Text / Snippets</h2>
@@ -1063,7 +1153,11 @@ Testing" spellcheck="false"></textarea></label>
 <p class="hint">Saved personas: <span id="personaCount">0 stored</span>. The quick-switch uses saved personas from /personas or the Change Persona picker.</p>
 </section></div>
 
-<div class="tab-page" data-page="advanced"><p class="page-intro">Performance, per-character overrides, and other settings intended for troubleshooting or specialized setups.</p><section class="card" id="characterQolProfilesCard">
+<div class="tab-page" data-page="advanced"><p class="page-intro">Compatibility fallbacks, performance controls, per-character overrides, and other settings intended for troubleshooting or specialized setups.</p><section class="card" id="chatExportCompatibilityCard">
+<h2>Chat export — Advanced / Compatibility</h2>
+<p class="hint">Normal Copy / Export always fetches the full active chat through the fast API first. There is no separate history method to choose for normal exporting.</p>
+<p class="hint">If the API fetch fails or you are specifically testing compatibility, open <strong>Advanced / Compatibility</strong> inside the Chat export window and use <strong>Load full chat through page (very slow)</strong>. That fallback uses SpicyChat's own Load Previous Messages flow and mounts old messages into the live page, so very large chats can become slow or memory-heavy until the chat is reloaded.</p>
+</section><section class="card" id="characterQolProfilesCard">
 <h2>Per-character QoL profiles</h2>
 <label class="row"><input id="enableCharacterQolProfiles" type="checkbox"/><span>Enable per-character QoL profiles</span></label>
 <p class="hint">Adds a Character profile button to the QoL panel on individual chats. A character can override RP Format Repair, RP formatting style/detection, and Auto voice on chat open while every unchanged option continues using your normal global settings.</p>
@@ -1223,6 +1317,7 @@ Testing" spellcheck="false"></textarea></label>
 <h2>Panel items</h2>
 <p class="hint">These control what appears inside the mini panel. Auto voice and Auto * can be toggled directly from the panel; other tools still use their normal feature settings.</p>
 <label class="row"><input id="quickPanelShowStatus" type="checkbox"/><span>Show status line</span></label>
+<label class="row"><input id="quickPanelShowLoadedMessageCount" type="checkbox"/><span>Show messages currently loaded in chats</span></label>
 <label class="row"><input id="quickPanelStatusShowOpened" type="checkbox"/><span>Show opened chat count in the mini panel</span></label>
 <label class="row"><input id="quickPanelStatusShowBlocked" type="checkbox"/><span>Show blocked bot count in the mini panel</span></label>
 <label class="row"><input id="quickPanelShowFeatureSummary" type="checkbox"/><span>Show a short summary of enabled QoL features for the current page</span></label>
@@ -1295,6 +1390,7 @@ Testing" spellcheck="false"></textarea></label>
 </div>
 <div class="mini-panel-preview-body" id="miniPanelPreviewBody">
 <div class="mini-panel-preview-status" id="miniPanelPreviewStatus">350 opened stored. 3 personas saved.</div>
+<div class="mini-panel-preview-status" id="miniPanelPreviewMessageCount">Messages shown: 50</div>
 <button id="miniPanelPreviewOptions" type="button">Options</button>
 <button id="miniPanelPreviewFill" type="button">Fill now</button>
 <div class="mini-panel-preview-group" id="miniPanelPreviewSmartFilters"><span>Pinned filters</span><div class="mini-panel-preview-row"><button type="button">Fresh finds</button><button type="button">Later queue</button></div></div>
@@ -1345,6 +1441,19 @@ Testing" spellcheck="false"></textarea></label>
 </section><section class="card">
 <h2>Sidebar cleanup</h2>
 <p class="hint">Sign In is always kept visible. Sign Out only hides if you turn on that exact option.</p>
+<div class="sub-card">
+<strong>QoL sidebar button</strong>
+<label class="row"><input id="showQolSidebarButton" type="checkbox"/><span>Show SpicyChat QoL in the sidebar</span></label>
+<label>Placement
+<select id="qolSidebarButtonPlacement">
+<option value="after-sai">Below S.AI Toolkit (default)</option>
+<option value="after-recommendations">Under Recommendations</option>
+<option value="after-favorites">Under Favorites</option>
+<option value="before-help">Above Help</option>
+</select>
+</label>
+<p class="hint">Opt-in only. Clicking it opens the QoL settings. If S.AI Toolkit is not installed, the default placement falls back near Help.</p>
+</div>
 <h3>Top</h3>
 <label class="row"><input id="hideSidebarLogo" type="checkbox"/><span>Hide logo</span></label>
 <label class="row"><input id="hideSidebarHome" type="checkbox"/><span>Hide Home</span></label>
@@ -1420,7 +1529,7 @@ Testing" spellcheck="false"></textarea></label>
 </section><section class="card" id="chatBubbleCustomizationCard">
 <h2>Chat bubble customization</h2>
 <label class="row"><input id="enableChatBubbleCustomization" type="checkbox"/><span>Enable chat bubble customization</span></label>
-<p class="hint">Local appearance only. Customize AI and user bubbles separately without changing message text or anything saved by SpicyChat.</p>
+<p class="hint">Local appearance only. Customize AI and user bubbles separately without changing message text or anything saved by SpicyChat. Global chat font size and line spacing are under Accessibility &amp; text size; custom chat images are under Custom chat backgrounds.</p>
 <label class="row"><input id="persistSpicyChatUserAppearance" type="checkbox"/><span>Keep my SpicyChat “My messages” appearance locked across site updates</span></label>
 <p class="hint">When enabled, QoL automatically remembers the native My messages background/normal-text colors whenever that SpicyChat appearance panel is open and reapplies them locally if a site update resets the bubble. After enabling it, open that native appearance panel once so QoL can capture your current choices. Nothing is overridden before a native appearance has been captured, and message text is never changed.</p>
 <div class="button-row">
@@ -1430,7 +1539,7 @@ Testing" spellcheck="false"></textarea></label>
 <button data-chat-bubble-preset="contrast-light" type="button">High Contrast Light</button>
 <button data-chat-bubble-preset="pastel" type="button">Pastel</button>
 </div>
-<p class="hint">Normal text, narrative/actions and dialogue can use separate colors. Header names, message buttons and regenerate/rate/listen controls always keep their native colors.</p>
+<p class="hint">Normal text, narrative/actions and dialogue can use separate colors and fonts. Header names, message buttons and regenerate/rate/listen controls always keep their native styling.</p>
 <div class="sub-card">
 <div class="settings-subhead"><h3>AI messages</h3><button data-chat-bubble-reset-group="ai" type="button">Reset AI</button></div>
 <label>Background color <input id="chatBubbleAiBackground" type="color" value="#27282d"/></label>
@@ -1441,6 +1550,14 @@ Testing" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label>Normal text color <input id="chatBubbleAiText" type="color" value="#f2f2f2"/></label>
+<label>Normal text font<select id="chatBubbleAiFont"><option value="inherit">SpicyChat default</option>
+<option value="system">System sans</option>
+<option value="roboto">Roboto</option>
+<option value="georgia">Georgia</option>
+<option value="times">Times New Roman</option>
+<option value="trebuchet">Trebuchet MS</option>
+<option value="verdana">Verdana</option>
+<option value="monospace">Monospace</option></select></label>
 <p class="hint" id="chatBubbleAiContrast"></p>
 <label>Narrative / action text
             <select id="chatBubbleAiActionMode">
@@ -1450,6 +1567,14 @@ Testing" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label>Narrative / action color <input id="chatBubbleAiActionText" type="color" value="#79c8f5"/></label>
+<label>Narrative / action font<select id="chatBubbleAiActionFont"><option value="inherit">SpicyChat default</option>
+<option value="system">System sans</option>
+<option value="roboto">Roboto</option>
+<option value="georgia">Georgia</option>
+<option value="times">Times New Roman</option>
+<option value="trebuchet">Trebuchet MS</option>
+<option value="verdana">Verdana</option>
+<option value="monospace">Monospace</option></select></label>
 <label>Dialogue / quoted text
             <select id="chatBubbleAiDialogueMode">
 <option value="base">Same as normal text</option>
@@ -1458,6 +1583,14 @@ Testing" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label>Dialogue color <input id="chatBubbleAiDialogueText" type="color" value="#f2f2f2"/></label>
+<label>Dialogue font<select id="chatBubbleAiDialogueFont"><option value="inherit">SpicyChat default</option>
+<option value="system">System sans</option>
+<option value="roboto">Roboto</option>
+<option value="georgia">Georgia</option>
+<option value="times">Times New Roman</option>
+<option value="trebuchet">Trebuchet MS</option>
+<option value="verdana">Verdana</option>
+<option value="monospace">Monospace</option></select></label>
 <label>Border color <input id="chatBubbleAiBorder" type="color" value="#555861"/></label>
 <label>Border width (px) <input id="chatBubbleAiBorderWidth" max="12" min="0" step="0.5" type="number"/></label>
 <label>Border style
@@ -1508,6 +1641,14 @@ Testing" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label>Normal text color <input id="chatBubbleUserText" type="color" value="#f5f5f5"/></label>
+<label>Normal text font<select id="chatBubbleUserFont"><option value="inherit">SpicyChat default</option>
+<option value="system">System sans</option>
+<option value="roboto">Roboto</option>
+<option value="georgia">Georgia</option>
+<option value="times">Times New Roman</option>
+<option value="trebuchet">Trebuchet MS</option>
+<option value="verdana">Verdana</option>
+<option value="monospace">Monospace</option></select></label>
 <p class="hint" id="chatBubbleUserContrast"></p>
 <label>Narrative / action text
             <select id="chatBubbleUserActionMode">
@@ -1517,6 +1658,14 @@ Testing" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label>Narrative / action color <input id="chatBubbleUserActionText" type="color" value="#79c8f5"/></label>
+<label>Narrative / action font<select id="chatBubbleUserActionFont"><option value="inherit">SpicyChat default</option>
+<option value="system">System sans</option>
+<option value="roboto">Roboto</option>
+<option value="georgia">Georgia</option>
+<option value="times">Times New Roman</option>
+<option value="trebuchet">Trebuchet MS</option>
+<option value="verdana">Verdana</option>
+<option value="monospace">Monospace</option></select></label>
 <label>Dialogue / quoted text
             <select id="chatBubbleUserDialogueMode">
 <option value="base">Same as normal text</option>
@@ -1525,6 +1674,14 @@ Testing" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label>Dialogue color <input id="chatBubbleUserDialogueText" type="color" value="#f5f5f5"/></label>
+<label>Dialogue font<select id="chatBubbleUserDialogueFont"><option value="inherit">SpicyChat default</option>
+<option value="system">System sans</option>
+<option value="roboto">Roboto</option>
+<option value="georgia">Georgia</option>
+<option value="times">Times New Roman</option>
+<option value="trebuchet">Trebuchet MS</option>
+<option value="verdana">Verdana</option>
+<option value="monospace">Monospace</option></select></label>
 <label>Border color <input id="chatBubbleUserBorder" type="color" value="#52718a"/></label>
 <label>Border width (px) <input id="chatBubbleUserBorderWidth" max="12" min="0" step="0.5" type="number"/></label>
 <label>Border style
@@ -1760,6 +1917,11 @@ cash =&gt; Bingo Coins
 
 <section class="card">
 <h2>Message options</h2>
+<div class="sub-card">
+<h3>Message layout</h3>
+<label class="row"><input id="stackChatMessages" type="checkbox"/><span>Stack user and AI messages in one chat column</span></label>
+<p class="hint">Aligns user and AI message boxes in the same vertical chat column without rebuilding SpicyChat's message DOM. Turn it off to keep SpicyChat's normal left/right message layout.</p>
+</div>
 <p class="hint">Adds small quick-action icons to chat messages. Every individual action switch is authoritative. The first checkbox is only a group toggle for Copy + Edit + Report, so turning Report off below always removes the Report icon. Copy is handled directly when the rendered message can be read safely; Edit, Report and Remove Image silently trigger SpicyChat's own native actions without showing the intermediate three-dot popup. The native report form/editor still appears when needed.</p>
 <label class="row"><input id="showMessageQuickActions" type="checkbox"/><span>Copy, Edit &amp; Report quick actions (toggle all three)</span></label>
 <label class="row"><input id="messageQuickActionCopy" type="checkbox"/><span>Show Copy icon</span></label>
@@ -1773,15 +1935,15 @@ cash =&gt; Bingo Coins
 <section class="card">
 <h2>Chat export</h2>
 <label class="row"><input id="showChatExportButton" type="checkbox"/><span>Show Copy / Export chat buttons on chat pages</span></label>
-<label class="row"><input id="chatExportLoadPreviousMessages" type="checkbox"/><span>Load older messages before exporting</span></label>
-<label class="row"><input id="chatExportIncludeBotInfo" type="checkbox"/><span>Include visible bot info</span></label>
+<p class="hint">Opening Copy / Export automatically fetches the full active chat through the fast API and keeps that history out of the live page. When the chat is ready, the export window uses the complete in-memory history; a retry button only appears if the automatic fetch did not complete.</p>
+<label class="row"><input id="chatExportIncludeBotInfo" type="checkbox"/><span>Include available bot info</span></label>
 <label class="row"><input id="chatExportIncludeOocDirectives" type="checkbox"/><span>Include OOC and directive notes</span></label>
 <label class="row"><input id="chatExportIncludeGenerationDetails" type="checkbox"/><span>Include captured timestamps/model/generation details when available</span></label>
 <label class="row"><input id="chatExportNumberMessages" type="checkbox"/><span>Number exported messages</span></label>
 <label class="row"><input id="chatExportIncludeAvatars" type="checkbox"/><span>Include avatar links in HTML/JSON exports</span></label>
 <label>Default format<select id="chatExportDefaultFormat"><option value="text">Plain text</option><option value="markdown">Markdown</option><option value="html">HTML archive</option><option value="json">JSON backup</option></select></label>
-<label>Default HTML layout<select id="chatExportHtmlLayout"><option value="bubbles">Chat bubbles</option><option value="transcript">Transcript</option></select></label>
-<p class="hint">Copy chat puts the loaded conversation straight on the clipboard. Export chat opens the format picker for TXT, Markdown, HTML or JSON. If older messages are still available, the export window tells you and can load them before you save.</p>
+<label>Default HTML layout<select id="chatExportHtmlLayout"><option value="bubbles">Match current chat appearance</option><option value="transcript">Clean transcript</option></select></label>
+<p class="hint">For Match current chat appearance, API history supplies the message data while the currently loaded chat supplies the appearance template (bubble colors, text, borders, radius, font, and backtick styling). Clean transcript uses a simple portable layout. The very slow page-loading fallback is kept under Advanced / Compatibility for troubleshooting only.</p>
 </section>
 
 
@@ -2020,10 +2182,11 @@ Fantasy" spellcheck="false"></textarea></label>
 <section class="card">
 <h2>Card filters</h2>
 <label class="row"><input id="hideHomeForYouCards" type="checkbox"/><span>Hide cards tagged "For You" on the Home page only</span></label>
-<label class="row"><input id="expandLongCardDescriptions" type="checkbox"/><span>Expand longer card descriptions</span></label>
+<label class="row"><input id="expandLongCardDescriptions" type="checkbox"/><span>Show full bot descriptions on cards (no hover)</span></label>
 <label class="row"><input id="showCardGreetingTokenInfo" type="checkbox"/><span>Show token counts on bot cards</span></label>
 <label class="row"><input id="showExactMessageCounts" type="checkbox"/><span>Show exact message counts on bot cards</span></label>
 <label class="row"><input id="showBotCreationDates" type="checkbox"/><span>Show bot creation dates on bot cards and profiles</span></label>
+<label class="row"><input id="expandBotNamesOnHover" type="checkbox"/><span>Expand cut-off bot names horizontally on hover / tap</span></label>
 <div class="sub-card">
 <strong>Token counts to show</strong>
 <label class="row"><input id="cardTokenShowGreeting" type="checkbox"/><span>Greeting</span></label>
@@ -2101,9 +2264,17 @@ step sister" spellcheck="false"></textarea></label>
 </select>
 </label>
 <label class="manager-sort-label">
-            Rating
+            Dislike
             <select id="blockedBotDislikeFilter">
-<option value="all">all blocked bots</option>
+<option value="all">all</option>
+<option value="remaining">not handled yet</option>
+<option value="handled">already handled</option>
+</select>
+</label>
+<label class="manager-sort-label">
+            Less Like
+            <select id="blockedBotLessLikeFilter">
+<option value="all">all</option>
 <option value="remaining">not handled yet</option>
 <option value="handled">already handled</option>
 </select>
@@ -2111,15 +2282,27 @@ step sister" spellcheck="false"></textarea></label>
 <span class="manager-count" id="blockedBotManagerSummary">0 saved</span>
 </div>
 <div class="button-row">
+<strong>Dislike:</strong>
 <button id="bulkDislikeBlockedBots" type="button">Dislike remaining blocked bots</button>
 <button hidden="" id="resumeBlockedDislikeRun" type="button">Resume unfinished</button>
 <button hidden="" id="retryFailedBlockedDislikes" type="button">Retry last failed</button>
-<button id="clearBlockedDislikeHistory" type="button">Clear handled history</button>
+<button id="clearBlockedDislikeHistory" type="button">Clear Dislike history</button>
+<button id="resetAndRedoBlockedDislikes" type="button">Reset Dislike history + redo all</button>
 <span class="manager-count" id="blockedBotDislikeStatus"></span>
 </div>
+<div class="button-row">
+<strong>Less Like:</strong>
+<button id="bulkLessLikeBlockedBots" type="button">Stop recommending remaining blocked bots</button>
+<button hidden="" id="resumeBlockedLessLikeRun" type="button">Resume unfinished</button>
+<button hidden="" id="retryFailedBlockedLessLikes" type="button">Retry last failed</button>
+<button id="clearBlockedLessLikeHistory" type="button">Clear Less Like history</button>
+<button id="resetAndRedoBlockedLessLikes" type="button">Reset Less Like history + redo all</button>
+</div>
+<div class="manager-count less-like-status-row" id="blockedBotLessLikeStatus"></div>
+<div class="button-row"><span class="manager-count" id="blockedBotNameOnlyStatus"></span></div>
 <label>Delay between bots
 <input id="blockedBulkDislikeDelayMs" max="10000" min="250" step="250" type="number" value="750"/>
-<span class="hint">Milliseconds. 750 ms is the default; this is only the short gap between ratings in a bulk run.</span>
+<span class="hint">Milliseconds. 750 ms is the default. Dislike uses this as its fixed delay; Stop recommending uses it as the safe starting interval, then adapts between 350–5000 ms based on successful responses and throttle/error signals.</span>
 </label>
 <div class="bot-manager-bulkbar" data-manager-kind="blocked">
 <button id="blockedBotSelectShown" type="button">Select shown</button>
@@ -2129,13 +2312,14 @@ step sister" spellcheck="false"></textarea></label>
 <select aria-label="Blocked bot bulk action" id="blockedBotBulkAction">
 <option value="">Bulk action…</option>
 <option value="dislike-selected">Dislike selected</option>
+<option value="less-like-selected">Stop recommending selected</option>
 <option value="copy-links">Copy profile links</option>
 <option value="unblock">Unblock selected</option>
 </select>
 <button id="blockedBotApplyBulk" type="button">Apply</button>
 </div>
 <p class="hint ds-bulk-selection-hint">Selections stay active after Apply so you can run another bulk action on the same bots. Use Clear selection when you are finished.</p>
-<p class="hint">Desktop browser only. QoL processes one blocked bot at a time through SpicyChat's normal rating dialog. Successfully disliked bots, bots that were already disliked, creator-blocked bots, private/deleted/404 bots, and other terminal unavailable ratings are remembered locally and skipped on later runs. Failed/time-out attempts stay eligible for retry. A bulk run now pauses after several helper failures in a row instead of continuing through the rest of the queue. If Settings closes mid-run, the unfinished queue can be resumed later. Name-only blocks are skipped because they do not have a bot ID/chat to rate.</p>
+<p class="hint">Desktop browser only. Dislike and Stop recommending are separate workflows with separate handled history. Dislike keeps the existing QoL/SpicyChat rating worker. Stop recommending opens or reuses one inactive SpicyChat Home helper for the entire batch so auth and SpicyChat's recommendation client stay initialized, then sends feedback directly by bot ID without navigating between bots or searching/clicking cards. The helper closes when the run finishes. If you close it manually, the run pauses and Resume recreates it. Successful actions are remembered locally and skipped on later runs; failures remain eligible for retry. Name-only blocks are skipped because they do not have a bot ID.</p>
 <div class="bot-manager-list" id="blockedBotManager"></div>
 <div class="bot-manager-pager">
 <button id="blockedBotShowMore" type="button">Show 20 more</button>
@@ -2195,7 +2379,9 @@ NTR"></textarea></label>
 <label>Recently Seen history limit<input id="recentlySeenLimit" max="250" min="10" step="10" type="number"/></label>
 <label class="row"><input id="enableBotComparison" type="checkbox"/><span>Enable local side-by-side bot comparison</span></label>
 <label class="row"><input id="showQuickNotInterestedButtons" type="checkbox"/><span>Add a quick Not Interested button to bot cards</span></label>
-<p class="hint">Comparison uses information already visible on cards plus your local QoL folders/tags/notes. Recently Seen is local and can be backed up or deleted separately.</p>
+<label class="row"><input id="showQuickLessLikeButtons" type="checkbox"/><span>Add a quick Stop recommending me this button to bot cards</span></label>
+<label class="row"><input id="showQuickDislikeButtons" type="checkbox"/><span>Add a separate quick Dislike button to bot cards (desktop browser only)</span></label>
+<p class="hint">All three are separate and opt-in: Not Interested is only a local QoL filter; Stop recommending me this uses SpicyChat's own Less Like This action for recommendation preferences; Dislike uses the existing QoL/SpicyChat rating worker and is tracked in the handled Dislike history.</p>
 </section>
 
 
@@ -2203,6 +2389,8 @@ NTR"></textarea></label>
 <h2>Listing refill</h2>
 <p class="hint">Can load extra listing pages in a temporary inactive SpicyChat helper tab (or use Load More on older layouts) after QoL hides cards so the page has enough visible results. Disabled on phone/mobile for now.</p>
 <label class="row"><input id="autoFillListings" type="checkbox"/><span>Enable Listing Refill</span></label>
+<label class="row"><input id="paginationTopJumpBox" type="checkbox"/><span>Show a page-number box above chatbot listings</span></label>
+<p class="hint">The page box accepts pages 1–20,000 and uses the same navigation as the bottom pagination jump control.</p>
 <label>Target visible cards<input id="autoFillTargetCards" max="200" min="1" step="1" type="number"/></label>
 <label>Max extra pages / Load More attempts per listing<input id="autoFillMaxClicks" max="30" min="1" step="1" type="number"/></label>
 <p class="hint">Default target is 50 visible cards; you can raise it up to 200. On current paginated listings QoL briefly opens later pages in an inactive helper tab, copies only candidates that pass the current filters back into your listing, skips duplicate bots, and closes/reuses the helper automatically. Listing filter statistics are configured separately under Bot Blocking &amp; Dislikes.</p>
@@ -2424,7 +2612,7 @@ myth => Fantasy | ✨"></textarea></label>
 <p class="hint" id="cleanupStatus"></p>
 </section><section class="card" id="settingsHealthCard">
 <h2>Settings check</h2>
-<p class="hint">Checks only things that are likely to need action, such as an enabled feature missing required setup, invalid values, interrupted bulk actions, broken local records, or unusually large storage. It does not change anything by itself.</p>
+<p class="hint">Checks things that are likely to need action, including enabled features missing setup, invalid values, interrupted bulk actions, broken local records, unusually large storage, and developer wiring mistakes where a registered setting has no Settings control. It does not change anything by itself.</p>
 <div class="button-row"><button id="runSettingsHealthCheck" type="button">Check configuration</button></div>
 <div class="settings-health-results" id="settingsHealthResults"><span class="hint">No check run yet.</span></div>
 </section>
@@ -2444,7 +2632,7 @@ myth => Fantasy | ✨"></textarea></label>
 <div class="tab-page" data-page="help"><p class="page-intro">Quick explanations, support links, diagnostics, credits, and the info that helps when something breaks.</p>
 <section class="card help-card" id="aboutCard"><h2>About SpicyChat QoL</h2>
 <div class="about-project-head">
-<img alt="SpicyChat QoL icon" class="about-project-icon" src="icons/icon128.png"/>
+<img alt="SpicyChat QoL icon" class="about-project-icon" src="https://spicychatqol.drache.uk/assets/icons/full_icon.jpg" onerror="this.onerror=null;this.src='icons/icon128.png';"/>
 <div><strong>SpicyChat QoL</strong><p class="hint">Developed under DragonScript by DragonGRaf.</p></div>
 </div>
 <p>An independent quality-of-life project for SpicyChat focused on optional tools, local-first data, creator helpers, chat utilities, filtering, organization, and interface cleanup.</p>

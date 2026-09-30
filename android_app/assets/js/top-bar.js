@@ -25,14 +25,31 @@
 
   function hideTopBarElement(el, reason) {
     if (!el) return;
-
-    DS.hideElement?.(el, `topbar:${reason}`);
+    DS.hideElement?.(el, reason === "notifications" ? "notifications" : `topbar:${reason}`);
   }
 
+  function unhideNotificationVisibility() {
+    const settings = DS.state?.settings || {};
+    if (settings.hideNotifications || settings.hideTopBarNotifications) return;
+    DS.qsa("[data-ds-reason='notifications']").forEach(el => DS.unhideElement?.(el));
+
+    // v0.2.16 and earlier could leave the old `topbar:notifications`
+    // reason behind. Clean it once, then stay on the single canonical
+    // `notifications` reason so the two modules cannot ping-pong it.
+    if (!DS.state.notificationReasonMigrationDone) {
+      DS.qsa("[data-ds-reason='topbar:notifications']").forEach(el => DS.unhideElement?.(el));
+      DS.state.notificationReasonMigrationDone = true;
+    }
+  }
+  DS.unhideNotificationVisibility = unhideNotificationVisibility;
+
   function unhideTopBarReason(reason) {
-    DS.qsa(`[data-ds-reason='topbar:${reason}']`).forEach(el => {
-      DS.unhideElement?.(el);
-    });
+    if (reason === "notifications") {
+      unhideNotificationVisibility();
+      return;
+    }
+
+    DS.qsa(`[data-ds-reason='topbar:${reason}']`).forEach(el => DS.unhideElement?.(el));
   }
 
   function findAvatarPill() {
@@ -133,12 +150,14 @@
 
   function rememberOriginalPill(pill) {
     if (!pill) return;
-
     const label = findPillTextElement(pill);
     if (!label) return;
 
-    if (!pill.dataset.dsTopbarOriginalText) {
-      pill.dataset.dsTopbarOriginalText = cleanText(label.textContent);
+    const current = cleanText(label.textContent);
+    const applied = cleanText(pill.dataset.dsTopbarAppliedText || "");
+    const nativeChanged = pill.dataset.dsTopbarMutated === "1" && applied && current && current !== applied;
+    if (!pill.dataset.dsTopbarOriginalText || pill.dataset.dsTopbarMutated !== "1" || nativeChanged) {
+      if (current) pill.dataset.dsTopbarOriginalText = current;
     }
   }
 
@@ -168,11 +187,12 @@
     const label = findPillTextElement(pill);
     const original = pill.dataset.dsTopbarOriginalText;
 
-    if (label && original && pill.dataset.dsTopbarMutated === "1") {
+    if (label && original && pill.dataset.dsTopbarMutated === "1" && cleanText(label.textContent) !== original) {
       label.textContent = original;
     }
 
     delete pill.dataset.dsTopbarMutated;
+    delete pill.dataset.dsTopbarAppliedText;
   }
 
   function getActiveSavedPersonaName() {
@@ -218,15 +238,15 @@
 
   function setProfilePillText(pill, text) {
     if (!pill) return;
-
     const label = findPillTextElement(pill);
     if (!label) return;
 
     rememberOriginalPill(pill);
-
-    label.textContent = cleanText(text) || "Default";
-    pill.dataset.dsTopbarMutated = "1";
-    pill.title = cleanText(text) || "Default";
+    const wanted = cleanText(text) || "Default";
+    if (cleanText(label.textContent) !== wanted) label.textContent = wanted;
+    if (pill.dataset.dsTopbarMutated !== "1") pill.dataset.dsTopbarMutated = "1";
+    if (pill.dataset.dsTopbarAppliedText !== wanted) pill.dataset.dsTopbarAppliedText = wanted;
+    if (pill.title !== wanted) pill.title = wanted;
   }
 
   function applyProfilePillMode() {
@@ -243,11 +263,17 @@
       return;
     }
 
-    restoreProfilePill(pill);
+    if (pill.dataset.dsReason === "topbar:profile-pill") DS.unhideElement?.(pill);
+
+    if (mode === "normal") {
+      restoreProfilePill(pill);
+      return;
+    }
 
     if (mode === "custom") {
       const custom = cleanText(settings.topBarProfilePillCustomText || "");
       if (custom) setProfilePillText(pill, custom);
+      else restoreProfilePill(pill);
       return;
     }
 
@@ -256,7 +282,6 @@
       const text = settings.topBarProfilePillPersonaPrefix === false
         ? persona
         : `Persona: ${persona}`;
-
       setProfilePillText(pill, text);
     }
   }

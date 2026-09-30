@@ -14,6 +14,7 @@
   let slowTimer = null;
   let slowScheduledAt = 0;
   let slowQuietTimer = null;
+  let messageEnhancerQuietTimer = null;
   let idleHandle = null;
   let criticalRunning = false;
   let criticalPending = false;
@@ -326,6 +327,12 @@
     return DS.normalize ? DS.normalize(text) : text.toLowerCase().replace(/\s+/g, " ").trim();
   }
 
+  function isLoadPreviousMessagesButton(button) {
+    if (!(button instanceof Element)) return false;
+    if (button.querySelector?.("[data-translate-key='chat:page.action.loadPreviousMessages']")) return true;
+    return normalizedText(button).includes("load previous messages");
+  }
+
   function isChatDropdownMenuElement(el) {
     if (!el || el.closest?.("#ds-qol-panel, #ds-chat-export-modal")) return false;
     if (!isVisible(el)) return false;
@@ -352,6 +359,11 @@
     const dropdownButton = target?.closest?.("button[aria-label='chat-dropdown']");
     const dropdownAction = target?.closest?.("button");
     const label = normalizedText(dropdownAction);
+
+    if (isLoadPreviousMessagesButton(dropdownAction)) {
+      scheduleChatHistoryBatchRefresh();
+      return;
+    }
 
     if (dropdownAction && label === "save") {
       const messageRoot = dropdownAction.closest?.("div[id^='message-']");
@@ -456,6 +468,10 @@
     return chatMessageCountCache.count;
   }
 
+  // Shared by lightweight UI such as the optional Mini Panel counter so those
+  // surfaces do not need to rescan a long chat on every refresh.
+  DS.getLoadedChatMessageCount = loadedChatMessageCount;
+
   function messageQuickActionsEnabled(settings = DS.state?.settings || {}) {
     return !!(
       settings.messageQuickActionCopy ||
@@ -477,7 +493,7 @@
   function chatTopBarWanted(settings) {
     return anySetting(settings, [
       "showChatTopBarTools", "chatTopBarInlineCreator", "chatTopBarAddLaterButton",
-      "showPerCharacterChatHistory", "showQuickNewChatButton", "hideChatTopBarRatingButton",
+      "showPerCharacterChatHistory", "showQuickNewChatButton", "showChatExportButton", "hideChatTopBarRatingButton",
       "hideChatTopBarModelButton", "hideChatTopBarContextDot", "hideChatDropdownVoiceUpsell",
       "hideChatDropdownMemoryItem"
     ]);
@@ -526,6 +542,15 @@
 
   function personaToolsWanted(settings) {
     return anySetting(settings, ["autoAcceptPersonaChange", "savePersonasFromPages", "keepLocalPersonaCopies", "expandPersonaDescriptions", "enablePersonaOrganizer", "showPersonaQuickSwitch"]);
+  }
+
+  async function runPersonaPickerLowImpact(source = "runtime") {
+    if (!DS.isPersonaPickerOpen?.()) return false;
+    const counters = runtimeCounters();
+    counters.personaPickerLowImpactRuns = Number(counters.personaPickerLowImpactRuns || 0) + 1;
+    counters.lastPersonaPickerLowImpactSource = String(source || "runtime");
+    await runStep("persona picker low-impact", () => DS.applyPersonaPickerLightweight?.());
+    return true;
   }
 
   function memoryManagerWanted(settings) {
@@ -699,7 +724,8 @@
     }
 
     const debug = !!DS.state?.settings?.debug;
-    const collectTiming = debug || !!DS.state?.settings?.performanceDiagnostics;
+    const inspectorConnected = !!DS.isDiagnosticInspectorConnected?.();
+    const collectTiming = debug || !!DS.state?.settings?.performanceDiagnostics || inspectorConnected;
     const started = collectTiming && typeof performance !== "undefined" ? performance.now() : 0;
 
     try {
@@ -722,6 +748,7 @@
         entry.maxMs = Math.max(entry.maxMs, elapsed);
         entry.lastMs = elapsed;
         entry.lastAt = Date.now();
+        entry.lastTrigger = String(DS.state.lastRunTrigger || "").slice(0, 120);
       }
     }
   }
@@ -736,7 +763,8 @@
         averageMs: value.calls ? Math.round((value.totalMs / value.calls) * 100) / 100 : 0,
         maxMs: Math.round((value.maxMs || 0) * 100) / 100,
         lastMs: Math.round((value.lastMs || 0) * 100) / 100,
-        lastAt: Number(value.lastAt || 0)
+        lastAt: Number(value.lastAt || 0),
+        lastTrigger: String(value.lastTrigger || "")
       }))
       .sort((a, b) => b.totalMs - a.totalMs);
   };
@@ -787,6 +815,7 @@
     counters.messageLaneRuns = Number(counters.messageLaneRuns || 0) + 1;
     try {
       const settings = DS.state?.settings || {};
+      DS.refreshMessageEnhancerConfig?.(settings);
       applyRuntimePerformancePresentation();
       if (!settings.enabled || !DS.isSingleChatPage?.() || shouldPauseHiddenTab()) return;
       if (settings.pauseQolWhileMessageEditing !== false && DS.hasActiveMessageEditor?.()) {
@@ -802,6 +831,22 @@
         return;
       }
       if (Date.now() < pauseRerunsUntil || DS.isChatHeaderMenuOpen?.()) return;
+
+      const enhancerQuietUntil = Number(DS.state.chatEnhancerQuietUntil || 0);
+      if (settings.chatPerformanceMode && enhancerQuietUntil > Date.now()) {
+        await runStep("performance mode", () => DS.applyPerformanceMode?.());
+        const counters = runtimeCounters();
+        counters.chatEnhancerQuietDeferrals = Number(counters.chatEnhancerQuietDeferrals || 0) + 1;
+        clearTimeout(messageEnhancerQuietTimer);
+        const wait = Math.max(40, enhancerQuietUntil - Date.now() + 20);
+        messageEnhancerQuietTimer = window.setTimeout(() => {
+          messageEnhancerQuietTimer = null;
+          const resume = () => DS.scheduleMessageLane?.("post-native-render-quiet");
+          if (typeof requestIdleCallback === "function") requestIdleCallback(resume, { timeout: 700 });
+          else setTimeout(resume, 0);
+        }, wait);
+        return;
+      }
 
       const dirtySet = DS.state.messageDirtyRoots || (DS.state.messageDirtyRoots = new Set());
       const laneRoots = [...dirtySet].filter(root => root?.isConnected && !DS.isMessageEditPending?.(root));
@@ -826,6 +871,7 @@
       if (settings.enableChatTextReplacements || DS.state.chatTextReplacementsWasActive) await runStep("chat text replacements", () => DS.applyChatTextReplacements?.());
       if (settings.enableTranslation || DS.state.translationWasActive) await runStep("translation", () => DS.applyTranslationTools?.());
       await runFeatureStep("auto voice", !!DS.isAutoVoiceEnabled?.(), () => DS.applyAutoVoice?.());
+      DS.markMessageEnhancerVisited?.(laneRoots);
 
       const now = Date.now();
       const quietFor = now - Number(DS.state.lastChatMutationAt || 0);
@@ -1071,6 +1117,12 @@
         return;
       }
 
+      // The chat-start/change-persona modal is a transient native surface.
+      // While it is open, broad chat/listing reconciliation only competes with
+      // SpicyChat's own picker rendering and can cause periodic half-second
+      // stalls. Keep only the tiny persona-specific pass alive until it closes.
+      if (await runPersonaPickerLowImpact("critical")) return;
+
       DS.state.disabledCleanupDone = false;
       const deepSleep = deepSleepEnabled(settings);
       if (!deepSleep || cardFilteringWanted(settings) || document.querySelector("[data-ds-hidden-card],.ds-card-hidden,.ds-card-dimmed")) {
@@ -1103,7 +1155,7 @@
         // on high-latency installed/PWA sessions.
         if (!DS.hasActiveMessageEditor?.()) {
           await runFeatureStep("message removal draft guard", !!settings.protectDraftDuringMessageRemoval, () => DS.applyMessageRemovalGuard?.());
-          await runFeatureStep("failed message helper", !!settings.failedMessageHelper || !!document.querySelector(".ds-failed-message-helper,[data-ds-failed-message-helper]"), () => DS.applyFailedMessageHelper?.());
+          await runFeatureStep("failed message helper", !!settings.failedMessageHelper || !!settings.autoRetryFailedMessageSends || !!document.querySelector(".ds-failed-message-helper,[data-ds-failed-message-helper],[data-testid='ChatSendErrorBanner']"), () => DS.applyFailedMessageHelper?.());
         }
         await runStep("performance mode", () => DS.applyPerformanceMode?.());
         await runSavedOpenedLane("critical-single-chat");
@@ -1165,6 +1217,7 @@
       }
 
       if (singleChat) {
+        DS.refreshMessageEnhancerConfig?.(settings);
         await runFeatureStep("chat top bar", chatTopBarWanted(settings) || !!DS.state.chatTopBarWasActive, () => DS.applyChatTopBarTools?.());
         await runFeatureStep("chat backgrounds", !!settings.enableChatBackgrounds || !!DS.state.chatBackgroundsWasActive, () => DS.applyChatBackgrounds?.());
         await runFeatureStep("chat background button placement", !!settings.enableChatBackgrounds || !!DS.state.chatBackgroundsWasActive, () => DS.applyChatBackgroundControlPlacement?.());
@@ -1178,6 +1231,7 @@
           await runFeatureStep("Android app controls", !!env.android || String(settings.androidAppControlsMode || "auto") === "always" || !!DS.state.androidAppControlsWasActive, () => DS.applyAndroidAppControls?.());
         }
         await runFeatureStep("composer", composerWanted(settings) || !!DS.state.composerControlWasActive, () => DS.applyComposerControl?.());
+        await runFeatureStep("mobile chat layout", true, () => DS.applyMobileChatLayoutFixes?.());
         if (settings.enableReplyInstructions || settings.enableGlobalMemory || settings.enableRpStateTracker || DS.state.replyInstructionsWasActive) await runStep("reply instructions", () => DS.applyReplyInstructions?.());
         if (settings.showFormattingToolbar || DS.state.formattingToolbarWasActive) await runStep("formatting toolbar", () => DS.applyFormattingToolbar?.());
         if (DS.isRpFormatRepairEnabledForCurrentCharacter?.() || settings.enableRpFormatRepair || DS.state.rpFormatRepairWasActive) await runStep("RP format repair", () => DS.applyRpFormatRepair?.());
@@ -1194,6 +1248,7 @@
         await runFeatureStep("memory manager", memoryManagerWanted(settings) || !!document.querySelector("[data-ds-memory-manager],#ds-memory-manager"), () => DS.applyMemoryManagerTools?.());
         if (settings.enableChatTextReplacements || DS.state.chatTextReplacementsWasActive) await runStep("chat text replacements", () => DS.applyChatTextReplacements?.());
         if (settings.enableTranslation || DS.state.translationWasActive) await runStep("translation", () => DS.applyTranslationTools?.());
+        DS.markMessageEnhancerVisited?.(DS.getMessageEnhancerRoots?.({ newest: 24, margin: 1400 }) || []);
       } else {
         if (DS.state.chatTopBarWasActive) {
           await runStep("chat top bar cleanup", () => DS.applyChatTopBarTools?.());
@@ -1306,6 +1361,8 @@
         return;
       }
 
+      if (await runPersonaPickerLowImpact("slow")) return;
+
       if (Date.now() < pauseRerunsUntil || (DS.isSingleChatPage?.() && DS.isChatHeaderMenuOpen?.())) {
         rerunAfterMenuSettles();
         return;
@@ -1337,11 +1394,11 @@
       // listing/banner work so a busy chat cannot leave SpicyChat UI elements
       // visible just because the cosmetic lane was delayed.
       await runFeatureStep("top bar", topBarWanted(settings) || !!document.querySelector("[data-ds-reason^='topbar:']"), () => DS.applyTopBarCleanup?.());
-      const sidebarWanted = Object.keys(settings).some(key => key.startsWith("hideSidebar") && settings[key]);
+      const sidebarWanted = !!settings.showQolSidebarButton || Object.keys(settings).some(key => key.startsWith("hideSidebar") && settings[key]);
       if (listing) {
-        await runThrottledFeatureStep("sidebar", sidebarWanted || !!document.querySelector("[data-ds-reason^='sidebar:']"), listingMaintenanceInterval, () => DS.applySidebarCleanup?.(), !!options.force);
+        await runThrottledFeatureStep("sidebar", sidebarWanted || !!document.querySelector("[data-ds-reason^='sidebar:'],#ds-qol-sidebar-btn"), listingMaintenanceInterval, () => DS.applySidebarCleanup?.(), !!options.force);
       } else {
-        await runFeatureStep("sidebar", sidebarWanted || !!document.querySelector("[data-ds-reason^='sidebar:']"), () => DS.applySidebarCleanup?.());
+        await runFeatureStep("sidebar", sidebarWanted || !!document.querySelector("[data-ds-reason^='sidebar:'],#ds-qol-sidebar-btn"), () => DS.applySidebarCleanup?.());
       }
       await runFeatureStep("main footer", !!settings.enableMainFooterManagement || !!document.querySelector("[data-ds-reason^='main-footer:'],[data-ds-main-footer-root]"), () => DS.applyMainFooterManagement?.());
 
@@ -1399,9 +1456,11 @@
       }
 
       if (listing) {
+        await runFeatureStep("pagination tools", true, () => DS.applyPaginationTools?.());
+        await runFeatureStep("bot name expander", true, () => DS.applyBotNameExpander?.());
         // Recommendation helpers load local creator identity before the final
         // card pass so own-bot filtering can work without extra page requests.
-        await runFeatureStep("recommendation helpers", !!settings.enableRecommendationHelpers || !!document.querySelector("[data-ds-recommendation-helper]"), () => DS.applyRecommendationHelpers?.());
+        await runThrottledFeatureStep("recommendation helpers", !!settings.enableRecommendationHelpers || !!document.querySelector("[data-ds-recommendation-helper]"), listingMaintenanceInterval, () => DS.applyRecommendationHelpers?.(), !!options.force);
         // Description expansion runs only after promo/banner cleanup and a fresh
         // blocking/opened-card pass so hidden cards do not expand first and flash.
         await runThrottledFeatureStep("card hiding settled", cardFilteringWanted(settings) || !!document.querySelector("[data-ds-hidden-card],.ds-card-hidden,.ds-card-dimmed"), listingCardInterval, () => DS.applyCardHiding?.(), !!options.force);
@@ -1446,6 +1505,8 @@
         settings.showRecentlySeenButton ||
         settings.enableBotComparison ||
         settings.showQuickNotInterestedButtons ||
+        settings.showQuickLessLikeButtons ||
+        settings.showQuickDislikeButtons ||
         settings.showQuickUnblockButtons ||
         DS.state.cardWorkflowWasActive
       )) {
@@ -1540,6 +1601,9 @@
     const profile = runtimeProfile();
     const counters = runtimeCounters();
     const messageCount = loadedChatMessageCount();
+    const source = String(options.source || "scheduled").slice(0, 120);
+    DS.state.lastRunTrigger = source;
+    counters.lastScheduleSource = source;
     counters.schedules++;
 
     let criticalDelay = immediate ? 0 : 160;
@@ -1795,6 +1859,9 @@
     DS.state.lastMarkedChatId = "";
     DS.state.messageDirtyRoots?.clear?.();
     DS.state.messageLaneRoots = null;
+    DS.state.chatEnhancerQuietUntil = 0;
+    clearTimeout(messageEnhancerQuietTimer);
+    messageEnhancerQuietTimer = null;
     DS.state.activeMessageEditRoots?.clear?.();
     clearBlockedRefreshBatch();
     messageEditSettleTimers.forEach(timer => clearTimeout(timer));
@@ -2102,13 +2169,23 @@
       }
 
       const chatLocal = isChatPage && runtimeProfile() !== "normal" && mutationsAreChatLocal(mutations);
-      if (chatLocal) DS.state.lastChatMutationAt = Date.now();
+      if (chatLocal) {
+        const now = Date.now();
+        DS.state.lastChatMutationAt = now;
+        if (DS.state?.settings?.chatPerformanceMode && loadedChatMessageCount() >= 80) {
+          const profile = runtimeProfile();
+          const quietMs = profile === "maximum" ? 1400 : (profile === "aggressive" ? 1150 : 950);
+          DS.state.chatEnhancerQuietUntil = Math.max(Number(DS.state.chatEnhancerQuietUntil || 0), now + quietMs);
+          counters.chatEnhancerQuietExtensions = Number(counters.chatEnhancerQuietExtensions || 0) + 1;
+        }
+      }
 
       // Keep the expensive whole-page DOM revision stable during token streaming.
       // A real message-root add/remove still bumps it so static long-chat classes
       // and other structure caches refresh, while text edits use messageTextRevision.
       const cardListing = !isChatPage && isCardListingContext();
       const affectsCards = cardListing ? mutationsMayAffectCards(mutations) : false;
+      if (cardListing && affectsCards) DS.markListingDirtyCards?.(mutations);
       if (chatLocal) {
         if (messageRootsChanged) DS.bumpDomRevision?.();
       } else if (!cardListing || affectsCards) {
@@ -2153,12 +2230,61 @@
     setInterval(checkRouteChange, 2000);
   };
 
+  function primeLargeChatMessageLane(source = "resume") {
+    if (!DS.isSingleChatPage?.()) return false;
+    const roots = DS.getLoadedMessageRoots?.() || [];
+    if (roots.length < 120) return false;
+
+    DS.state.messageResumeLazyUntil = Date.now() + 8000;
+    const dirty = DS.state.messageDirtyRoots || (DS.state.messageDirtyRoots = new Set());
+    // Hidden tabs can accumulate hundreds of stale dirty roots. On resume,
+    // discard that backlog and only enhance what the user can see plus the
+    // newest messages. Older history is picked up lazily while scrolling.
+    dirty.clear();
+    const visible = DS.getMessageEnhancerRoots?.({ forceLazy: true, newest: 24, margin: 1400 }) || roots.slice(-24);
+    let queued = 0;
+    for (const root of visible) {
+      if (DS.messageEnhancerHasVisited?.(root)) continue;
+      if (DS.markMessageRootDirty?.(root)) queued++;
+    }
+
+    const counters = runtimeCounters();
+    counters.messageResumeLazyPrunes = Number(counters.messageResumeLazyPrunes || 0) + 1;
+    counters.messageResumeLazyRoots = Number(counters.messageResumeLazyRoots || 0) + queued;
+    if (queued) DS.scheduleMessageLane?.(`lazy-${source}`);
+    return true;
+  }
+
+  function scheduleLazyHistoryEnhancement() {
+    if (!DS.isSingleChatPage?.()) return;
+    clearTimeout(DS.state.messageLazyScrollTimer);
+    DS.state.messageLazyScrollTimer = window.setTimeout(() => {
+      DS.state.messageLazyScrollTimer = null;
+      const roots = DS.getLoadedMessageRoots?.() || [];
+      if (roots.length < 120) return;
+      DS.state.messageResumeLazyUntil = Math.max(Number(DS.state.messageResumeLazyUntil || 0), Date.now() + 1200);
+      const near = DS.getMessageEnhancerRoots?.({ forceLazy: true, newest: 8, margin: 900 }) || [];
+      let added = 0;
+      for (const root of near) {
+        if (DS.messageEnhancerHasVisited?.(root)) continue;
+        if (DS.markMessageRootDirty?.(root)) added++;
+      }
+      if (added) {
+        const counters = runtimeCounters();
+        counters.messageLazyScrollBatches = Number(counters.messageLazyScrollBatches || 0) + 1;
+        counters.messageLazyScrollRoots = Number(counters.messageLazyScrollRoots || 0) + added;
+        DS.scheduleMessageLane?.("lazy-history-scroll");
+      }
+    }, 180);
+  }
+
   function installRefreshTrackers() {
     if (DS.state.refreshTrackersInstalled) return;
     DS.state.refreshTrackersInstalled = true;
 
     document.addEventListener("scroll", () => {
       DS.state.userScrollingUntil = Date.now() + 220;
+      scheduleLazyHistoryEnhancement();
     }, { passive: true, capture: true });
 
     document.addEventListener("visibilitychange", () => {
@@ -2169,6 +2295,7 @@
       } else {
         scheduleNonChatPresentationRecovery("visible");
         scheduleSavedOpenedLane("visible", 40);
+        primeLargeChatMessageLane("visible");
         DS.scheduleRun?.({ immediate: true, source: "visible" });
       }
     }, true);
@@ -2176,6 +2303,7 @@
     window.addEventListener("pageshow", () => {
       scheduleNonChatPresentationRecovery("pageshow");
       scheduleSavedOpenedLane("pageshow", 40);
+      primeLargeChatMessageLane("pageshow");
       DS.scheduleRun?.({ immediate: true, source: "pageshow" });
     }, true);
 
@@ -2194,7 +2322,7 @@
     try {
       if (typeof PerformanceObserver === "function" && PerformanceObserver.supportedEntryTypes?.includes?.("longtask")) {
         const observer = new PerformanceObserver(list => {
-          if (!DS.state?.settings?.performanceDiagnostics) return;
+          if (!DS.state?.settings?.performanceDiagnostics && !DS.isDiagnosticInspectorConnected?.()) return;
           const counters = runtimeCounters();
           for (const entry of list.getEntries()) {
             const ms = Number(entry.duration || 0);
@@ -2310,10 +2438,22 @@
 
   (async function main() {
     await DS.loadState();
-    DS.runtimeLog?.("info", "main", "State loaded", { enabled: DS.state?.settings?.enabled !== false });
+    try { await DS.resolveBackgroundWorkerIdentity?.(); } catch {}
+    DS.runtimeLog?.("info", "main", "State loaded", {
+      enabled: DS.state?.settings?.enabled !== false,
+      backgroundWorker: String(DS.state?.qolBackgroundWorker || "")
+    });
 
+    if (DS.state.qolBackgroundWorker) {
+      DS.runtimeLog?.("info", "main", `${DS.state.qolBackgroundWorker} helper tab: normal QoL page processing skipped`);
+      return;
+    }
     if (DS.state.quickDislikeWorker) {
       DS.runtimeLog?.("info", "main", "Quick-dislike helper tab: normal QoL page processing skipped");
+      return;
+    }
+    if (DS.state.recommendationWorker) {
+      DS.runtimeLog?.("info", "main", "Recommendation helper tab: normal QoL page processing skipped");
       return;
     }
     if (DS.state.listingRefillWorker) {

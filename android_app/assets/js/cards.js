@@ -473,6 +473,11 @@
   };
 
   DS.shouldHideCard = function shouldHideCard(card, anchor, context = {}) {
+    // The dedicated Less Like helper must be able to see the exact blocked bot
+    // it is processing. It runs in a hidden SpicyChat tab and does not affect
+    // the user's visible listings.
+    if (DS.state.quickLessLikeWorker) return null;
+
     const { settings, openedChats } = DS.state;
     const discoveryContext = !!context.discovery;
     const homeContext = !!context.home;
@@ -701,6 +706,83 @@
     delete el.dataset.dsNormalizedApplied;
   }
 
+  function botNameTitleFromTarget(target) {
+    const el = target instanceof Element ? target : target?.parentElement;
+    if (!el) return null;
+    const link = el.closest?.("a[aria-label^='chat-with-'][title], a[href*='/chat/'][title], a[href*='/chatbot/'][title]");
+    if (!link) return null;
+    const card = DS.getCardFromChatLink?.(link) || link.closest?.("div.relative.group.rounded-xl");
+    return DS.isRecommendationCardRoot?.(card) ? link : null;
+  }
+
+  function removeBotNameOverlay() {
+    document.getElementById("ds-bot-name-expander")?.remove();
+    DS.state.botNameExpandedTarget = null;
+  }
+
+  function showBotNameOverlay(link) {
+    if (!link?.isConnected) return;
+    const full = String(link.getAttribute("title") || link.textContent || "").replace(/\s+/g, " ").trim();
+    if (!full) return;
+
+    const rect = link.getBoundingClientRect();
+    if (!(link.scrollWidth > link.clientWidth + 2 || rect.width < 90)) return;
+
+    removeBotNameOverlay();
+    const overlay = document.createElement("div");
+    overlay.id = "ds-bot-name-expander";
+    overlay.textContent = full;
+    overlay.setAttribute("role", "tooltip");
+    overlay.style.left = `${Math.max(4, rect.left)}px`;
+    overlay.style.top = `${Math.max(4, rect.top - 2)}px`;
+    document.documentElement.appendChild(overlay);
+    DS.state.botNameExpandedTarget = link;
+  }
+
+  function installBotNameExpanderListeners() {
+    if (DS.state.botNameExpanderListenersInstalled) return;
+    DS.state.botNameExpanderListenersInstalled = true;
+
+    document.addEventListener("pointerover", event => {
+      if (!DS.state.settings?.expandBotNamesOnHover || event.pointerType === "touch") return;
+      const link = botNameTitleFromTarget(event.target);
+      if (link) showBotNameOverlay(link);
+    }, true);
+
+    document.addEventListener("pointerout", event => {
+      const target = DS.state.botNameExpandedTarget;
+      if (!target) return;
+      if (event.relatedTarget && target.contains?.(event.relatedTarget)) return;
+      removeBotNameOverlay();
+    }, true);
+
+    document.addEventListener("click", event => {
+      if (!DS.state.settings?.expandBotNamesOnHover) {
+        removeBotNameOverlay();
+        return;
+      }
+      const link = botNameTitleFromTarget(event.target);
+      if (!link) {
+        removeBotNameOverlay();
+        return;
+      }
+      if (window.matchMedia?.("(hover: none), (pointer: coarse)")?.matches) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (DS.state.botNameExpandedTarget === link) removeBotNameOverlay();
+        else showBotNameOverlay(link);
+      }
+    }, true);
+
+    window.addEventListener("scroll", removeBotNameOverlay, true);
+    window.addEventListener("resize", removeBotNameOverlay, { passive: true });
+  }
+
+  DS.applyBotNameExpander = function applyBotNameExpander() {
+    installBotNameExpanderListeners();
+    if (!DS.state.settings?.expandBotNamesOnHover) removeBotNameOverlay();
+  };
+
   DS.applyCardDisplayNormalization = function applyCardDisplayNormalization(cards = DS.collectCards?.() || []) {
     const enabled = cardDisplayNormalizationEnabled();
 
@@ -737,8 +819,10 @@
     if (!card) return null;
 
     const exactSelectors = [
+      ":scope > div[class*='px-2'][class*='py-3'] > div[class*='line-clamp-3'][class*='group-hover:line-clamp-none']",
       ":scope > div[class*='px-2'][class*='py-3'] > div[class*='line-clamp-2'][class*='group-hover:line-clamp-none']",
       ":scope > div[class*='px-2'][class*='py-3'] > div[class*='scrollbar-hide'][class*='overflow-y-auto']",
+      "div[class*='line-clamp-3'][class*='group-hover:line-clamp-none']",
       "div[class*='line-clamp-2'][class*='group-hover:line-clamp-none']",
       "div[class*='scrollbar-hide'][class*='overflow-y-auto']"
     ];
@@ -777,7 +861,7 @@
         const cls = DS.classText(el);
         const childCount = el.children?.length || 0;
         const score =
-          (cls.includes("line-clamp-2") ? 260 : 0) +
+          ((cls.includes("line-clamp-3") || cls.includes("line-clamp-2")) ? 260 : 0) +
           (cls.includes("group-hover:line-clamp-none") ? 180 : 0) +
           (cls.includes("scrollbar-hide") ? 120 : 0) +
           (cls.includes("overflow-y-auto") ? 80 : 0) +
@@ -820,6 +904,11 @@
       // Fall back to a text-length estimate below.
     }
 
+    const cls = DS.classText?.(block) || String(block.className || "");
+    // My Creations currently uses a three-line clamp with a fixed ~60px box.
+    // Some cards report equal client/scroll heights while React is settling, so
+    // use a slightly earlier text fallback for that layout.
+    if (cls.includes("line-clamp-3")) return text.length >= 68;
     return text.length >= 78;
   }
 
@@ -1003,7 +1092,9 @@
 
   DS.compactLayouts = function compactLayouts(cards) {
     if (!DS.state.settings.compactAfterHiding) {
-      DS.qsa?.(".ds-grid-dense").forEach(parent => parent.classList.remove("ds-grid-dense"));
+      DS.qsa?.(".ds-grid-dense").forEach(parent => {
+        if (parent.classList.contains("ds-grid-dense")) parent.classList.remove("ds-grid-dense");
+      });
       return;
     }
 
@@ -1023,10 +1114,10 @@
     for (const parent of parents) {
       if (!DS.classText(parent).includes("grid")) continue;
       if (parent.querySelector?.("nav, [role='navigation']")) {
-        parent.classList.remove("ds-grid-dense");
+        if (parent.classList.contains("ds-grid-dense")) parent.classList.remove("ds-grid-dense");
         continue;
       }
-      parent.classList.add("ds-grid-dense");
+      if (!parent.classList.contains("ds-grid-dense")) parent.classList.add("ds-grid-dense");
     }
   };
 
@@ -1046,6 +1137,44 @@
     return !!document.querySelector("[data-ds-language-allowed-passes='1'], [data-ds-language-allowed-passes=\"1\"]");
   }
 
+  function cardFilterKey() {
+    return [
+      Number(DS.state?.cardFilterStateRevision || 0),
+      DS.state?.settings?.hiddenCardMode || "hide",
+      DS.smartFilterWantsOpened?.() ? 1 : 0,
+      DS.smartFilterWantsFavorites?.() ? 1 : 0,
+      DS.smartFilterWantsLater?.() ? 1 : 0
+    ].join("|");
+  }
+
+  DS.markListingDirtyCards = function markListingDirtyCards(mutations) {
+    const dirty = DS.state.listingDirtyCards instanceof Set
+      ? DS.state.listingDirtyCards
+      : (DS.state.listingDirtyCards = new Set());
+
+    const addNode = node => {
+      const el = node instanceof Element ? node : node?.parentElement;
+      if (!el) return;
+
+      const direct = el.closest?.("div.relative.group.rounded-xl, div[class*='rounded-xl'][class*='group']");
+      if (direct && DS.isRecommendationCardRoot?.(direct)) dirty.add(direct);
+
+      const anchors = [];
+      if (el.matches?.("a[href*='/chat/'], a[href*='/chatbot/']")) anchors.push(el);
+      el.querySelectorAll?.("a[href*='/chat/'], a[href*='/chatbot/']").forEach(anchor => anchors.push(anchor));
+      for (const anchor of anchors) {
+        const card = DS.getCardFromChatLink?.(anchor);
+        if (card?.isConnected) dirty.add(card);
+      }
+    };
+
+    for (const mutation of mutations || []) {
+      addNode(mutation.target);
+      for (const node of mutation.addedNodes || []) addNode(node);
+    }
+    return dirty.size;
+  };
+
   DS.applyCardHiding = async function applyCardHiding(options = {}) {
     if (!DS.state.settings.enabled) return;
 
@@ -1057,25 +1186,55 @@
 
     const passKey = cardHidingPassKey();
     const pendingLanguagePass = hasPendingLanguageUnhideVerification();
-    if (!options.force && !pendingLanguagePass && DS.state.cardHidingLastPassKey === passKey) {
-      const perf = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
-      perf.cardHidingStablePassSkips = Number(perf.cardHidingStablePassSkips || 0) + 1;
-      return;
+    const filterKey = cardFilterKey();
+    const routeKey = location.href;
+    const dirty = DS.state.listingDirtyCards instanceof Set
+      ? DS.state.listingDirtyCards
+      : (DS.state.listingDirtyCards = new Set());
+    const canUseDirty =
+      !options.force &&
+      !pendingLanguagePass &&
+      DS.state.cardHidingHasFullPass === true &&
+      DS.state.cardHidingLastFilterKey === filterKey &&
+      DS.state.cardHidingLastRouteKey === routeKey;
+
+    let cards;
+    if (canUseDirty) {
+      cards = [...dirty]
+        .filter(card => card?.isConnected)
+        .map(card => ({
+          card,
+          anchor: card.querySelector("a[href*='/chat/'], a[href*='/chatbot/']")
+        }))
+        .filter(item => item.anchor);
+      dirty.clear();
+
+      if (!cards.length) {
+        const perf = DS.state.runtimePerformance || (DS.state.runtimePerformance = {});
+        perf.cardHidingStablePassSkips = Number(perf.cardHidingStablePassSkips || 0) + 1;
+        DS.state.cardHidingLastPassKey = passKey;
+        return;
+      }
+    } else {
+      cards = DS.collectCards();
+      dirty.clear();
     }
 
-    const cards = DS.collectCards();
     DS.applyCardDisplayNormalization?.(cards);
 
     if (DS.isFavoriteBotsPage() && DS.state.settings.neverHideFavorites !== false) {
+      DS.state.cardHidingLastFilterKey = filterKey;
+      DS.state.cardHidingLastRouteKey = routeKey;
+      DS.state.cardHidingHasFullPass = true;
       return;
     }
     let hidden = 0;
     let processed = 0;
-    const chunkLargeListing = cards.length >= 80;
+    const chunkLargeListing = cards.length >= 60;
 
     for (const { card, anchor } of cards) {
       processed += 1;
-      if (chunkLargeListing && processed > 1 && processed % 36 === 0) {
+      if (chunkLargeListing && processed > 1 && processed % 24 === 0) {
         // A 100-200 card grid can otherwise become one long synchronous task.
         // Yield between small chunks so Brave/Chrome can paint and process input.
         await new Promise(resolve => setTimeout(resolve, 0));
@@ -1160,8 +1319,12 @@
     // one follow-up confirmation before being unhidden, so leave that pass dirty.
     if (!hasPendingLanguageUnhideVerification()) {
       DS.state.cardHidingLastPassKey = cardHidingPassKey();
+      DS.state.cardHidingLastFilterKey = filterKey;
+      DS.state.cardHidingLastRouteKey = routeKey;
+      DS.state.cardHidingHasFullPass = true;
     } else {
       DS.state.cardHidingLastPassKey = "";
+      DS.state.cardHidingHasFullPass = false;
     }
   };
 })();

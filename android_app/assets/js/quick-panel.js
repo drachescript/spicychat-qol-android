@@ -1,6 +1,10 @@
 (() => {
   "use strict";
 
+  try {
+    if (new URLSearchParams(location.search || "").get("dsQolRecommendationWorker") === "1") return;
+  } catch {}
+
   if (window.__SPICYCHAT_QOL_QUICK_PANEL_V01841__) {
     window.DragonScriptQoL?.scheduleRun?.();
     return;
@@ -764,6 +768,7 @@
 
       <div class="ds-qol-body">
         <div class="ds-qol-status" id="ds-qol-status">Loading...</div>
+        <div class="ds-qol-status" id="ds-qol-loaded-message-count" title="Messages currently loaded on this chat page, not the total chat size.">Messages shown: 0</div>
 
         <div class="ds-qol-row" id="ds-qol-normal-row">
           <button id="ds-qol-options" type="button">Options</button>
@@ -824,7 +829,9 @@
           <div class="ds-qol-row" id="ds-qol-chat-list-buttons">
             <button id="ds-qol-scan-visible" type="button">Scan visible</button>
             <button id="ds-qol-load-all-chats" type="button">Load all</button>
+            <button id="ds-qol-full-rescan-chats" type="button" style="display:none;">Full rescan</button>
           </div>
+          <div id="ds-qol-load-all-status" class="ds-qol-small-note" role="status" aria-live="polite" style="display:none;"></div>
         </div>
 
         <div id="ds-qol-smart-filter-pins-row" class="ds-qol-smart-filter-pins" style="display:none;">
@@ -942,6 +949,10 @@
 
     panel.querySelector("#ds-qol-load-all-chats")?.addEventListener("click", async () => {
       await DS.manualLoadAllChatsAndImport?.();
+    });
+
+    panel.querySelector("#ds-qol-full-rescan-chats")?.addEventListener("click", async () => {
+      await DS.manualFullRescanChatsAndImport?.();
     });
 
     panel.querySelector("#ds-qol-auto-voice")?.addEventListener("click", () => {
@@ -1103,7 +1114,7 @@
   }
 
   const PANEL_SIGNATURE_SETTINGS = [
-    "quickPanelShowStatus", "quickPanelShowFeatureSummary", "quickPanelStatusShowOpened", "quickPanelStatusShowBlocked",
+    "quickPanelShowStatus", "quickPanelShowLoadedMessageCount", "quickPanelShowFeatureSummary", "quickPanelStatusShowOpened", "quickPanelStatusShowBlocked",
     "quickPanelShowOptions", "quickPanelShowFillNow", "showChatListTools", "quickPanelShowChatSearch", "quickPanelShowChatSort",
     "quickPanelShowScanVisible", "quickPanelShowLoadAll", "showChatSearch", "chatSearchShowPanel", "enableFocusMode",
     "enableCharacterQolProfiles", "enableSavedTextSnippets", "enableContextKeeper", "enableStoryDayTracker", "storyDayTrackerShowQuickPanel", "enableRpStateTracker", "rpStateShowQuickPanel", "quickPanelShowAutoVoice", "autoPairAsterisks",
@@ -1124,6 +1135,9 @@
     const visibleChats = onChatListPage && settings.quickPanelShowStatus !== false
       ? (document.querySelectorAll("a[href*='/chat/']")?.length || 0)
       : 0;
+    const loadedMessages = onSingleChatPage && settings.quickPanelShowLoadedMessageCount
+      ? Math.max(0, Number(DS.getLoadedChatMessageCount?.() ?? document.querySelectorAll("[id^='message-']").length) || 0)
+      : 0;
     return [
       page.href || location.href,
       panel.classList.contains("ds-closed") ? 1 : 0,
@@ -1140,7 +1154,8 @@
       `${story.code || ""}:${story.pending || 0}`,
       `${rpState.count || 0}:${rpState.pending || 0}:${(rpState.items || []).map(item => `${item.id || item.key}:${item.updatedAt || 0}:${item.includeInContext === false ? 0 : 1}`).join(",")}`,
       `${refill.running ? 1 : 0}:${refill.stopping ? 1 : 0}:${refill.visible || 0}:${refill.hidden || 0}:${refill.pagesLoaded || 0}:${refill.lastError || ""}`,
-      visibleChats
+      visibleChats,
+      loadedMessages
     ].join("~");
   }
 
@@ -1149,6 +1164,7 @@
     if (!body) return;
 
     const status = document.getElementById("ds-qol-status");
+    const loadedMessageCount = document.getElementById("ds-qol-loaded-message-count");
     const normalRow = document.getElementById("ds-qol-normal-row");
     const chatListTools = document.getElementById("ds-qol-chat-list-tools");
     const smartFilterPinsRow = document.getElementById("ds-qol-smart-filter-pins-row");
@@ -1166,7 +1182,9 @@
     const soundscapeRow = document.getElementById("ds-qol-soundscape-row");
     const chatRow = document.getElementById("ds-qol-chat-row");
 
-    const desired = [status, normalRow];
+    const desired = [status];
+    if (onSingleChatPage) desired.push(loadedMessageCount);
+    desired.push(normalRow);
     if (onSingleChatPage) {
       desired.push(
         currentChatSearchTools,
@@ -1247,6 +1265,7 @@
       "enableContextKeeper",
       "enableStoryDayTracker",
       "enableRpFormatRepair",
+      "stackChatMessages",
       "enableChatBubbleCustomization",
       "androidTopBarMenu",
       "allowTypingWhileAiResponding",
@@ -1419,6 +1438,14 @@
     const status = document.getElementById("ds-qol-status");
     setShown(status, settings.quickPanelShowStatus !== false || !!settings.quickPanelShowFeatureSummary);
 
+    const loadedMessageCount = document.getElementById("ds-qol-loaded-message-count");
+    const showLoadedMessageCount = !!(onSingleChatPage && settings.quickPanelShowLoadedMessageCount);
+    if (showLoadedMessageCount && loadedMessageCount) {
+      const count = Math.max(0, Number(DS.getLoadedChatMessageCount?.() ?? document.querySelectorAll("[id^='message-']").length) || 0);
+      setText(loadedMessageCount, `Messages shown: ${count.toLocaleString()}`);
+    }
+    setShown(loadedMessageCount, showLoadedMessageCount);
+
     const optionsButton = document.getElementById("ds-qol-options");
     const fillButton = document.getElementById("ds-qol-fill-listing");
     const showOptions = settings.quickPanelShowOptions !== false;
@@ -1452,6 +1479,7 @@
     setShown(document.getElementById("ds-qol-chat-sort-wrap"), showSort);
     setShown(document.getElementById("ds-qol-scan-visible"), showScan);
     setShown(document.getElementById("ds-qol-load-all-chats"), showLoadAll);
+    setShown(document.getElementById("ds-qol-full-rescan-chats"), showLoadAll && !!DS.state.chatImportBaselineReady && !DS.state.loadAllChats?.running);
     setShown(document.getElementById("ds-qol-chat-list-buttons"), showScan || showLoadAll, "flex");
     setShown(
       document.getElementById("ds-qol-chat-list-tools"),
@@ -1599,8 +1627,7 @@
     const showExport = !!(
       onSingleChatPage &&
       settings.showChatExportButton &&
-      settings.quickPanelShowExport !== false &&
-      !DS.shouldDeferToSaiToolkit?.("chat-export")
+      settings.quickPanelShowExport !== false
     );
     setShown(document.getElementById("ds-qol-copy-chat"), showExport);
     setShown(document.getElementById("ds-qol-export-chat"), showExport);

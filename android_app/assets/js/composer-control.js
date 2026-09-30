@@ -11,7 +11,10 @@
     guardTop: 0,
     guardContainer: null,
     guardRaf: 0,
-    guardTimer: 0
+    guardTimer: 0,
+    mobileObserver: null,
+    mobileListenersInstalled: false,
+    mobileNormalizeRaf: 0
   };
 
   function settings() {
@@ -185,6 +188,61 @@
     state.composerObserver?.disconnect();
     state.observedTextareas = new WeakSet();
   }
+
+  function mobileLayoutActive() {
+    try { return window.matchMedia?.("(max-width: 760px), (pointer: coarse)")?.matches ?? window.innerWidth <= 760; }
+    catch { return window.innerWidth <= 760; }
+  }
+
+  function composerTextarea() {
+    return getMessageTextareas().find(textarea => !textarea.closest("div[id^='message-']")) || null;
+  }
+
+  function normalizeMobileSendWrapper() {
+    if (!mobileLayoutActive()) return;
+    const textarea = composerTextarea();
+    if (!textarea) return;
+
+    const scope = textarea.closest("form") || textarea.parentElement?.parentElement?.parentElement || textarea.parentElement;
+    const buttons = [...(scope?.querySelectorAll?.("button") || [])];
+    const send = buttons.find(button => {
+      const label = String(button.getAttribute("aria-label") || button.title || "").toLowerCase();
+      return button.type === "submit" || label.includes("send");
+    });
+    if (!send) return;
+
+    DS.setClassState?.(send, "ds-mobile-chat-send-button", true);
+    const wrapper = send.parentElement;
+    if (wrapper && wrapper !== scope) DS.setClassState?.(wrapper, "ds-mobile-chat-send-wrapper", true);
+  }
+
+  function scheduleMobileSendWrapperNormalize() {
+    cancelAnimationFrame(state.mobileNormalizeRaf);
+    state.mobileNormalizeRaf = requestAnimationFrame(normalizeMobileSendWrapper);
+  }
+
+  function installMobileChatLayoutFixes() {
+    if (!mobileLayoutActive() || state.mobileListenersInstalled) return;
+    state.mobileListenersInstalled = true;
+
+    // Leave SpicyChat's message-edit textarea height alone. In Android/WebView
+    // the visual viewport changes when the keyboard opens, and QoL's previous
+    // inline auto-resize could collapse long edited messages into a tiny
+    // scrollable line.
+    state.mobileObserver = new MutationObserver(() => scheduleMobileSendWrapperNormalize());
+    state.mobileObserver.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+
+    window.addEventListener("resize", scheduleMobileSendWrapperNormalize, { passive: true });
+  }
+
+  DS.applyMobileChatLayoutFixes = function applyMobileChatLayoutFixes() {
+    if (!enabled() || !mobileLayoutActive()) return;
+    installMobileChatLayoutFixes();
+    normalizeMobileSendWrapper();
+  };
 
   // Kept as no-ops so older helpers cannot accidentally re-enable the removed
   // automatic chat-following behaviour.

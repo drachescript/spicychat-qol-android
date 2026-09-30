@@ -15,6 +15,8 @@ $Project = Join-Path $Root "android_app"
 
 $OutputDir = Join-Path $Root "output"
 
+$DevBuildDir = "D:\Documents\extentions\spicychat-qol\dev_build"
+
 $FlutterApk = Join-Path $Project "build\app\outputs\flutter-apk\app-release.apk"
 
 $Keystore = Join-Path $Project "android\upload-keystore.jks"
@@ -216,6 +218,32 @@ function Remove-DirectoryWithRetry {
 
 }
 
+
+
+function Publish-DevBuildApk {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceApk,
+        [Parameter(Mandatory = $true)][string]$FileName
+    )
+
+    New-Item -ItemType Directory -Path $DevBuildDir -Force | Out-Null
+
+    # Keep dev_build simple: exactly one APK. Remove any older APK first.
+    Get-ChildItem -LiteralPath $DevBuildDir -Filter "*.apk" -File -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Write-Host "Deleting old dev APK: $($_.FullName)" -ForegroundColor DarkGray
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+        }
+
+    $Destination = Join-Path $DevBuildDir $FileName
+    Copy-Item -LiteralPath $SourceApk -Destination $Destination -Force
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        Fail "APK build succeeded, but the dev copy was not created: $Destination"
+    }
+
+    return $Destination
+}
 
 
 function Assert-AndroidPackageSource {
@@ -689,6 +717,12 @@ try {
 
 
 
+    $DevBuildApk = Publish-DevBuildApk `
+        -SourceApk $VersionedApk `
+        -FileName $ApkFileName
+
+
+
     $BuildSucceeded = $true
 
 
@@ -704,6 +738,8 @@ try {
     Write-Host "APK: $VersionedApk"
 
     Write-Host "Latest copy: $LatestApk"
+
+    Write-Host "Dev build copy: $DevBuildApk" -ForegroundColor Green
 
     Write-Host "SHA-256: $Hash"
 

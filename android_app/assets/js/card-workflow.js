@@ -253,6 +253,79 @@
     return button;
   }
 
+  async function directLessLikeCard(card, snapshot) {
+    if (!snapshot?.id) return false;
+    const diagToken = DS.diagOperationStart?.("card-workflow", "direct-less-like-this", { botId: snapshot.id });
+    const finishDiag = (outcome, errors = 0) => DS.diagOperationEnd?.(diagToken, {
+      outcome,
+      counts: { scanned: 1, changed: outcome === "ok" ? 1 : 0, skipped: outcome === "ok" ? 0 : 1, errors },
+      extra: { botId: snapshot.id, trigger: "qol", executor: "direct-recombee-api" }
+    });
+    DS.setQuickStatus?.(`Updating recommendations for ${snapshot.name || snapshot.id}…`, true);
+    let response = null;
+    try {
+      response = await chrome.runtime.sendMessage({
+        type: "DS_QUICK_LESS_LIKE_BOT",
+        botId: snapshot.id,
+        botName: snapshot.name || ""
+      });
+    } catch (error) {
+      DS.setQuickStatus?.(`Less Like This failed: ${clean(error?.message || error)}`);
+      finishDiag("worker-error", 1);
+      return false;
+    }
+    const status = clean(response?.rememberedStatus || response?.status || "failed");
+    if (response?.ok) {
+      DS.setQuickStatus?.(status === "already-handled"
+        ? `Recommendations were already updated for ${snapshot.name || snapshot.id}.`
+        : `Updated SpicyChat recommendations for ${snapshot.name || snapshot.id}.`);
+      finishDiag("ok", 0);
+      if (card?.isConnected) {
+        card.style.display = "none";
+        card.dataset.dsLessLiked = "1";
+      }
+      return true;
+    }
+    DS.setQuickStatus?.(status === "spicychat-tab-required"
+      ? "Open a SpicyChat tab first, then try Stop recommending again."
+      : `Less Like This failed for ${snapshot.name || snapshot.id}: ${status}.`);
+    finishDiag(status || "failed", 1);
+    return false;
+  }
+
+  async function quickDislikeCard(snapshot) {
+    if (!snapshot?.id) return false;
+    const diagToken = DS.diagOperationStart?.("card-workflow", "quick-dislike", { botId: snapshot.id });
+    const finishDiag = (outcome, errors = 0) => DS.diagOperationEnd?.(diagToken, {
+      outcome,
+      counts: { scanned: 1, changed: outcome === "ok" ? 1 : 0, skipped: outcome === "ok" ? 0 : 1, errors },
+      extra: { botId: snapshot.id, trigger: "qol", executor: "qol-quick-dislike-worker" }
+    });
+    DS.setQuickStatus?.(`Disliking ${snapshot.name || snapshot.id}…`, true);
+    let response = null;
+    try {
+      response = await chrome.runtime.sendMessage({
+        type: "DS_QUICK_DISLIKE_BOT",
+        botId: snapshot.id,
+        botName: snapshot.name || "",
+        chatUrl: snapshot.chatUrl || `${location.origin}/chat/${snapshot.id}`
+      });
+    } catch (error) {
+      DS.setQuickStatus?.(`Dislike failed: ${clean(error?.message || error)}`);
+      finishDiag("worker-error", 1);
+      return false;
+    }
+    const status = clean(response?.rememberedStatus || response?.status || "failed");
+    if (response?.ok) {
+      DS.setQuickStatus?.(status === "already-handled" ? `Dislike already handled for ${snapshot.name || snapshot.id}.` : `Dislike result for ${snapshot.name || snapshot.id}: ${status}.`);
+      finishDiag("ok", 0);
+      return true;
+    }
+    DS.setQuickStatus?.(`Dislike failed for ${snapshot.name || snapshot.id}: ${status}.`);
+    finishDiag(status || "failed", 1);
+    return false;
+  }
+
   function clearCardActions(card) {
     card?.querySelector?.(`.${ACTIONS_CLASS}`)?.remove();
     card?.classList?.remove("ds-card-density-target");
@@ -269,6 +342,8 @@
       settings.showCopyBotInfoButtons ||
       settings.enableBotComparison ||
       settings.showQuickNotInterestedButtons ||
+      settings.showQuickLessLikeButtons ||
+      settings.showQuickDislikeButtons ||
       (settings.showQuickUnblockButtons && snapshot.blocked)
     );
 
@@ -313,6 +388,18 @@
           { [DS.NOT_INTERESTED_KEY]: before },
           { [DS.NOT_INTERESTED_KEY]: JSON.parse(JSON.stringify(DS.state.notInterestedBots || {})) }
         );
+      }));
+    }
+
+    if (settings.showQuickLessLikeButtons) {
+      host.appendChild(makeActionButton("↓", `Stop recommending me this: ${snapshot.name}`, () => {
+        directLessLikeCard(card, snapshot).catch(() => DS.setQuickStatus?.("Could not update SpicyChat recommendations."));
+      }));
+    }
+
+    if (settings.showQuickDislikeButtons) {
+      host.appendChild(makeActionButton("👎", `Dislike: ${snapshot.name}`, () => {
+        quickDislikeCard(snapshot).catch(() => DS.setQuickStatus?.("Could not run Dislike."));
       }));
     }
 
@@ -703,6 +790,8 @@
       settings.showRecentlySeenButton ||
       settings.enableBotComparison ||
       settings.showQuickNotInterestedButtons ||
+      settings.showQuickLessLikeButtons ||
+      settings.showQuickDislikeButtons ||
       settings.showQuickUnblockButtons
     );
 

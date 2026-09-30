@@ -19,6 +19,7 @@ const CHAT_ORGANIZER_KEY = "chatOrganization";
 const CHARACTER_QOL_PROFILES_KEY = "characterQolProfiles";
 const BOT_AVAILABILITY_KEY = "botAvailability";
 const BOT_ARCHIVE_KEY = "botArchive";
+const BOT_UNAVAILABLE_RECOVERY_KEY = "botUnavailableRecoveryV1";
 const LOREBOOK_BACKUPS_KEY = "lorebookBackups";
 const SAVED_TEXT_SNIPPETS_KEY = "savedTextSnippets";
 const CONTEXT_KEEPER_DATA_KEY = "contextKeeperData";
@@ -47,9 +48,34 @@ const SOUNDSCAPE_AUDIO_KEY = "soundscapeAudioLibrary";
 const CHAT_BACKGROUNDS_KEY = "chatBackgroundMediaV1";
 const QUICK_DISLIKE_HISTORY_KEY = "quickDislikeHistoryV1";
 const QUICK_DISLIKE_BULK_STATE_KEY = "quickDislikeBulkStateV1";
+const QUICK_LESS_LIKE_HISTORY_KEY = "quickLessLikeHistoryV1";
+const QUICK_LESS_LIKE_BULK_STATE_KEY = "quickLessLikeBulkStateV1";
 const BULK_DISLIKE_FAILURE_PAUSE_THRESHOLD = 3;
 const BULK_DISLIKE_RETRY_LIMIT = 2;
 const BULK_DISLIKE_RETRY_BASE_MS = 1200;
+
+// Bulk Less Like stays strictly serial. These values are intentionally kept in
+// one place so pacing can be tuned from real Inspector captures without
+// scattering sleeps/cooldowns throughout the worker loop. The existing
+// blockedBulkDislikeDelayMs setting is used as the *starting* Less Like
+// interval; adaptive pacing then moves within the bounds below.
+const BULK_LESS_LIKE_PACING = Object.freeze({
+  minIntervalMs: 350,
+  maxIntervalMs: 5000,
+  successWindow: 25,
+  successStepDownMs: 50,
+  transientStepUpMs: 250,
+  serverErrorMultiplier: 1.5,
+  throttleMultiplier: 2,
+  retryLimit: 2,
+  retryBaseMs: 1500,
+  retryMaxMs: 30000,
+  checkpointEveryItems: 50,
+  checkpointEveryMs: 30000,
+  availabilityCheckpointEvery: 50,
+  uiUpdateEveryMs: 300,
+  latencyWindowSize: 31
+});
 const BULK_DISLIKE_TRANSIENT_STATUSES = new Set([
   "worker-timeout",
   "worker-tab-failed",
@@ -61,9 +87,47 @@ const BULK_DISLIKE_TRANSIENT_STATUSES = new Set([
   "worker-error",
   "failed"
 ]);
+const BULK_LESS_LIKE_TRANSIENT_STATUSES = new Set([
+  "worker-timeout",
+  "worker-tab-failed",
+  "worker-closed",
+  "navigation-timeout",
+  "card-not-found",
+  "menu-button-not-found",
+  "less-like-missing",
+  "submit-failed",
+  "submit-not-confirmed",
+  "direct-feedback-timeout",
+  "direct-feedback-unavailable",
+  "recombee-request-failed",
+  "recombee-rate-limited",
+  "recombee-server-error",
+  "recombee-network-error",
+  "recombee-token-not-found",
+  "bot-not-found",
+  "character-auth-not-ready",
+  "character-auth-rejected",
+  "character-api-timeout",
+  "character-api-network-failure",
+  "character-rate-limited",
+  "worker-error",
+  "failed"
+]);
 const TAB_CLEANUP_TOPICS_KEY = "tabCleanupTopics";
 const RECOVERY_SNAPSHOT_KEY = "dsRecoverySnapshotV1";
-const BACKUP_FORMAT_VERSION = 12;
+const BACKUP_FORMAT_VERSION = 13;
+
+const ARCHIVE_IMPORT_ENDPOINT_KEY = "dsArchiveImportEndpointV1";
+const ARCHIVE_IMPORT_TOKEN_KEY = "dsArchiveImportTokenV1";
+const ARCHIVE_UPLOAD_STATE_KEY = "dsBotStatusArchiveUploadStateV1";
+const ARCHIVE_CONTRIBUTION_ENABLED_KEY = "dsArchivePublicContributionEnabledV1";
+const ARCHIVE_CONTRIBUTION_INSTALL_ID_KEY = "dsArchivePublicContributionInstallIdV1";
+const ARCHIVE_CONTRIBUTION_STATE_KEY = "dsBotStatusArchiveSubmissionStateV1";
+const DEFAULT_ARCHIVE_IMPORT_ENDPOINT = "https://spicychat-archive-import.dragongraf.workers.dev/api/imports/bot-status";
+const DEFAULT_ARCHIVE_SUBMISSION_ENDPOINT = "https://spicychat-archive-import.dragongraf.workers.dev/api/submissions/bot-status";
+const ARCHIVE_UPLOAD_SOFT_MAX_BYTES = 60 * 1024 * 1024;
+const ARCHIVE_UPLOAD_CHUNK_SIZE = 1000;
+const BOT_STATUS_SCAN_SPEED_DELAYS = Object.freeze({ safe: 600, normal: 450, fast: 350 });
 
 const OPTIONS_PERFORMANCE = {
   bootStartedAt: typeof performance !== "undefined" ? performance.now() : 0,
@@ -387,6 +451,8 @@ const DEFAULT_SETTINGS = {
   showCardGreetingTokenInfo: false,
   showExactMessageCounts: false,
   showBotCreationDates: false,
+  expandBotNamesOnHover: false,
+  paginationTopJumpBox: false,
   cardTokenShowGreeting: true,
   cardTokenShowDescription: false,
   cardTokenShowPersonality: false,
@@ -396,6 +462,8 @@ const DEFAULT_SETTINGS = {
   botArchiveOnProfileVisit: false,
   botArchiveOnChatOpen: false,
   botArchiveRefreshHours: 24,
+  botStatusScanSpeed: "safe",
+  botStatusStaleDays: 7,
   botArchiveRememberSeenPublic: false,
   botBackupToolsEnabled: false,
   botArchiveOwnEditorBackups: true,
@@ -439,6 +507,8 @@ const DEFAULT_SETTINGS = {
   recentlySeenLimit: 100,
   enableBotComparison: false,
   showQuickNotInterestedButtons: false,
+  showQuickLessLikeButtons: false,
+  showQuickDislikeButtons: false,
   showQuickUnblockButtons: false,
 
   reduceAnimatedBotImages: false,
@@ -491,6 +561,7 @@ const DEFAULT_SETTINGS = {
   quickPanelMaxHeightPercent: 80,
   quickPanelAutoCollapseOverlap: false,
   quickPanelShowStatus: false,
+  quickPanelShowLoadedMessageCount: false,
   quickPanelStatusShowOpened: false,
   quickPanelStatusShowBlocked: false,
   popupShowOpenedCount: false,
@@ -509,7 +580,7 @@ const DEFAULT_SETTINGS = {
   quickPanelShowAutoAsterisk: false,
   quickPanelShowTranslation: false,
   quickPanelShowPersona: false,
-  quickPanelShowExport: false,
+  quickPanelShowExport: true,
   quickPanelShowSoundscapes: false,
   quickPanelCustomX: 12,
   quickPanelCustomY: 12,
@@ -544,6 +615,7 @@ const DEFAULT_SETTINGS = {
 
   showChatExportButton: false,
   chatExportLoadPreviousMessages: false,
+  chatExportHistoryMode: "api",
   chatExportIncludeBotInfo: false,
   chatExportIncludeOocDirectives: false,
   chatExportIncludeGenerationDetails: true,
@@ -628,6 +700,12 @@ const DEFAULT_SETTINGS = {
   chatBubbleAiActionText: "#79c8f5",
   chatBubbleAiDialogueMode: "base",
   chatBubbleAiDialogueText: "#f2f2f2",
+  chatBubbleAiFont: "inherit",
+  chatBubbleAiActionFont: "inherit",
+  chatBubbleAiDialogueFont: "inherit",
+  chatBubbleAiFont: "inherit",
+  chatBubbleAiActionFont: "inherit",
+  chatBubbleAiDialogueFont: "inherit",
   chatBubbleAiBorder: "#555861",
   chatBubbleAiBorderWidth: 0,
   chatBubbleAiBorderStyle: "solid",
@@ -646,6 +724,12 @@ const DEFAULT_SETTINGS = {
   chatBubbleUserActionText: "#79c8f5",
   chatBubbleUserDialogueMode: "base",
   chatBubbleUserDialogueText: "#f5f5f5",
+  chatBubbleUserFont: "inherit",
+  chatBubbleUserActionFont: "inherit",
+  chatBubbleUserDialogueFont: "inherit",
+  chatBubbleUserFont: "inherit",
+  chatBubbleUserActionFont: "inherit",
+  chatBubbleUserDialogueFont: "inherit",
   chatBubbleUserBorder: "#52718a",
   chatBubbleUserBorderWidth: 0,
   chatBubbleUserBorderStyle: "solid",
@@ -661,6 +745,7 @@ const DEFAULT_SETTINGS = {
   hideChatVoiceButton: false,
   hideUnlockCustomVoices: false,
 
+  stackChatMessages: false,
   showMessageQuickActions: false,
   messageQuickActionCopy: false,
   messageQuickActionEdit: false,
@@ -683,6 +768,7 @@ const DEFAULT_SETTINGS = {
   scrollTopLoadPreviousTiming: "before",
   protectDraftDuringMessageRemoval: false,
   failedMessageHelper: false,
+  autoRetryFailedMessageSends: false,
   chatPerformanceMode: false,
   runtimePerformanceMode: "adaptive",
   desktopAppPerformanceGuard: true,
@@ -716,6 +802,8 @@ const DEFAULT_SETTINGS = {
   androidTopBarPersona: true,
   androidTopBarModel: true,
 
+  showQolSidebarButton: false,
+  qolSidebarButtonPlacement: "after-sai",
   hideSidebarLogo: false,
   hideSidebarHome: false,
   hideSidebarChats: false,
@@ -781,8 +869,11 @@ let recentlySeenBotState = { entries: [] };
 let botOrganizationState = { meta: {} };
 let botAvailabilityState = { meta: {} };
 let botArchiveState = { meta: {} };
+let botUnavailableRecoveryState = { version: 1, meta: {} };
 let botAvailabilityScanRunning = false;
 let botAvailabilityStopRequested = false;
+let botStatusMetadataDirty = false;
+let botStatusStorageSelfWriteUntil = 0;
 let blockedBotNameRepairRunning = false;
 let blockedBotNameRepairStopRequested = false;
 let blockedBulkDislikeRunning = false;
@@ -790,6 +881,11 @@ let blockedBulkDislikeStopRequested = false;
 let activeBlockedBulkDislikeRunId = "";
 let quickDislikeHistoryState = { version: 1, bots: {} };
 let quickDislikeBulkState = { version: 1, status: "idle", pendingIds: [], failedIds: [], startedAt: 0, updatedAt: 0, currentId: "", lastMode: "remaining" };
+let blockedBulkLessLikeRunning = false;
+let blockedBulkLessLikeStopRequested = false;
+let activeBlockedBulkLessLikeRunId = "";
+let quickLessLikeHistoryState = { version: 1, bots: {} };
+let quickLessLikeBulkState = { version: 2, status: "idle", pendingIds: [], failedIds: [], failureMeta: {}, startedAt: 0, updatedAt: 0, currentId: "", lastMode: "remaining", totalBots: 0, nextQueuePosition: 0, attempted: 0, succeeded: 0, failedCount: 0, retried: 0, skipped: 0, pacing: {} };
 let chatBackgroundMediaState = { global: null, chats: {} };
 
 let soundscapeSceneState = { version: 1, activeId: "", scenes: [] };
@@ -816,7 +912,7 @@ let blockingDataLoadPromise = null;
 let savedListsDataLoadPromise = null;
 let loadedSettingsSnapshot = { ...DEFAULT_SETTINGS };
 
-const BLOCKING_DATA_KEYS = [BLOCKED_BOTS_KEY, NOT_INTERESTED_KEY, QUICK_DISLIKE_HISTORY_KEY, QUICK_DISLIKE_BULK_STATE_KEY];
+const BLOCKING_DATA_KEYS = [BLOCKED_BOTS_KEY, NOT_INTERESTED_KEY, QUICK_DISLIKE_HISTORY_KEY, QUICK_DISLIKE_BULK_STATE_KEY, QUICK_LESS_LIKE_HISTORY_KEY, QUICK_LESS_LIKE_BULK_STATE_KEY];
 const SAVED_LIST_DATA_KEYS = [
   OPENED_KEY,
   OPENED_META_KEY,
@@ -828,7 +924,8 @@ const SAVED_LIST_DATA_KEYS = [
   RECENTLY_SEEN_BOTS_KEY,
   BOT_ORGANIZER_KEY,
   BOT_AVAILABILITY_KEY,
-  BOT_ARCHIVE_KEY
+  BOT_ARCHIVE_KEY,
+  BOT_UNAVAILABLE_RECOVERY_KEY
 ];
 
 function nextUiFrame() {
@@ -1411,6 +1508,20 @@ function runtimeMessage(message) {
   });
 }
 
+function runtimeMessageWithTimeout(message, timeoutMs = 15000) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish({ __dsTimeout: true }), Math.max(500, Number(timeoutMs) || 15000));
+    runtimeMessage(message).then(finish).catch(() => finish(null));
+  });
+}
+
 
 const DEEPL_ORIGINS = ["https://api-free.deepl.com/*", "https://api.deepl.com/*"];
 
@@ -1516,6 +1627,9 @@ const FEATURE_CHANGE_MARKERS = {
   enableFocusMode: { version: "0.1.8.87", label: "New" },
   enableChatBackgrounds: { version: "0.1.9.54", label: "New" },
   enableChatBubbleCustomization: { version: "0.1.9.88", label: "Updated" },
+  stackChatMessages: { version: "0.2.22", label: "Updated" },
+  expandLongCardDescriptions: { version: "0.2.22", label: "Updated" },
+  enablePersonaOrganizer: { version: "0.2.22", label: "Updated" },
   persistSpicyChatUserAppearance: { version: "0.1.9.88", label: "New" },
   androidTopBarMenu: { version: "0.1.8.84", label: "New" },
   performanceDiagnostics: { version: "0.1.8.84", label: "New" },
@@ -1536,6 +1650,8 @@ const FEATURE_CHANGE_MARKERS = {
   showCardGreetingTokenInfo: { version: "0.1.8.97", label: "Updated" },
   showExactMessageCounts: { version: "0.1.9.112", label: "New" },
   showBotCreationDates: { version: "0.2.14", label: "New" },
+  expandBotNamesOnHover: { version: "0.2.17", label: "New" },
+  paginationTopJumpBox: { version: "0.2.17", label: "New" },
   cardTokenShowGreeting: { version: "0.1.8.97", label: "New" },
   cardTokenShowPersonality: { version: "0.1.8.97", label: "New" },
   cardTokenShowScenario: { version: "0.1.8.97", label: "New" },
@@ -1597,7 +1713,7 @@ const FEATURE_CHANGE_MARKERS = {
   bulkCardBlockingSidebarLauncher: { version: "0.1.9.109", label: "New" },
   quickDislikeOnBlock: { version: "0.1.9.119", label: "Updated" },
   quickDislikeIdleMinutes: { version: "0.1.9.86", label: "New" },
-  blockedBulkDislikeDelayMs: { version: "0.1.9.92", label: "Updated" },
+  blockedBulkDislikeDelayMs: { version: "0.2.23", label: "Updated" },
   autoFillListings: { version: "0.1.9.62", label: "Updated" },
   showListingFilterStats: { version: "0.2.14", label: "New" },
   showListingFilterStatsDetails: { version: "0.2.14", label: "New" },
@@ -1671,7 +1787,7 @@ const CARD_CHANGE_MARKERS = [
   { selector: "#characterQolProfilesCard h2", version: "0.1.8.88", label: "New" },
   { selector: "#savedSnippetsCard h2", version: "0.1.8.89", label: "New" },
   { selector: "#contextKeeperCard h2", version: "0.1.9.34", label: "Updated" },
-  { selector: "#botAvailabilityCard h2", version: "0.1.9.89", label: "Updated" },
+  { selector: "#botAvailabilityCard h2", version: "0.2.21", label: "Updated" },
   { selector: "#cardWorkflowCard h2", version: "0.1.9.34", label: "Updated" },
   { selector: "#diagnosticsCard h2", version: "0.1.9.120", label: "Updated" },
   { selector: "#simpleFeatureGuideCard h2", version: "0.1.9.105", label: "New" },
@@ -1817,6 +1933,8 @@ const OPTIONAL_FEATURE_KEYS = [
   "showRecentlySeenButton",
   "enableBotComparison",
   "showQuickNotInterestedButtons",
+  "showQuickLessLikeButtons",
+  "showQuickDislikeButtons",
   "showQuickUnblockButtons",
   "reduceAnimatedBotImages",
   "animatedImagesListings",
@@ -1909,6 +2027,7 @@ const OPTIONAL_FEATURE_KEYS = [
   "botArchiveOnChatOpen",
   "protectDraftDuringMessageRemoval",
   "failedMessageHelper",
+  "autoRetryFailedMessageSends",
   "chatPerformanceMode",
   "desktopAppPerformanceGuard",
   "pauseQolInHiddenTabs",
@@ -1916,6 +2035,7 @@ const OPTIONAL_FEATURE_KEYS = [
   "enableLocalChangeHistory",
   "showUpdateNotifications",
   "androidTopBarMenu",
+  "showQolSidebarButton",
   "hideSidebarLogo",
   "hideSidebarHome",
   "hideSidebarChats",
@@ -4095,6 +4215,8 @@ function resetHeavySavedDataState() {
   notInterestedState = { ids: [], meta: {} };
   quickDislikeHistoryState = { version: 1, bots: {} };
   quickDislikeBulkState = { version: 1, status: "idle", pendingIds: [], failedIds: [], startedAt: 0, updatedAt: 0, currentId: "", lastMode: "remaining" };
+  quickLessLikeHistoryState = { version: 1, bots: {} };
+  quickLessLikeBulkState = { version: 2, status: "idle", pendingIds: [], failedIds: [], failureMeta: {}, startedAt: 0, updatedAt: 0, currentId: "", lastMode: "remaining", totalBots: 0, nextQueuePosition: 0, attempted: 0, succeeded: 0, failedCount: 0, retried: 0, skipped: 0, pacing: {} };
   currentOpened = [];
   openedChatMetaState = {};
   favoriteCreatorState = { handles: [], meta: {} };
@@ -4107,6 +4229,135 @@ function resetHeavySavedDataState() {
   botOrganizationState = { meta: {} };
   botAvailabilityState = { meta: {} };
   botArchiveState = { meta: {} };
+}
+
+
+function validBotId(value) {
+  return BOT_ID_RE.test(String(value || "").trim());
+}
+
+function filterMetaToValidBotIds(metaValue) {
+  const source = metaValue && typeof metaValue === "object" ? metaValue : {};
+  const out = {};
+  for (const [id, value] of Object.entries(source)) {
+    if (validBotId(id)) out[id] = value;
+  }
+  return out;
+}
+
+function filterBulkStateIds(stateValue, normalizeFn) {
+  const state = normalizeFn(stateValue);
+  state.pendingIds = state.pendingIds.filter(validBotId);
+  state.failedIds = state.failedIds.filter(validBotId);
+  if (state.failureMeta && typeof state.failureMeta === "object") {
+    state.failureMeta = Object.fromEntries(Object.entries(state.failureMeta).filter(([id]) => validBotId(id)));
+  }
+  if (!validBotId(state.currentId)) state.currentId = "";
+  return state;
+}
+
+async function cleanupMalformedBlockingRecords(settings = {}) {
+  let changed = false;
+  const cleanStore = storeValue => {
+    const store = normalizeBotStore(storeValue);
+    const ids = store.ids.filter(validBotId);
+    const meta = filterMetaToValidBotIds(store.meta);
+    if (ids.length !== store.ids.length || Object.keys(meta).length !== Object.keys(store.meta || {}).length || (store.names || []).length) changed = true;
+    return { ids, names: [], meta };
+  };
+  blockedState = cleanStore(blockedState);
+  notInterestedState = cleanStore(notInterestedState);
+
+  const cleanHistory = (value, normalizeFn) => {
+    const state = normalizeFn(value);
+    const bots = filterMetaToValidBotIds(state.bots);
+    if (Object.keys(bots).length !== Object.keys(state.bots || {}).length) changed = true;
+    return { ...state, bots };
+  };
+  quickDislikeHistoryState = cleanHistory(quickDislikeHistoryState, normalizeQuickDislikeHistory);
+  quickLessLikeHistoryState = cleanHistory(quickLessLikeHistoryState, normalizeQuickLessLikeHistory);
+  const dislikeBulk = filterBulkStateIds(quickDislikeBulkState, normalizeQuickDislikeBulkState);
+  const lessLikeBulk = filterBulkStateIds(quickLessLikeBulkState, normalizeQuickLessLikeBulkState);
+  if (JSON.stringify(dislikeBulk) !== JSON.stringify(quickDislikeBulkState)) changed = true;
+  if (JSON.stringify(lessLikeBulk) !== JSON.stringify(quickLessLikeBulkState)) changed = true;
+  quickDislikeBulkState = dislikeBulk;
+  quickLessLikeBulkState = lessLikeBulk;
+
+  const savedBlockedIds = uniqueClean(settings.blockedBotIds || []).filter(validBotId);
+  if (savedBlockedIds.length !== uniqueClean(settings.blockedBotIds || []).length || uniqueClean(settings.blockedBotNames || []).length) changed = true;
+  settings.blockedBotIds = savedBlockedIds;
+  settings.blockedBotNames = [];
+  if (!changed) return false;
+  await storageSet({
+    settings,
+    [BLOCKED_BOTS_KEY]: blockedState,
+    [NOT_INTERESTED_KEY]: notInterestedState,
+    [QUICK_DISLIKE_HISTORY_KEY]: quickDislikeHistoryState,
+    [QUICK_DISLIKE_BULK_STATE_KEY]: quickDislikeBulkState,
+    [QUICK_LESS_LIKE_HISTORY_KEY]: quickLessLikeHistoryState,
+    [QUICK_LESS_LIKE_BULK_STATE_KEY]: quickLessLikeBulkState
+  });
+  return true;
+}
+
+async function cleanupMalformedSavedBotRecords() {
+  let changed = false;
+  const cleanBotStore = storeValue => {
+    const store = normalizeBotStore(storeValue);
+    const ids = store.ids.filter(validBotId);
+    const meta = filterMetaToValidBotIds(store.meta);
+    if (ids.length !== store.ids.length || Object.keys(meta).length !== Object.keys(store.meta || {}).length || (store.names || []).length) changed = true;
+    return { ids, names: [], meta };
+  };
+
+  const openedBefore = uniqueClean(currentOpened);
+  currentOpened = openedBefore.filter(validBotId);
+  if (currentOpened.length !== openedBefore.length) changed = true;
+  const oldOpenedMetaCount = Object.keys(openedChatMetaState || {}).length;
+  openedChatMetaState = filterMetaToValidBotIds(openedChatMetaState);
+  if (oldOpenedMetaCount !== Object.keys(openedChatMetaState).length) changed = true;
+  favoriteBotState = cleanBotStore(favoriteBotState);
+  laterBotState = cleanBotStore(laterBotState);
+
+  const recentBefore = normalizeRecentlySeenStore(recentlySeenBotState).entries;
+  const recent = recentBefore.filter(item => validBotId(item.id));
+  if (recent.length !== recentBefore.length) changed = true;
+  recentlySeenBotState = { entries: recent };
+
+  const org = normalizeBotOrganization(botOrganizationState);
+  const orgMeta = filterMetaToValidBotIds(org.meta);
+  if (Object.keys(orgMeta).length !== Object.keys(org.meta || {}).length) changed = true;
+  botOrganizationState = { ...org, meta: orgMeta };
+
+  const availability = normalizeBotAvailability(botAvailabilityState);
+  const availabilityMeta = filterMetaToValidBotIds(availability.meta);
+  if (Object.keys(availabilityMeta).length !== Object.keys(availability.meta || {}).length) changed = true;
+  botAvailabilityState = { meta: availabilityMeta };
+
+  const watch = normalizeCreatorBotWatchState(creatorBotWatchState);
+  const recentWatch = watch.recent.filter(item => validBotId(item.id));
+  if (recentWatch.length !== watch.recent.length) changed = true;
+  for (const creator of Object.values(watch.creators || {})) {
+    const ids = uniqueClean(creator.seenIds || []).filter(validBotId);
+    if (ids.length !== uniqueClean(creator.seenIds || []).length) changed = true;
+    creator.seenIds = ids;
+  }
+  creatorBotWatchState = { ...watch, recent: recentWatch };
+
+  // Intentionally never remove BOT_ARCHIVE_KEY entries here: recovery copies
+  // are allowed to outlive the live bot and may be the only remaining copy.
+  if (!changed) return false;
+  await storageSet({
+    [OPENED_KEY]: currentOpened,
+    [OPENED_META_KEY]: openedChatMetaState,
+    [FAVORITE_BOTS_KEY]: favoriteBotState,
+    [LATER_BOTS_KEY]: laterBotState,
+    [RECENTLY_SEEN_BOTS_KEY]: recentlySeenBotState,
+    [BOT_ORGANIZER_KEY]: botOrganizationState,
+    [BOT_AVAILABILITY_KEY]: botAvailabilityState,
+    [CREATOR_BOT_WATCH_KEY]: creatorBotWatchState
+  });
+  return true;
 }
 
 async function ensureBlockingDataLoaded() {
@@ -4122,6 +4373,9 @@ async function ensureBlockingDataLoaded() {
     notInterestedState = normalizeBotStore(result[NOT_INTERESTED_KEY]);
     quickDislikeHistoryState = normalizeQuickDislikeHistory(result[QUICK_DISLIKE_HISTORY_KEY]);
     quickDislikeBulkState = normalizeQuickDislikeBulkState(result[QUICK_DISLIKE_BULK_STATE_KEY]);
+    quickLessLikeHistoryState = normalizeQuickLessLikeHistory(result[QUICK_LESS_LIKE_HISTORY_KEY]);
+    quickLessLikeBulkState = normalizeQuickLessLikeBulkState(result[QUICK_LESS_LIKE_BULK_STATE_KEY]);
+    await cleanupMalformedBlockingRecords(settings);
     blockingDataLoaded = true;
     return true;
   })().finally(() => {
@@ -4147,7 +4401,9 @@ async function ensureSavedListsDataLoaded() {
     botOrganizationState = normalizeBotOrganization(result[BOT_ORGANIZER_KEY]);
     botAvailabilityState = normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]);
     botArchiveState = normalizeBotArchive(result[BOT_ARCHIVE_KEY]);
+    botUnavailableRecoveryState = normalizeBotUnavailableRecovery(result[BOT_UNAVAILABLE_RECOVERY_KEY]);
     await ensureBlockingDataLoaded();
+    await cleanupMalformedSavedBotRecords();
     const blockedPriorityCleanup = enforceBlockedPriorityOverOpenedState({ markDirty: false });
     if (blockedPriorityCleanup.removed) {
       await storageSet({
@@ -4220,6 +4476,7 @@ async function renderHeavyManagersForTab(tabName) {
   }
 
   renderedHeavyTabs.add(tabName);
+  if (tabName === "saved") refreshArchiveTransferUi().catch(() => {});
 }
 
 function setActiveTab(tabName) {
@@ -4294,6 +4551,8 @@ function setSettingsSearchExpanded(expanded, { focus = false } = {}) {
 function setupSettingsSearch() {
   const SEARCH_ALIASES = {
     autoFillListings: "refill fill page listing autofill hidden cards",
+    paginationTopJumpBox: "page number jump go top chatbot listing pagination 20000",
+    expandBotNamesOnHover: "bot name title expander full name hover tap cut off",
     showListingRefillButton: "refill fill now manual listing",
     showListingFilterStats: "bot blocking filters blocked filtered bots result count stats results found listing statistics",
     showListingFilterStatsDetails: "bot blocking filters blocked filtered breakdown details language tags words creators listing statistics",
@@ -5127,6 +5386,49 @@ function mergeQuickDislikeHistories(current, incoming) {
   return { version: 1, bots };
 }
 
+function normalizeQuickLessLikeHistory(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const bots = source.bots && typeof source.bots === "object" ? source.bots : {};
+  const normalized = {};
+  Object.entries(bots).forEach(([id, value]) => {
+    const botId = String(id || "").trim();
+    const status = String(value?.status || "");
+    if (!botId || !["less-liked", "unavailable"].includes(status)) return;
+    normalized[botId] = {
+      status,
+      name: String(value?.name || "").slice(0, 160),
+      handledAt: Number(value?.handledAt || value?.at || 0) || 0,
+      stage: String(value?.stage || "").slice(0, 80),
+      reason: String(value?.reason || "").slice(0, 300),
+      httpStatus: Number(value?.httpStatus || 0) || 0
+    };
+  });
+  return { version: 1, bots: normalized };
+}
+
+function quickLessLikeHistoryEntry(id) {
+  const botId = String(id || "").trim();
+  return botId ? quickLessLikeHistoryState?.bots?.[botId] || null : null;
+}
+
+function quickLessLikeHistoryLabel(entry) {
+  if (!entry) return "";
+  if (entry.status === "less-liked") return "Stop recommending sent";
+  if (entry.status === "unavailable") return "Unavailable / deleted · skipped";
+  return "Handled";
+}
+
+function mergeQuickLessLikeHistories(current, incoming) {
+  const left = normalizeQuickLessLikeHistory(current);
+  const right = normalizeQuickLessLikeHistory(incoming);
+  const bots = { ...left.bots };
+  Object.entries(right.bots).forEach(([id, entry]) => {
+    const previous = bots[id];
+    if (!previous || Number(entry.handledAt || 0) >= Number(previous.handledAt || 0)) bots[id] = entry;
+  });
+  return { version: 1, bots };
+}
+
 function normalizeQuickDislikeBulkState(raw) {
   const source = raw && typeof raw === "object" ? raw : {};
   const status = ["idle", "running", "paused", "completed", "completed-with-failures", "interrupted"].includes(String(source.status || ""))
@@ -5146,6 +5448,73 @@ function normalizeQuickDislikeBulkState(raw) {
   };
 }
 
+function normalizeQuickLessLikeBulkState(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const status = ["idle", "running", "paused", "completed", "completed-with-failures", "interrupted"].includes(String(source.status || ""))
+    ? String(source.status)
+    : "idle";
+  const pacing = source.pacing && typeof source.pacing === "object" ? source.pacing : {};
+  return {
+    version: 2,
+    status,
+    pendingIds: uniqueClean(Array.isArray(source.pendingIds) ? source.pendingIds : []),
+    failedIds: uniqueClean(Array.isArray(source.failedIds) ? source.failedIds : []),
+    failureMeta: Object.fromEntries(Object.entries(source.failureMeta && typeof source.failureMeta === "object" ? source.failureMeta : {})
+      .filter(([id]) => validBotId(id))
+      .map(([id, value]) => [id, {
+        status: String(value?.status || "failed").slice(0, 80),
+        stage: String(value?.stage || "").slice(0, 80),
+        reason: String(value?.reason || value?.error || "").slice(0, 300),
+        httpStatus: Number(value?.httpStatus || 0) || 0,
+        tokenAttempts: Number(value?.tokenAttempts || 0) || 0,
+        networkAttempts: Number(value?.networkAttempts || 0) || 0,
+        availabilityNetworkAttempts: Number(value?.availabilityNetworkAttempts || 0) || 0,
+        availabilityConfirmed: !!value?.availabilityConfirmed,
+        tokenSource: String(value?.tokenSource || "").slice(0, 80),
+        requestSent: !!value?.requestSent,
+        retryable: !!value?.retryable,
+        retryAfterMs: Math.max(0, Number(value?.retryAfterMs || 0) || 0),
+        throttleSignal: String(value?.throttleSignal || "").slice(0, 40),
+        networkAmbiguous: !!value?.networkAmbiguous,
+        feedbackTabsTried: Number(value?.feedbackTabsTried || 0) || 0,
+        nativeSignedSamples: Number(value?.nativeSignedSamples || 0) || 0,
+        workerRecovered: !!value?.workerRecovered,
+        at: Number(value?.at || 0) || 0
+      }])),
+    startedAt: Number(source.startedAt || 0) || 0,
+    updatedAt: Number(source.updatedAt || 0) || 0,
+    currentId: String(source.currentId || "").trim(),
+    lastMode: ["remaining", "resume", "failed", "selected"].includes(String(source.lastMode || "")) ? String(source.lastMode) : "remaining",
+    runId: String(source.runId || "").slice(0, 120),
+    jobId: String(source.jobId || source.runId || "").slice(0, 120),
+    stopRequested: !!source.stopRequested,
+    totalBots: Math.max(0, Number(source.totalBots || 0) || 0),
+    nextQueuePosition: Math.max(0, Number(source.nextQueuePosition || 0) || 0),
+    attempted: Math.max(0, Number(source.attempted || 0) || 0),
+    succeeded: Math.max(0, Number(source.succeeded || 0) || 0),
+    failedCount: Math.max(0, Number(source.failedCount || 0) || 0),
+    retried: Math.max(0, Number(source.retried || 0) || 0),
+    skipped: Math.max(0, Number(source.skipped || 0) || 0),
+    pacing: {
+      intervalMs: Math.max(0, Number(pacing.intervalMs || 0) || 0),
+      successStreak: Math.max(0, Number(pacing.successStreak || 0) || 0),
+      backoffLevel: Math.max(0, Number(pacing.backoffLevel || 0) || 0),
+      state: String(pacing.state || "").slice(0, 80),
+      http429: Math.max(0, Number(pacing.http429 || 0) || 0),
+      http5xx: Math.max(0, Number(pacing.http5xx || 0) || 0),
+      recentMedianMs: Math.max(0, Number(pacing.recentMedianMs || 0) || 0)
+    }
+  };
+}
+
+async function persistQuickLessLikeBulkState(nextState) {
+  quickLessLikeBulkState = normalizeQuickLessLikeBulkState(nextState);
+  quickLessLikeBulkState.updatedAt = Date.now();
+  await storageSet({ [QUICK_LESS_LIKE_BULK_STATE_KEY]: quickLessLikeBulkState });
+  updateBlockedLessLikeResumeControls();
+  return quickLessLikeBulkState;
+}
+
 async function persistQuickDislikeBulkState(nextState) {
   quickDislikeBulkState = normalizeQuickDislikeBulkState(nextState);
   quickDislikeBulkState.updatedAt = Date.now();
@@ -5154,10 +5523,11 @@ async function persistQuickDislikeBulkState(nextState) {
   return quickDislikeBulkState;
 }
 
+const BOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BOT_AVAILABILITY_STATUSES = new Set(["available", "unavailable", "restricted", "unknown"]);
 const BOT_UPDATE_STATUSES = new Set(["current", "updated"]);
 const BOT_DUPLICATE_LEVELS = new Set(["exact", "likely", "possible"]);
-const BOT_SNAPSHOT_FIELDS = ["name", "title", "description", "greeting", "personality", "scenario", "tags", "visibility", "creator", "image"];
+const BOT_SNAPSHOT_FIELDS = ["name", "title", "description", "greeting", "personality", "scenario", "exampleDialogues", "tags", "visibility", "creator", "image"];
 const BOT_ARCHIVE_FIELDS = [
   "name", "title", "description", "greeting", "personality", "scenario",
   "exampleDialogues", "tags", "visibility", "creator", "image",
@@ -5199,6 +5569,7 @@ const BOT_SNAPSHOT_LABELS = {
   greeting: "Greeting",
   personality: "Personality",
   scenario: "Scenario",
+  exampleDialogues: "Example Dialogues",
   tags: "Tags",
   visibility: "Visibility",
   creator: "Creator",
@@ -5222,14 +5593,26 @@ function cleanBotSnapshotText(value, max = 6000) {
 function canonicalBotImage(value) {
   const text = cleanBotSnapshotText(value, 2000);
   if (!text) return "";
+  const cleanText = text.replace(/[?#].*$/, "");
+  const avatarPath = cleanText
+    .replace(/^https?:\/\/(?:www\.)?spicychat\.ai\/avatars\//i, "avatars/")
+    .replace(/^https?:\/\/cdn\.nd-api\.com\/avatars\//i, "avatars/")
+    .replace(/^\/+/, "");
+  if (/^avatars\//i.test(avatarPath)) {
+    return `https://cdn.nd-api.com/${avatarPath}`;
+  }
   try {
     const url = new URL(text, "https://spicychat.ai");
     url.search = "";
     url.hash = "";
     return url.href;
   } catch {
-    return text.replace(/[?#].*$/, "");
+    return cleanText;
   }
+}
+
+function canonicalBotCreator(value) {
+  return cleanBotSnapshotText(value, 500).replace(/^@+\s*/, "");
 }
 
 
@@ -5363,6 +5746,8 @@ function normalizeBotArchive(value) {
       creator: cleanBotArchiveText(raw.creator || fields.creator || "", 500),
       image: canonicalBotImage(raw.image || fields.image || ""),
       profileUrl: String(raw.profileUrl || `https://spicychat.ai/chatbot/${id}`).trim(),
+      chatUrls: uniqueClean([...(Array.isArray(raw.chatUrls) ? raw.chatUrls : []), raw.chatUrl || ""])
+        .map(value => String(value || "").trim()).filter(value => /^https:\/\/[^/]*spicychat\.ai\/chat\//i.test(value)).slice(0, 50),
       firstSavedAt: Number(raw.firstSavedAt) || Number(raw.savedAt) || Number(raw.capturedAt) || 0,
       lastSavedAt: Number(raw.lastSavedAt) || Number(raw.savedAt) || Number(raw.capturedAt) || 0,
       lastAvailableAt: Number(raw.lastAvailableAt) || Number(raw.lastSavedAt) || 0,
@@ -5394,6 +5779,7 @@ function mergeBotArchiveEntry(previousValue, incomingValue) {
     creator: incoming.creator || previous?.creator || fields.creator || "",
     image: incoming.image || previous?.image || fields.image || "",
     profileUrl: incoming.profileUrl || previous?.profileUrl || `https://spicychat.ai/chatbot/${id}`,
+    chatUrls: uniqueClean([...(previous?.chatUrls || []), ...(incoming.chatUrls || [])]).slice(0, 50),
     firstSavedAt: Number(previous?.firstSavedAt) || Number(incoming.firstSavedAt) || Date.now(),
     lastSavedAt: Number(incoming.lastSavedAt) || Date.now(),
     lastAvailableAt: Number(incoming.lastAvailableAt) || Date.now(),
@@ -5497,16 +5883,42 @@ function saveArchiveSnapshotForBot(idValue, snapshotValue, meta = {}) {
   if (!id || !snapshotValue || typeof snapshotValue !== "object") return false;
   const normalized = normalizeBotArchive({ meta: { [id]: { ...snapshotValue, id, ...meta } } }).meta[id];
   if (!normalized?.coverage?.length) return false;
-  botArchiveState = normalizeBotArchive(botArchiveState);
-  botArchiveState.meta[id] = mergeBotArchiveEntry(botArchiveState.meta[id], {
+  // Bulk Bot Status scans can add thousands of copies. Normalizing the entire
+  // archive before and after every single bot turns that into quadratic work.
+  // Existing state is normalized once when loaded / when the scan begins;
+  // only the one entry being changed needs normalization here.
+  if (!botArchiveState || typeof botArchiveState !== "object") botArchiveState = { meta: {} };
+  if (!botArchiveState.meta || typeof botArchiveState.meta !== "object") botArchiveState.meta = {};
+  const previous = botArchiveState.meta[id] || null;
+  const incoming = {
     ...normalized,
     id,
     profileUrl: meta.profileUrl || normalized.profileUrl || `https://spicychat.ai/chatbot/${id}`,
-    lastSavedAt: Date.now(),
-    lastAvailableAt: Date.now(),
     source: meta.source || normalized.source || "Bot Status Center"
+  };
+  const comparable = value => {
+    const entry = value && typeof value === "object" ? value : {};
+    const fields = entry.fields && typeof entry.fields === "object" ? entry.fields : {};
+    return JSON.stringify({
+      name: cleanBotArchiveText(entry.name || fields.name || "", 500),
+      creator: canonicalBotCreator(entry.creator || fields.creator || ""),
+      image: canonicalBotImage(entry.image || fields.image || ""),
+      profileUrl: String(entry.profileUrl || ""),
+      source: String(entry.source || ""),
+      coverage: [...(entry.coverage || [])].sort(),
+      fields: Object.fromEntries(BOT_ARCHIVE_FIELDS.map(field => [field, field === "image" ? canonicalBotImage(fields[field]) : field === "creator" ? canonicalBotCreator(fields[field]) : cleanBotArchiveText(fields[field] || "", field === "personality" || field === "exampleDialogues" ? 18000 : 12000)]))
+    });
+  };
+  if (previous && comparable(previous) === comparable(incoming)) {
+    // A fresh availability check should not make every unchanged saved copy
+    // look modified. Keep the content snapshot timestamps stable.
+    return false;
+  }
+  botArchiveState.meta[id] = mergeBotArchiveEntry(previous, {
+    ...incoming,
+    lastSavedAt: Date.now(),
+    lastAvailableAt: Date.now()
   });
-  botArchiveState = normalizeBotArchive(botArchiveState);
   return true;
 }
 
@@ -5517,7 +5929,9 @@ function normalizeBotSnapshot(value) {
   for (const field of BOT_SNAPSHOT_FIELDS) {
     normalized[field] = field === "image"
       ? canonicalBotImage(fields[field])
-      : cleanBotSnapshotText(fields[field]);
+      : field === "creator"
+        ? canonicalBotCreator(fields[field])
+        : cleanBotSnapshotText(fields[field]);
   }
   const coverage = BOT_SNAPSHOT_FIELDS.filter(field => normalized[field]);
   const strongText = [normalized.description, normalized.greeting, normalized.personality, normalized.scenario]
@@ -5540,11 +5954,18 @@ function normalizeBotChange(change) {
   if (!change || typeof change !== "object") return null;
   const field = BOT_SNAPSHOT_FIELDS.includes(String(change.field || "")) ? String(change.field) : "";
   if (!field) return null;
-  return {
-    field,
-    before: field === "image" ? canonicalBotImage(change.before) : cleanBotSnapshotText(change.before),
-    after: field === "image" ? canonicalBotImage(change.after) : cleanBotSnapshotText(change.after)
-  };
+  const normalizeValue = value => field === "image"
+    ? canonicalBotImage(value)
+    : field === "creator"
+      ? canonicalBotCreator(value)
+      : cleanBotSnapshotText(value);
+  const before = normalizeValue(change.before);
+  const after = normalizeValue(change.after);
+  const same = field === "creator"
+    ? before.localeCompare(after, undefined, { sensitivity: "base" }) === 0
+    : before === after;
+  if (same) return null;
+  return { field, before, after };
 }
 
 function normalizeBotAvailability(value) {
@@ -5558,7 +5979,7 @@ function normalizeBotAvailability(value) {
     const status = BOT_AVAILABILITY_STATUSES.has(String(raw.status || "").toLowerCase())
       ? String(raw.status).toLowerCase()
       : "unknown";
-    const updateStatus = BOT_UPDATE_STATUSES.has(String(raw.updateStatus || "").toLowerCase())
+    const rawUpdateStatus = BOT_UPDATE_STATUSES.has(String(raw.updateStatus || "").toLowerCase())
       ? String(raw.updateStatus).toLowerCase()
       : "current";
     const baseline = snapshotHasSignal(raw.baseline) ? normalizeBotSnapshot(raw.baseline) : null;
@@ -5566,12 +5987,13 @@ function normalizeBotAvailability(value) {
     const changedFields = Array.isArray(raw.changedFields)
       ? raw.changedFields.map(normalizeBotChange).filter(Boolean)
       : [];
+    const updateStatus = changedFields.length ? "updated" : (rawUpdateStatus === "updated" ? "current" : rawUpdateStatus);
 
     meta[id] = {
       id,
       name: String(raw.name || "").replace(/\s+/g, " ").trim(),
-      image: String(raw.image || "").trim(),
-      creator: String(raw.creator || "").replace(/\s+/g, " ").trim(),
+      image: canonicalBotImage(raw.image || snapshot?.fields?.image || baseline?.fields?.image || ""),
+      creator: canonicalBotCreator(raw.creator || snapshot?.fields?.creator || baseline?.fields?.creator || ""),
       profileUrl: String(raw.profileUrl || `https://spicychat.ai/chatbot/${id}`).trim(),
       chatUrl: String(raw.chatUrl || `https://spicychat.ai/chat/${id}`).trim(),
       sources: uniqueClean(Array.isArray(raw.sources) ? raw.sources : []),
@@ -5581,14 +6003,76 @@ function normalizeBotAvailability(value) {
       checkedAt: Number(raw.checkedAt) || 0,
       baseline,
       snapshot,
-      updateStatus: changedFields.length ? "updated" : updateStatus,
+      updateStatus,
       changedFields,
       updateDetectedAt: Number(raw.updateDetectedAt) || 0,
-      baselineAcceptedAt: Number(raw.baselineAcceptedAt) || 0
+      baselineAcceptedAt: Number(raw.baselineAcceptedAt) || 0,
+      unavailableEvidenceCount: Math.max(0, Number(raw.unavailableEvidenceCount) || 0),
+      unavailableCandidateAt: Number(raw.unavailableCandidateAt) || 0,
+      unavailableConfirmedAt: Number(raw.unavailableConfirmedAt) || 0,
+      unavailableEvidenceType: String(raw.unavailableEvidenceType || "").slice(0, 80),
+      recoverySources: uniqueClean(Array.isArray(raw.recoverySources) ? raw.recoverySources : []),
+      cleanupAppliedAt: Number(raw.cleanupAppliedAt) || 0,
+      recoveredAt: Number(raw.recoveredAt) || 0
     };
   }
 
   return { meta };
+}
+
+
+function normalizeBotUnavailableRecovery(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const rawMeta = source.meta && typeof source.meta === "object" && !Array.isArray(source.meta) ? source.meta : {};
+  const meta = {};
+  const recordObject = value => value && typeof value === "object" && !Array.isArray(value) ? value : null;
+
+  for (const [rawId, rawValue] of Object.entries(rawMeta)) {
+    const raw = rawValue && typeof rawValue === "object" && !Array.isArray(rawValue) ? rawValue : {};
+    const id = String(raw.id || rawId || "").trim();
+    if (!BOT_ID_RE.test(id)) continue;
+    const memberships = raw.memberships && typeof raw.memberships === "object" ? raw.memberships : {};
+    const records = raw.records && typeof raw.records === "object" ? raw.records : {};
+    meta[id] = {
+      id,
+      capturedAt: Number(raw.capturedAt) || 0,
+      recoveredAt: Number(raw.recoveredAt) || 0,
+      name: String(raw.name || "").replace(/\s+/g, " ").trim(),
+      creator: canonicalBotCreator(raw.creator || ""),
+      image: canonicalBotImage(raw.image || ""),
+      profileUrl: String(raw.profileUrl || `https://spicychat.ai/chatbot/${id}`).trim(),
+      sources: uniqueClean(Array.isArray(raw.sources) ? raw.sources : []),
+      archiveAvailable: !!raw.archiveAvailable,
+      memberships: {
+        blocked: !!memberships.blocked,
+        notInterested: !!memberships.notInterested,
+        favorite: !!memberships.favorite,
+        later: !!memberships.later,
+        opened: !!memberships.opened,
+        organizer: !!memberships.organizer,
+        recent: !!memberships.recent,
+        creatorWatch: !!memberships.creatorWatch
+      },
+      records: {
+        blocked: recordObject(records.blocked),
+        notInterested: recordObject(records.notInterested),
+        favorite: recordObject(records.favorite),
+        later: recordObject(records.later),
+        openedMeta: recordObject(records.openedMeta),
+        organizer: recordObject(records.organizer),
+        recent: recordObject(records.recent),
+        creatorWatch: recordObject(records.creatorWatch)
+      }
+    };
+  }
+
+  return { version: 1, meta };
+}
+
+function mergeBotUnavailableRecovery(current, incoming) {
+  const left = normalizeBotUnavailableRecovery(current);
+  const right = normalizeBotUnavailableRecovery(incoming);
+  return { version: 1, meta: { ...left.meta, ...right.meta } };
 }
 
 function mergeBotAvailability(current, incoming) {
@@ -5601,9 +6085,14 @@ function availabilitySourceLabel(source) {
   return ({
     favorite: "Favorites",
     later: "Later",
+    blocked: "Blocked",
+    notInterested: "Not Interested",
+    recent: "Recently Seen",
+    creatorWatch: "Followed creator detections",
     organizer: "Bot Organizer",
     opened: "Opened history",
-    archive: "Saved bot archive"
+    archive: "Saved bot archive",
+    recovery: "Unavailable recovery"
   })[source] || source;
 }
 
@@ -5613,7 +6102,7 @@ function collectTrackedAvailabilityBots(scope = "all") {
 
   const add = (idValue, raw = {}, source = "") => {
     const id = String(idValue || raw?.id || "").trim();
-    if (!id || !selected(source)) return;
+    if (!BOT_ID_RE.test(id) || !selected(source)) return;
     const previous = byId.get(id) || {
       id,
       name: "",
@@ -5642,6 +6131,20 @@ function collectTrackedAvailabilityBots(scope = "all") {
     const store = normalizeBotStore(laterBotState);
     store.ids.forEach(id => add(id, store.meta[id], "later"));
   }
+  if (selected("blocked")) {
+    const store = normalizeBotStore(blockedState);
+    store.ids.forEach(id => add(id, store.meta[id], "blocked"));
+  }
+  if (selected("notInterested")) {
+    const store = normalizeBotStore(notInterestedState);
+    store.ids.forEach(id => add(id, store.meta[id], "notInterested"));
+  }
+  if (selected("recent")) {
+    normalizeRecentlySeenStore(recentlySeenBotState).entries.forEach(item => add(item.id, item, "recent"));
+  }
+  if (selected("creatorWatch")) {
+    normalizeCreatorBotWatchState(creatorBotWatchState).recent.forEach(item => add(item.id, item, "creatorWatch"));
+  }
   if (selected("organizer")) {
     const store = normalizeBotOrganization(botOrganizationState);
     Object.entries(store.meta || {}).forEach(([id, meta]) => add(id, meta, "organizer"));
@@ -5658,6 +6161,19 @@ function collectTrackedAvailabilityBots(scope = "all") {
       image: meta.image || meta.fields?.image || "",
       profileUrl: meta.profileUrl || `https://spicychat.ai/chatbot/${id}`
     }, "archive"));
+  }
+  if (selected("recovery")) {
+    const recovery = normalizeBotUnavailableRecovery(botUnavailableRecoveryState);
+    Object.entries(recovery.meta || {}).forEach(([id, meta]) => {
+      if (Number(meta.recoveredAt || 0) > 0) return;
+      add(id, {
+        id,
+        name: meta.name || "",
+        creator: meta.creator || "",
+        image: meta.image || "",
+        profileUrl: meta.profileUrl || `https://spicychat.ai/chatbot/${id}`
+      }, "recovery");
+    });
   }
 
   return [...byId.values()].map(entry => ({
@@ -5899,9 +6415,10 @@ function extractBotArchiveSnapshot(html, id, entry = {}, stableSnapshot = null) 
     const stable = stableSnapshot ? normalizeBotSnapshot(stableSnapshot).fields : {};
     const fields = {};
     for (const field of BOT_ARCHIVE_FIELDS) fields[field] = visible[field] || "";
-    // The archive intentionally does not pull hidden definition text out of app JSON.
-    // Only harmless public metadata may fall back to the update-watch snapshot.
-    for (const field of ["name", "description", "tags", "visibility", "creator", "image"]) {
+    // Keep any field the signed-in user could actually retrieve during this
+    // successful check. This never invents or unlocks hidden/private data; it
+    // only backfills from the page/API snapshot that this same scan captured.
+    for (const field of BOT_ARCHIVE_FIELDS) {
       if (!fields[field]) fields[field] = stable[field] || "";
     }
     return {
@@ -5944,10 +6461,12 @@ function extractBotProfileSnapshot(html, id, entry = {}) {
 
     const fields = {
       name: objectName || visible.name || metaName || title || entry.name || "",
+      title: firstBotField(candidate, ["title", "subtitle", "headline"]) || visible.title || "",
       description: firstBotField(candidate, ["description", "shortDescription", "short_description", "summary"]) || visible.description || metaDescription || "",
       greeting: firstBotField(candidate, ["greeting", "firstMessage", "first_message", "openingMessage", "opening_message", "initialMessage"]) || visible.greeting || "",
       personality: firstBotField(candidate, ["personality", "definition", "characterDefinition", "character_definition"]) || visible.personality || "",
       scenario: firstBotField(candidate, ["scenario", "context", "setting"]) || visible.scenario || "",
+      exampleDialogues: firstBotField(candidate, ["exampleDialogues", "example_dialogues", "exampleDialogue", "example_dialogue", "mesExample", "mes_example", "examples"]) || visible.exampleDialogues || "",
       tags: firstBotField(candidate, ["tags", "tagNames", "tag_names", "categories"]) || visible.tags || "",
       visibility: firstBotField(candidate, ["visibility", "privacy", "publishStatus", "publish_status"]) || visible.visibility || "",
       creator: extractCreatorFromBotObject(candidate) || visible.creator || entry.creator || "",
@@ -5975,6 +6494,7 @@ function compareBotSnapshots(baselineValue, currentValue) {
     // Only call a field changed when both scans could actually read it. This avoids
     // treating a temporarily missing field as a creator edit.
     if (!before || !after || before === after) continue;
+    if (field === "creator" && before.localeCompare(after, undefined, { sensitivity: "base" }) === 0) continue;
     changes.push({ field, before, after });
   }
   return changes;
@@ -5991,6 +6511,53 @@ function reconcileBotUpdate(previousValue, checkedValue) {
   checked.changedFields = [];
   checked.updateDetectedAt = Number(previous?.updateDetectedAt) || 0;
   checked.baselineAcceptedAt = Number(previous?.baselineAcceptedAt) || 0;
+  checked.recoverySources = uniqueClean(previous?.recoverySources || []);
+  checked.cleanupAppliedAt = Number(previous?.cleanupAppliedAt) || 0;
+  checked.recoveredAt = Number(previous?.recoveredAt) || 0;
+
+  // SpicyChat can return HTTP 200 with an empty object for an unavailable ID.
+  // One empty result is only a candidate; require the same evidence on a later
+  // independent check before making the record eligible for destructive cleanup.
+  const candidate = checked.unavailableCandidate === true || String(checked.unavailableEvidenceType || "") === "api-empty-200";
+  if (candidate) {
+    const sameEvidence = String(previous?.unavailableEvidenceType || "") === "api-empty-200";
+    const priorCount = sameEvidence ? Math.max(0, Number(previous?.unavailableEvidenceCount) || 0) : 0;
+    const priorCheckedAt = Number(previous?.checkedAt) || 0;
+    const independent = !priorCheckedAt || Number(checked.checkedAt || 0) > priorCheckedAt;
+    const count = Math.min(99, priorCount + (independent ? 1 : 0));
+    checked.unavailableEvidenceType = "api-empty-200";
+    checked.unavailableEvidenceCount = count;
+    checked.unavailableCandidateAt = Number(previous?.unavailableCandidateAt) || Number(checked.checkedAt) || Date.now();
+    checked.unavailableConfirmedAt = Number(previous?.unavailableConfirmedAt) || 0;
+    if (count >= 2) {
+      checked.status = "unavailable";
+      checked.unavailableConfirmedAt = Number(checked.checkedAt) || Date.now();
+      checked.reason = `Confirmed unavailable after ${count} independent HTTP-200 empty-object checks.`;
+    } else {
+      checked.status = "unknown";
+      checked.reason = "Unavailable candidate: Character API returned HTTP 200 with an empty object. Recheck on a later scan before cleanup.";
+    }
+    return checked;
+  }
+
+  if (["available", "restricted"].includes(String(checked.status || ""))) {
+    checked.unavailableEvidenceCount = 0;
+    checked.unavailableCandidateAt = 0;
+    checked.unavailableConfirmedAt = 0;
+    checked.unavailableEvidenceType = "";
+  } else if (checked.status === "unavailable") {
+    checked.unavailableEvidenceCount = Math.max(2, Number(previous?.unavailableEvidenceCount) || 0);
+    checked.unavailableCandidateAt = Number(previous?.unavailableCandidateAt) || Number(checked.checkedAt) || Date.now();
+    checked.unavailableConfirmedAt = Number(checked.checkedAt) || Date.now();
+    checked.unavailableEvidenceType = String(checked.unavailableEvidenceType || previous?.unavailableEvidenceType || "explicit-unavailable");
+  } else if (previous?.unavailableEvidenceCount) {
+    // A transient/unknown check should not erase an earlier candidate, but it
+    // also does not advance the confirmation count.
+    checked.unavailableEvidenceCount = Number(previous.unavailableEvidenceCount) || 0;
+    checked.unavailableCandidateAt = Number(previous.unavailableCandidateAt) || 0;
+    checked.unavailableConfirmedAt = Number(previous.unavailableConfirmedAt) || 0;
+    checked.unavailableEvidenceType = String(previous.unavailableEvidenceType || "");
+  }
 
   if (checked.status !== "available" || !snapshot) return checked;
   if (!oldBaseline || !snapshotHasSignal(oldBaseline)) {
@@ -6008,7 +6575,68 @@ function reconcileBotUpdate(previousValue, checkedValue) {
   return checked;
 }
 
-async function checkBotAvailability(entry) {
+
+function mergeBotArchiveSnapshotData(baseValue, helperValue, id, entry = {}) {
+  const base = baseValue && typeof baseValue === "object" ? baseValue : null;
+  const helper = helperValue && typeof helperValue === "object" ? helperValue : null;
+  if (!base && !helper) return null;
+  const fields = {};
+  for (const field of BOT_ARCHIVE_FIELDS) {
+    fields[field] = cleanBotArchiveText(helper?.fields?.[field] || base?.fields?.[field] || "", field === "personality" || field === "exampleDialogues" ? 18000 : 12000);
+  }
+  return {
+    ...(base || {}),
+    ...(helper || {}),
+    id,
+    name: fields.name || helper?.name || base?.name || entry.name || id,
+    creator: fields.creator || helper?.creator || base?.creator || entry.creator || "",
+    image: fields.image || helper?.image || base?.image || entry.image || "",
+    profileUrl: `https://spicychat.ai/chatbot/${id}`,
+    source: helper ? "Bot Status Center character API" : (base?.source || "Bot Status Center character API"),
+    firstSavedAt: Number(base?.firstSavedAt || helper?.firstSavedAt) || Date.now(),
+    lastSavedAt: Date.now(),
+    lastAvailableAt: Date.now(),
+    fields
+  };
+}
+
+async function hydrateBotStatusWithHelper(id, entry = {}, { keepHelper = false, forceOwnHelper = false, timeoutMs = 17000 } = {}) {
+  if (!BOT_ID_RE.test(String(id || ""))) return null;
+  try {
+    const result = await runtimeMessageWithTimeout({
+      type: "DS_BOT_STATUS_HELPER_CHECK",
+      botId: id,
+      botName: String(entry?.name || "").slice(0, 160),
+      keepHelper: !!keepHelper,
+      forceOwnHelper: !!forceOwnHelper
+    }, timeoutMs);
+    if (result?.__dsTimeout) {
+      return { ok: false, status: "worker-timeout", httpStatus: 0, reason: "Bot Status worker did not answer this bot check in time." };
+    }
+    return result && typeof result === "object" ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+async function prepareBotStatusHelper({ forceOwnHelper = true, timeoutMs = 17000 } = {}) {
+  try {
+    const result = await runtimeMessageWithTimeout({
+      type: "DS_BOT_STATUS_HELPER_PREPARE",
+      forceOwnHelper: !!forceOwnHelper
+    }, timeoutMs);
+    if (result?.__dsTimeout) return { ok: false, ready: false, status: "worker-timeout" };
+    return result && typeof result === "object" ? result : { ok: false, ready: false, status: "worker-no-response" };
+  } catch {
+    return { ok: false, ready: false, status: "worker-error" };
+  }
+}
+
+async function releaseBotStatusHelper() {
+  try { await runtimeMessage({ type: "DS_BOT_STATUS_HELPER_RELEASE" }); } catch {}
+}
+
+async function checkBotAvailability(entry, options = {}) {
   const id = String(entry?.id || "").trim();
   const base = {
     id,
@@ -6023,11 +6651,70 @@ async function checkBotAvailability(entry) {
     snapshot: null
   };
 
-  if (!id) return { ...base, status: "unknown", reason: "Missing bot ID." };
+  if (!BOT_ID_RE.test(id)) return { ...base, status: "unknown", reason: "Missing or invalid bot ID." };
 
+  // Bot Status Center is API-first now. A loaded SpicyChat page provides the
+  // signed-in character API context, but it is never navigated to each bot.
+  // The background worker borrows an existing SpicyChat page when possible and
+  // only opens one persistent Home helper when no suitable page is available.
+  const helper = await hydrateBotStatusWithHelper(id, entry, {
+    keepHelper: !!options.keepHelper,
+    forceOwnHelper: !!options.forceOwnHelper,
+    timeoutMs: Number(options.timeoutMs || 17000)
+  });
+  const helperStatus = String(helper?.status || "");
+  const helperHttp = Number(helper?.httpStatus || 0);
+  base.httpStatus = helperHttp;
+
+  if (helperStatus === "api-empty") {
+    return {
+      ...base,
+      status: "unknown",
+      unavailableCandidate: true,
+      unavailableEvidenceType: "api-empty-200",
+      reason: helper?.reason || "Character API returned HTTP 200 with an empty object; a later independent recheck is required before cleanup."
+    };
+  }
+  if (helperStatus === "unavailable") {
+    return { ...base, status: "unavailable", unavailableEvidenceType: "explicit-unavailable", reason: helper?.reason || (helperHttp ? `Character API returned HTTP ${helperHttp}.` : "Character API confirmed the chatbot is unavailable/deleted.") };
+  }
+  if (helperStatus === "restricted") {
+    return { ...base, status: "restricted", reason: helper?.reason || (helperHttp ? `Character API returned HTTP ${helperHttp}.` : "Character API confirmed the chatbot is private/restricted.") };
+  }
+  if (helperStatus === "available" && helper?.archiveSnapshot) {
+    const archiveSnapshot = mergeBotArchiveSnapshotData(null, helper.archiveSnapshot, id, entry);
+    const helperFields = archiveSnapshot?.fields || {};
+    const snapshot = normalizeBotSnapshot({
+      capturedAt: Date.now(),
+      source: "character API",
+      fields: Object.fromEntries(BOT_SNAPSHOT_FIELDS.map(field => [field, helperFields[field] || ""]))
+    });
+    const liveName = cleanAuthoritativeBotName(helperFields.name || archiveSnapshot?.name || "", id);
+    return {
+      ...base,
+      name: liveName || base.name,
+      image: helperFields.image || archiveSnapshot?.image || base.image,
+      creator: helperFields.creator || archiveSnapshot?.creator || base.creator,
+      snapshot,
+      archiveSnapshot,
+      status: "available",
+      reason: `Character API confirmed this bot and returned ${archiveSnapshot?.coverage?.length || 0} accessible field${(archiveSnapshot?.coverage?.length || 0) === 1 ? "" : "s"}.`
+    };
+  }
+
+  if (options.bulkScan) {
+    return {
+      ...base,
+      status: "unknown",
+      reason: helper?.reason || "Character API did not return a confirmed result during the bulk scan."
+    };
+  }
+
+  // If the API context is unavailable, a plain profile request is only allowed
+  // to prove explicit deleted/private states. HTTP 200 or a generic React shell
+  // is never enough to call a bot Available.
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
-
+  const timeout = setTimeout(() => controller.abort(), 10000);
   try {
     const response = await fetch(base.profileUrl, {
       method: "GET",
@@ -6037,90 +6724,55 @@ async function checkBotAvailability(entry) {
       signal: controller.signal,
       headers: { Accept: "text/html,application/xhtml+xml" }
     });
-    base.httpStatus = Number(response.status) || 0;
-
+    base.httpStatus = helperHttp || Number(response.status) || 0;
     if (response.status === 404 || response.status === 410) {
       return { ...base, status: "unavailable", reason: `Profile returned HTTP ${response.status}.` };
     }
-    if (response.status === 401 || response.status === 403) {
-      return { ...base, status: "restricted", reason: `Profile returned HTTP ${response.status}.` };
+    if (response.status === 403) {
+      return { ...base, status: "restricted", reason: "Profile returned HTTP 403." };
     }
     if (response.status === 429) {
       return { ...base, status: "unknown", reason: "SpicyChat rate-limited the check (HTTP 429)." };
     }
     if (!response.ok) {
-      return { ...base, status: "unknown", reason: `Profile check returned HTTP ${response.status}.` };
+      return { ...base, status: "unknown", reason: helper?.reason || `Profile check returned HTTP ${response.status}.` };
     }
 
     const finalUrl = String(response.url || "");
     if (/\/(login|signin|sign-in|auth)(?:[/?#]|$)/i.test(finalUrl)) {
-      return { ...base, status: "restricted", reason: "Profile redirected to sign-in/authentication." };
+      return { ...base, status: "unknown", reason: "SpicyChat authentication was not ready for this check." };
     }
-
     const html = await response.text();
     const visible = botAvailabilityVisibleText(html);
-    const title = visible.title.toLowerCase();
-    const body = visible.body.toLowerCase();
-    const combined = `${title}\n${body}`;
-
+    const combined = `${visible.title}\n${visible.body}`.toLowerCase();
     const unavailablePhrases = [
-      "chatbot not found",
-      "character not found",
-      "this chatbot is unavailable",
-      "this character is unavailable",
-      "chatbot is unavailable",
-      "character is unavailable",
-      "this chatbot has been deleted",
-      "this character has been deleted",
-      "couldn't find this chatbot",
-      "could not find this chatbot",
-      "page does not exist",
-      "page doesn't exist"
+      "chatbot not found", "character not found", "this chatbot is unavailable", "this character is unavailable",
+      "chatbot is unavailable", "character is unavailable", "this chatbot has been deleted", "this character has been deleted",
+      "couldn't find this chatbot", "could not find this chatbot", "page does not exist", "page doesn't exist"
     ];
     const restrictedPhrases = [
-      "this chatbot is private",
-      "this character is private",
-      "private chatbot",
-      "private character",
-      "you do not have access",
-      "you don't have access",
-      "access denied",
-      "not available in your region",
-      "not available in your country"
+      "this chatbot is private", "this character is private", "private chatbot", "private character",
+      "you do not have access", "you don't have access", "access denied", "not available in your region", "not available in your country"
     ];
-
     const unavailablePhrase = unavailablePhrases.find(phrase => combined.includes(phrase));
-    if (unavailablePhrase || /(^|\s)404(?:\s|$)/.test(title)) {
+    if (unavailablePhrase || /(^|\s)404(?:\s|$)/.test(String(visible.title || "").toLowerCase())) {
       return { ...base, status: "unavailable", reason: unavailablePhrase ? `Page says “${unavailablePhrase}”.` : "Profile page title indicates 404/not found." };
     }
-
     const restrictedPhrase = restrictedPhrases.find(phrase => combined.includes(phrase));
-    if (restrictedPhrase) {
-      return { ...base, status: "restricted", reason: `Page says “${restrictedPhrase}”.` };
-    }
+    if (restrictedPhrase) return { ...base, status: "restricted", reason: `Page says “${restrictedPhrase}”.` };
 
-    const snapshot = extractBotProfileSnapshot(html, id, entry);
-    const archiveSnapshot = extractBotArchiveSnapshot(html, id, entry, snapshot);
-    const fields = snapshot.fields || {};
-    const archiveCoverage = archiveSnapshot
-      ? (normalizeBotArchive({ meta: { [id]: archiveSnapshot } }).meta[id]?.coverage?.length || 0)
-      : 0;
-    return {
-      ...base,
-      name: fields.name || base.name,
-      image: fields.image || base.image,
-      creator: fields.creator || base.creator,
-      snapshot,
-      archiveSnapshot,
-      status: "available",
-      reason: `Profile loaded. Update watch captured ${snapshot.coverage.length} stable field${snapshot.coverage.length === 1 ? "" : "s"}${archiveCoverage ? `; local archive captured ${archiveCoverage} accessible field${archiveCoverage === 1 ? "" : "s"}` : ""}.`
-    };
-  } catch (error) {
-    const aborted = error?.name === "AbortError";
     return {
       ...base,
       status: "unknown",
-      reason: aborted ? "Profile check timed out." : `Profile check failed: ${String(error?.message || error || "network error").slice(0, 180)}`
+      reason: helper?.reason || "Character API did not confirm live bot data. A generic HTTP-200 profile shell is not treated as proof that the bot exists."
+    };
+  } catch (error) {
+    return {
+      ...base,
+      status: "unknown",
+      reason: error?.name === "AbortError"
+        ? (helper?.reason || "Bot status check timed out.")
+        : (helper?.reason || `Bot status check failed: ${String(error?.message || error || "network error").slice(0, 180)}`)
     };
   } finally {
     clearTimeout(timeout);
@@ -6404,6 +7056,9 @@ function botArchiveReadableText(archiveValue) {
   if (fields.creator || archive.creator) lines.push(`Creator: ${fields.creator || archive.creator}`);
   if (archive.profileUrl) lines.push(`Profile: ${archive.profileUrl}`);
   if (archive.lastSavedAt) lines.push(`Saved locally: ${new Date(archive.lastSavedAt).toLocaleString()}`);
+  if (archive.chatUrls?.length) {
+    archive.chatUrls.forEach((url, index) => lines.push(`${archive.chatUrls.length > 1 ? `Old chat ${index + 1}` : "Old chat"}: ${url}`));
+  }
   lines.push("");
   for (const field of BOT_ARCHIVE_FIELDS) {
     if (field === "name" || field === "creator") continue;
@@ -6422,12 +7077,18 @@ function botArchiveDetails(entry) {
   const details = makeElement("details", { className: "bot-update-details bot-archive-details" });
   const count = archive.coverage?.length || 0;
   details.appendChild(makeElement("summary", { text: `View saved local copy (${count} field${count === 1 ? "" : "s"})` }));
-  const pre = makeElement("pre", { text: botArchiveReadableText(archive) });
-  pre.style.whiteSpace = "pre-wrap";
-  pre.style.overflowWrap = "anywhere";
-  pre.style.margin = ".35rem 0 0";
-  pre.style.font = "inherit";
-  details.appendChild(pre);
+  // Recovery copies can contain very large Greeting/Personality/Example fields.
+  // Keep that text out of the Options DOM until the user actually opens it.
+  details.addEventListener("toggle", () => {
+    if (!details.open || details.dataset.archiveLoaded === "1") return;
+    const pre = makeElement("pre", { text: botArchiveReadableText(archive) });
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.overflowWrap = "anywhere";
+    pre.style.margin = ".35rem 0 0";
+    pre.style.font = "inherit";
+    details.appendChild(pre);
+    details.dataset.archiveLoaded = "1";
+  });
   return details;
 }
 
@@ -6447,6 +7108,768 @@ function downloadJsonFile(payload, filename) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+
+const BOT_STATUS_ARCHIVE_EXPORT_SCHEMA = "spicychat-qol-bot-status-archive-export";
+const BOT_STATUS_ARCHIVE_EXPORT_VERSION = 1;
+const BOT_STATUS_ARCHIVE_PUBLIC_SOURCE_RE = /(?:bot status|profile visit|spicychat public profile|character api|character-api|tracked metadata)/i;
+const BOT_STATUS_ARCHIVE_PRIVATE_SOURCE_RE = /(?:manual|editor|draft|creator backup|own[- ]?bot backup)/i;
+
+function botStatusArchiveExportSourceAllowed(entry) {
+  const source = String(entry?.source || "").trim();
+  if (!source || BOT_STATUS_ARCHIVE_PRIVATE_SOURCE_RE.test(source)) return false;
+  return BOT_STATUS_ARCHIVE_PUBLIC_SOURCE_RE.test(source);
+}
+
+function botStatusArchiveExportTags(value) {
+  const raw = Array.isArray(value) ? value : String(value || "").split(/\s*,\s*|\n+/g);
+  return uniqueClean(raw.map(tag => cleanBotArchiveText(tag, 120)).filter(Boolean)).slice(0, 100);
+}
+
+function botStatusArchiveExportFields(entryValue) {
+  const entry = entryValue && typeof entryValue === "object" ? entryValue : {};
+  const fields = entry.fields && typeof entry.fields === "object" ? entry.fields : {};
+  return {
+    name: cleanBotArchiveText(fields.name || entry.name || "", 500),
+    title: cleanBotArchiveText(fields.title || "", 12000),
+    description: cleanBotArchiveText(fields.description || "", 12000),
+    greeting: cleanBotArchiveText(fields.greeting || "", 12000),
+    personality: cleanBotArchiveText(fields.personality || "", 18000),
+    scenario: cleanBotArchiveText(fields.scenario || "", 12000),
+    exampleDialogues: cleanBotArchiveText(fields.exampleDialogues || "", 18000),
+    tags: botStatusArchiveExportTags(fields.tags),
+    visibility: cleanBotArchiveText(fields.visibility || "", 120),
+    creator: cleanBotArchiveText(fields.creator || entry.creator || "", 500),
+    avatarUrl: canonicalBotImage(fields.image || entry.image || ""),
+    messageCount: cleanBotArchiveText(fields.messageCount || "", 120),
+    rating: cleanBotArchiveText(fields.rating || "", 120),
+    tokenCount: cleanBotArchiveText(fields.tokenCount || "", 120)
+  };
+}
+
+function botStatusArchiveExportRevision(revisionValue) {
+  const revision = normalizeBotArchiveRevision(revisionValue);
+  if (!revision || !botStatusArchiveExportSourceAllowed(revision)) return null;
+  return {
+    capturedAt: Number(revision.capturedAt) || 0,
+    source: cleanBotArchiveText(revision.source || "", 120),
+    kind: cleanBotArchiveText(revision.kind || "auto", 40) || "auto",
+    fields: botStatusArchiveExportFields({ fields: revision.fields || {} }),
+    coverage: [...(revision.coverage || [])]
+  };
+}
+
+function botStatusArchiveExportRecord(entryValue, availabilityValue) {
+  const entry = entryValue && typeof entryValue === "object" ? entryValue : {};
+  const availability = availabilityValue && typeof availabilityValue === "object" ? availabilityValue : null;
+  const revisions = Array.isArray(entry.revisions)
+    ? entry.revisions.map(botStatusArchiveExportRevision).filter(Boolean)
+    : [];
+  const snapshotAt = Number(entry.lastSavedAt) || Number(entry.lastAvailableAt) || Number(entry.firstSavedAt) || 0;
+  const status = availability && BOT_AVAILABILITY_STATUSES.has(String(availability.status || "").toLowerCase())
+    ? String(availability.status).toLowerCase()
+    : "unknown";
+
+  return {
+    id: String(entry.id || "").trim(),
+    snapshotAt,
+    firstSavedAt: Number(entry.firstSavedAt) || 0,
+    lastSavedAt: Number(entry.lastSavedAt) || 0,
+    lastAvailableAt: Number(entry.lastAvailableAt) || 0,
+    source: cleanBotArchiveText(entry.source || "", 120),
+    profileUrl: String(entry.profileUrl || (entry.id ? `https://spicychat.ai/chatbot/${entry.id}` : "")).trim(),
+    fields: botStatusArchiveExportFields(entry),
+    coverage: [...(entry.coverage || [])],
+    publicHistory: revisions,
+    statusObservation: {
+      status,
+      checkedAt: Number(availability?.checkedAt) || 0,
+      httpStatus: Number(availability?.httpStatus) || 0,
+      reason: cleanBotArchiveText(availability?.reason || "", 500)
+    }
+  };
+}
+
+function botStatusArchiveExportFilename(extension = "json.gz") {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `spicychat-qol-bot-status-archive-${stamp}.${extension}`;
+}
+
+function downloadBlobFile(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function downloadBotStatusArchiveJsonGz() {
+  const button = $("exportBotStatusArchiveJsonGz");
+  const statusEl = $("botStatusArchiveExportStatus");
+  const setStatus = text => { if (statusEl) statusEl.textContent = text; };
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+
+  try {
+    setStatus("Preparing archive export…");
+    const stored = await storageGet([BOT_ARCHIVE_KEY, BOT_AVAILABILITY_KEY]);
+    const archive = normalizeBotArchive(stored[BOT_ARCHIVE_KEY]);
+    const availability = normalizeBotAvailability(stored[BOT_AVAILABILITY_KEY]);
+    const allEntries = Object.values(archive.meta || {}).sort((a, b) => String(a.id || "").localeCompare(String(b.id || "")));
+    const entries = allEntries.filter(botStatusArchiveExportSourceAllowed);
+    const skippedUnsafeCopies = Math.max(0, allEntries.length - entries.length);
+
+    if (!entries.length) {
+      setStatus("No public / Bot Status saved copies to export.");
+      showSettingsToast("No public / Bot Status saved copies were found. Manual creator/editor backups are intentionally excluded.");
+      return;
+    }
+
+    const statusCounts = { available: 0, unavailable: 0, restricted: 0, unknown: 0 };
+    let withPublicHistory = 0;
+    for (const entry of entries) {
+      const observed = availability.meta?.[entry.id]?.status;
+      const key = BOT_AVAILABILITY_STATUSES.has(String(observed || "").toLowerCase())
+        ? String(observed).toLowerCase()
+        : "unknown";
+      statusCounts[key] = Number(statusCounts[key] || 0) + 1;
+      if (Array.isArray(entry.revisions) && entry.revisions.some(revision => botStatusArchiveExportRevision(revision))) withPublicHistory += 1;
+    }
+
+    const header = {
+      schema: BOT_STATUS_ARCHIVE_EXPORT_SCHEMA,
+      version: BOT_STATUS_ARCHIVE_EXPORT_VERSION,
+      exportedAt: new Date().toISOString(),
+      generatedBy: {
+        product: "SpicyChat QoL",
+        version: String(chrome.runtime?.getManifest?.().version || "0.2.21")
+      },
+      source: "qol-bot-status-export",
+      semantics: {
+        snapshotsAreHistoricalObservations: true,
+        currentPublicStatusRequiresVerification: true,
+        unavailableOr404DoesNotByItselfMeanDeleted: true,
+        emptyImportedFieldsMustNotReplaceKnownArchiveValues: true,
+        manualCreatorBackupsExcluded: true,
+        localPrivateNotesExcluded: true
+      },
+      counts: {
+        savedCopiesSeen: allEntries.length,
+        exportedBots: entries.length,
+        skippedNonPublicOrManualCopies: skippedUnsafeCopies,
+        withPublicHistory,
+        statusObservations: statusCounts
+      }
+    };
+
+    if (typeof CompressionStream !== "function") {
+      const bots = entries.map(entry => botStatusArchiveExportRecord(entry, availability.meta?.[entry.id]));
+      downloadJsonFile({ ...header, bots }, botStatusArchiveExportFilename("json"));
+      setStatus(`Exported ${entries.length} bots as JSON (gzip is unavailable in this browser).`);
+      showSettingsToast(`Exported ${entries.length} archive snapshot${entries.length === 1 ? "" : "s"}. This browser does not support gzip, so QoL used plain JSON.`);
+      return;
+    }
+
+    // Stream one bot at a time into gzip so thousands of rich snapshots do not
+    // require a second giant uncompressed JSON string in memory.
+    const encoder = new TextEncoder();
+    const gzip = new CompressionStream("gzip");
+    const blobPromise = new Response(gzip.readable).blob();
+    const writer = gzip.writable.getWriter();
+    const prefix = `${JSON.stringify(header).slice(0, -1)},\"bots\":[`;
+    await writer.write(encoder.encode(prefix));
+
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const record = botStatusArchiveExportRecord(entry, availability.meta?.[entry.id]);
+      await writer.write(encoder.encode(`${index ? "," : ""}${JSON.stringify(record)}`));
+      if ((index + 1) % 250 === 0 || index + 1 === entries.length) {
+        setStatus(`Compressing ${index + 1} / ${entries.length} saved copies…`);
+        await nextUiFrame();
+      }
+    }
+
+    await writer.write(encoder.encode("]}"));
+    await writer.close();
+    const compressed = await blobPromise;
+    const gzipBlob = new Blob([compressed], { type: "application/gzip" });
+    downloadBlobFile(gzipBlob, botStatusArchiveExportFilename("json.gz"));
+    setStatus(`Exported ${entries.length} saved copies${skippedUnsafeCopies ? ` · skipped ${skippedUnsafeCopies} manual/non-public` : ""}.`);
+    showSettingsToast(`Archive export ready: ${entries.length} saved bot cop${entries.length === 1 ? "y" : "ies"} in compressed JSON.`);
+  } catch (error) {
+    console.error("SpicyChat QoL archive export failed", error);
+    setStatus("Archive export failed.");
+    showSettingsToast(`Could not create the archive export: ${String(error?.message || error || "unknown error")}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+
+function normalizeArchiveUploadState(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  const fingerprints = raw.fingerprints && typeof raw.fingerprints === "object" && !Array.isArray(raw.fingerprints)
+    ? Object.fromEntries(Object.entries(raw.fingerprints).map(([id, hash]) => [String(id), String(hash || "").slice(0, 64)]).filter(([id, hash]) => BOT_ID_RE.test(id) && hash))
+    : {};
+  return {
+    version: 1,
+    lastUploadAt: Number(raw.lastUploadAt) || 0,
+    lastSentCount: Math.max(0, Number(raw.lastSentCount) || 0),
+    lastSnapshotCount: Math.max(0, Number(raw.lastSnapshotCount) || 0),
+    lastMode: String(raw.lastMode || ""),
+    lastQueueIds: Array.isArray(raw.lastQueueIds) ? raw.lastQueueIds.map(value => String(value || "").slice(0, 160)).filter(Boolean).slice(0, 50) : [],
+    fingerprints
+  };
+}
+
+function normalizeArchiveImportEndpoint(value) {
+  const raw = String(value || DEFAULT_ARCHIVE_IMPORT_ENDPOINT).trim() || DEFAULT_ARCHIVE_IMPORT_ENDPOINT;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return "";
+    url.hash = "";
+    return url.href.replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function archiveHealthUrl(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    url.pathname = "/health";
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function archiveUploadComparable(record) {
+  const snapshot = record?.snapshot && typeof record.snapshot === "object" ? record.snapshot : {};
+  const status = snapshot.statusObservation && typeof snapshot.statusObservation === "object" ? snapshot.statusObservation : {};
+  return {
+    botId: String(record?.botId || ""),
+    snapshot: {
+      source: snapshot.source || "",
+      profileUrl: snapshot.profileUrl || "",
+      fields: snapshot.fields || {},
+      coverage: snapshot.coverage || [],
+      publicHistory: snapshot.publicHistory || [],
+      statusObservation: {
+        status: status.status || "unknown",
+        httpStatus: Number(status.httpStatus || 0),
+        reason: status.reason || ""
+      }
+    }
+  };
+}
+
+function fastArchiveFingerprint(record) {
+  const text = JSON.stringify(archiveUploadComparable(record));
+  let a = 0x811c9dc5;
+  let b = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    a ^= code;
+    a = Math.imul(a, 0x01000193) >>> 0;
+    b = (((b << 5) + b) ^ code) >>> 0;
+  }
+  return `${a.toString(16).padStart(8, "0")}${b.toString(16).padStart(8, "0")}`;
+}
+
+function archiveUploadSavedCopyRecord(entry, availability) {
+  const snapshot = botStatusArchiveExportRecord(entry, availability);
+  const savedMs = Number(entry?.lastSavedAt) || Number(snapshot?.snapshotAt) || Number(entry?.firstSavedAt) || 0;
+  return {
+    botId: String(entry?.id || "").trim(),
+    savedAt: savedMs ? new Date(savedMs).toISOString() : null,
+    snapshot
+  };
+}
+
+async function currentArchiveUploadRecords({ updateProgress = false, progressElementId = "botStatusArchiveUploadStatus" } = {}) {
+  await ensureSavedListsDataLoaded();
+  const archive = normalizeBotArchive(botArchiveState);
+  const availability = normalizeBotAvailability(botAvailabilityState);
+  const entries = Object.values(archive.meta || {})
+    .filter(botStatusArchiveExportSourceAllowed)
+    .sort((a, b) => String(a.id || "").localeCompare(String(b.id || "")));
+  const records = [];
+  const fingerprints = {};
+  const statusEl = $(progressElementId);
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    const record = archiveUploadSavedCopyRecord(entry, availability.meta?.[entry.id]);
+    records.push(record);
+    fingerprints[record.botId] = fastArchiveFingerprint(record);
+    if ((i + 1) % 250 === 0 || i + 1 === entries.length) {
+      if (updateProgress && statusEl) statusEl.textContent = `Preparing ${i + 1} / ${entries.length} saved copies…`;
+      // Fingerprinting several thousand rich saved copies can otherwise block the
+      // Options page long enough to feel frozen. Yield in small batches even
+      // when this is only the quiet "changed since last upload" refresh.
+      await nextUiFrame();
+    }
+  }
+  return { records, fingerprints };
+}
+
+async function gzipArchiveUploadRecords(records, exportedAt, chunk = null, extraHeader = null) {
+  if (typeof CompressionStream !== "function") throw new Error("This browser does not support gzip CompressionStream.");
+  const encoder = new TextEncoder();
+  const gzip = new CompressionStream("gzip");
+  const blobPromise = new Response(gzip.readable).blob();
+  const writer = gzip.writable.getWriter();
+  const header = {
+    schemaVersion: 1,
+    kind: "spicychat-qol-bot-status-export",
+    exportedAt,
+    ...(extraHeader && typeof extraHeader === "object" ? extraHeader : {}),
+    ...(chunk ? { chunk } : {})
+  };
+  await writer.write(encoder.encode(`${JSON.stringify(header).slice(0, -1)},"savedCopies":[`));
+  for (let i = 0; i < records.length; i += 1) {
+    await writer.write(encoder.encode(`${i ? "," : ""}${JSON.stringify(records[i])}`));
+  }
+  await writer.write(encoder.encode("]}"));
+  await writer.close();
+  const blob = await blobPromise;
+  return new Blob([blob], { type: "application/gzip" });
+}
+
+function archiveUploadFilename(exportedAt, chunkIndex = 0, chunkCount = 1) {
+  const stamp = String(exportedAt || new Date().toISOString()).replace(/[:.]/g, "-");
+  const suffix = chunkCount > 1 ? `-part-${chunkIndex + 1}-of-${chunkCount}` : "";
+  return `bot-status-${stamp}${suffix}.json.gz`;
+}
+
+async function postArchiveUpload(endpoint, token, blob, { exportedAt, filename }) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/gzip",
+      "Content-Encoding": "gzip",
+      "X-Import-Filename": filename,
+      "X-Exported-At": exportedAt
+    },
+    body: blob,
+    cache: "no-store"
+  });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch {}
+  if (!response.ok || data?.ok === false) {
+    const detail = String(data?.error || data?.message || text || `HTTP ${response.status}`).slice(0, 500);
+    throw new Error(`Archive Worker rejected the upload (${response.status}): ${detail}`);
+  }
+  return data && typeof data === "object" ? data : { ok: true, queued: true, bytes: blob.size, compressed: true };
+}
+
+async function splitArchiveUploadRecords(records, exportedAt, extraHeader = null) {
+  const chunks = [];
+  const pending = [];
+  for (let i = 0; i < records.length; i += ARCHIVE_UPLOAD_CHUNK_SIZE) pending.push(records.slice(i, i + ARCHIVE_UPLOAD_CHUNK_SIZE));
+  while (pending.length) {
+    const part = pending.shift();
+    const blob = await gzipArchiveUploadRecords(part, exportedAt, null, extraHeader);
+    if (blob.size <= ARCHIVE_UPLOAD_SOFT_MAX_BYTES) {
+      chunks.push({ records: part, blob });
+      continue;
+    }
+    if (part.length <= 1) throw new Error(`One saved copy compresses to ${(blob.size / 1024 / 1024).toFixed(1)} MB, above the 60 MB safe upload limit.`);
+    const midpoint = Math.ceil(part.length / 2);
+    pending.unshift(part.slice(midpoint), part.slice(0, midpoint));
+  }
+  return chunks;
+}
+
+function normalizeArchiveContributionState(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  const base = normalizeArchiveUploadState({
+    lastUploadAt: raw.lastSubmissionAt,
+    lastSentCount: raw.lastSentCount,
+    lastSnapshotCount: raw.lastSnapshotCount,
+    lastMode: raw.lastMode,
+    lastQueueIds: raw.lastSubmissionIds,
+    fingerprints: raw.fingerprints
+  });
+  return {
+    version: 1,
+    lastSubmissionAt: base.lastUploadAt,
+    lastSentCount: base.lastSentCount,
+    lastSnapshotCount: base.lastSnapshotCount,
+    lastMode: base.lastMode,
+    lastSubmissionIds: base.lastQueueIds,
+    lastStatus: ["pending", "approved", "rejected", "queued"].includes(String(raw.lastStatus || "").toLowerCase())
+      ? String(raw.lastStatus).toLowerCase()
+      : (base.lastUploadAt ? "pending" : ""),
+    fingerprints: base.fingerprints
+  };
+}
+
+async function loadArchiveContributionConfig() {
+  const stored = await storageGet([ARCHIVE_CONTRIBUTION_ENABLED_KEY, ARCHIVE_CONTRIBUTION_STATE_KEY]);
+  return {
+    enabled: stored[ARCHIVE_CONTRIBUTION_ENABLED_KEY] === true,
+    state: normalizeArchiveContributionState(stored[ARCHIVE_CONTRIBUTION_STATE_KEY])
+  };
+}
+
+async function archiveContributionInstallHash() {
+  const stored = await storageGet([ARCHIVE_CONTRIBUTION_INSTALL_ID_KEY]);
+  let installId = String(stored[ARCHIVE_CONTRIBUTION_INSTALL_ID_KEY] || "").trim();
+  if (!installId) {
+    installId = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : Array.from(crypto.getRandomValues(new Uint8Array(24)), value => value.toString(16).padStart(2, "0")).join("");
+    await storageSet({ [ARCHIVE_CONTRIBUTION_INSTALL_ID_KEY]: installId });
+  }
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`spicychat-archive-public-v1:${installId}`));
+  return Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, "0")).join("");
+}
+
+async function archiveContributionHeader() {
+  return {
+    submission: {
+      source: "spicychat-qol-extension",
+      extensionVersion: String(chrome.runtime?.getManifest?.()?.version || ""),
+      anonymousInstallIdHash: await archiveContributionInstallHash()
+    }
+  };
+}
+
+function archiveSubmissionFilename(exportedAt, chunkIndex = 0, chunkCount = 1) {
+  const stamp = String(exportedAt || new Date().toISOString()).replace(/[:.]/g, "-");
+  const suffix = chunkCount > 1 ? `-part-${chunkIndex + 1}-of-${chunkCount}` : "";
+  return `bot-status-submission-${stamp}${suffix}.json.gz`;
+}
+
+async function postArchiveSubmission(blob, { exportedAt, filename }) {
+  const response = await fetch(DEFAULT_ARCHIVE_SUBMISSION_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/gzip",
+      "Content-Encoding": "gzip",
+      "X-Import-Filename": filename,
+      "X-Exported-At": exportedAt
+    },
+    body: blob,
+    cache: "no-store"
+  });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch {}
+  if (!response.ok || data?.ok === false) {
+    const detail = String(data?.error || data?.message || text || `HTTP ${response.status}`).slice(0, 500);
+    throw new Error(`Archive submission endpoint rejected the upload (${response.status}): ${detail}`);
+  }
+  return data && typeof data === "object"
+    ? data
+    : { ok: true, submissionId: "", status: "pending", bytes: blob.size, compressed: true };
+}
+
+async function refreshArchiveContributionUi(prepared = null) {
+  const config = await loadArchiveContributionConfig();
+  const toggle = $("enableBotStatusArchiveContribution");
+  const actions = $("botStatusArchiveContributionActions");
+  const sendChanged = $("submitBotStatusArchiveChanged");
+  const sendAll = $("submitBotStatusArchiveAll");
+  const summary = $("botStatusArchiveContributionSummary");
+  if (toggle && document.activeElement !== toggle) toggle.checked = config.enabled;
+  if (actions) actions.hidden = !config.enabled;
+  if (!config.enabled) {
+    if (summary) summary.textContent = "Contribution is off. Nothing is sent unless you enable it and press the submit button.";
+    return;
+  }
+
+  const { records, fingerprints } = prepared || await currentArchiveUploadRecords();
+  const previous = config.state.fingerprints || {};
+  const changed = records.filter(record => previous[record.botId] !== fingerprints[record.botId]).length;
+  const first = !config.state.lastSubmissionAt || !Object.keys(previous).length;
+  if (sendChanged) {
+    sendChanged.disabled = records.length === 0 || (!first && changed === 0);
+    sendChanged.textContent = first
+      ? "Submit saved copies for review"
+      : changed
+        ? `Submit new/changed copies for review (${changed})`
+        : "No new/changed copies to submit";
+  }
+  if (sendAll) sendAll.hidden = first || !records.length;
+  if (summary) {
+    if (!config.state.lastSubmissionAt) {
+      summary.textContent = `${records.length.toLocaleString()} saved copies are ready for the first anonymous Archive submission.`;
+    } else {
+      const last = new Date(config.state.lastSubmissionAt).toLocaleString();
+      const ids = config.state.lastSubmissionIds.length
+        ? ` · submission ${config.state.lastSubmissionIds.map(id => id.slice(0, 12)).join(", ")}`
+        : "";
+      const state = config.state.lastStatus || "pending";
+      summary.textContent = `Last submission: ${last} · ${config.state.lastSentCount.toLocaleString()} copies · ${state}${ids} · ${changed.toLocaleString()} saved cop${changed === 1 ? "y has" : "ies have"} changed since.`;
+    }
+  }
+}
+
+async function refreshArchiveTransferUi() {
+  const [admin, contribution] = await Promise.all([loadArchiveUploadConfig(), loadArchiveContributionConfig()]);
+  const needsPrepared = (!!admin.endpoint && !!admin.token) || contribution.enabled;
+  const prepared = needsPrepared ? await currentArchiveUploadRecords() : null;
+  await Promise.all([
+    refreshArchiveUploadUi(prepared),
+    refreshArchiveContributionUi(prepared)
+  ]);
+}
+
+async function setArchiveContributionEnabled(enabled) {
+  await storageSet({ [ARCHIVE_CONTRIBUTION_ENABLED_KEY]: !!enabled });
+  await refreshArchiveTransferUi();
+}
+
+async function sendBotStatusArchiveContribution({ forceAll = false } = {}) {
+  const changedButton = $("submitBotStatusArchiveChanged");
+  const allButton = $("submitBotStatusArchiveAll");
+  const status = $("botStatusArchiveContributionStatus");
+  if (changedButton) changedButton.disabled = true;
+  if (allButton) allButton.disabled = true;
+  const setStatus = text => { if (status) status.textContent = text; };
+  try {
+    const config = await loadArchiveContributionConfig();
+    if (!config.enabled) throw new Error("Enable public Archive contribution first.");
+    setStatus("Preparing saved copies…");
+    const { records, fingerprints } = await currentArchiveUploadRecords({ updateProgress: true, progressElementId: "botStatusArchiveContributionStatus" });
+    if (!records.length) throw new Error("No public / Bot Status saved copies are available to submit.");
+    const previous = config.state.fingerprints || {};
+    const firstSubmission = !config.state.lastSubmissionAt || !Object.keys(previous).length;
+    const selected = forceAll || firstSubmission
+      ? records
+      : records.filter(record => previous[record.botId] !== fingerprints[record.botId]);
+    if (!selected.length) {
+      setStatus("No new or changed saved copies to submit.");
+      return;
+    }
+
+    const exportedAt = new Date().toISOString();
+    const extraHeader = await archiveContributionHeader();
+    setStatus(`Compressing ${selected.length.toLocaleString()} saved copies…`);
+    let chunks = [];
+    const fullBlob = await gzipArchiveUploadRecords(selected, exportedAt, null, extraHeader);
+    if (fullBlob.size <= ARCHIVE_UPLOAD_SOFT_MAX_BYTES) chunks = [{ records: selected, blob: fullBlob }];
+    else {
+      setStatus(`Compressed submission is ${(fullBlob.size / 1024 / 1024).toFixed(1)} MB; splitting into safe chunks…`);
+      chunks = await splitArchiveUploadRecords(selected, exportedAt, extraHeader);
+    }
+
+    const submissionIds = [];
+    let finalStatus = "pending";
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      let blob = chunk.blob;
+      if (chunks.length > 1) blob = await gzipArchiveUploadRecords(chunk.records, exportedAt, { index: i + 1, total: chunks.length }, extraHeader);
+      if (blob.size > ARCHIVE_UPLOAD_SOFT_MAX_BYTES) throw new Error(`Chunk ${i + 1} is still above the 60 MB safe submission limit.`);
+      setStatus(`Submitting bundle ${i + 1} / ${chunks.length} · ${chunk.records.length.toLocaleString()} saved copies…`);
+      const result = await postArchiveSubmission(blob, {
+        exportedAt,
+        filename: archiveSubmissionFilename(exportedAt, i, chunks.length)
+      });
+      const id = String(result?.submissionId || result?.id || "").trim();
+      if (id) submissionIds.push(id);
+      const state = String(result?.status || "pending").toLowerCase();
+      if (["pending", "approved", "rejected", "queued"].includes(state)) finalStatus = state;
+    }
+
+    const currentIds = new Set(records.map(record => record.botId));
+    const nextFingerprints = forceAll || firstSubmission ? {} : { ...previous };
+    for (const id of Object.keys(nextFingerprints)) if (!currentIds.has(id)) delete nextFingerprints[id];
+    for (const record of selected) nextFingerprints[record.botId] = fingerprints[record.botId];
+    await storageSet({
+      [ARCHIVE_CONTRIBUTION_STATE_KEY]: {
+        version: 1,
+        lastSubmissionAt: Date.now(),
+        lastSentCount: selected.length,
+        lastSnapshotCount: records.length,
+        lastMode: forceAll || firstSubmission ? "all" : "changed",
+        lastSubmissionIds: submissionIds,
+        lastStatus: finalStatus || "pending",
+        fingerprints: nextFingerprints
+      }
+    });
+    setStatus(`✓ ${selected.length.toLocaleString()} saved cop${selected.length === 1 ? "y" : "ies"} submitted for Archive review${chunks.length > 1 ? ` in ${chunks.length} bundles` : ""}. ${finalStatus === "pending" ? "Pending approval." : `Status: ${finalStatus}.`}`);
+    showSettingsToast(`Archive contribution submitted: ${selected.length.toLocaleString()} saved bot cop${selected.length === 1 ? "y" : "ies"}.`);
+  } catch (error) {
+    console.error("SpicyChat QoL public archive submission failed", error);
+    setStatus(`Archive submission failed: ${String(error?.message || error || "unknown error")}`);
+  } finally {
+    if (changedButton) changedButton.disabled = false;
+    if (allButton) allButton.disabled = false;
+    await refreshArchiveTransferUi().catch(() => {});
+  }
+}
+
+async function loadArchiveUploadConfig() {
+  const stored = await storageGet([ARCHIVE_IMPORT_ENDPOINT_KEY, ARCHIVE_IMPORT_TOKEN_KEY, ARCHIVE_UPLOAD_STATE_KEY]);
+  return {
+    endpoint: normalizeArchiveImportEndpoint(stored[ARCHIVE_IMPORT_ENDPOINT_KEY] || DEFAULT_ARCHIVE_IMPORT_ENDPOINT),
+    token: String(stored[ARCHIVE_IMPORT_TOKEN_KEY] || ""),
+    state: normalizeArchiveUploadState(stored[ARCHIVE_UPLOAD_STATE_KEY])
+  };
+}
+
+async function saveArchiveUploadConfig({ quiet = false } = {}) {
+  const endpoint = normalizeArchiveImportEndpoint(value("botStatusArchiveEndpoint", DEFAULT_ARCHIVE_IMPORT_ENDPOINT));
+  const token = String(value("botStatusArchiveToken", "")).trim();
+  if (!endpoint) {
+    if (!quiet) showSettingsToast("Archive endpoint must be a valid HTTPS URL.");
+    return false;
+  }
+  await storageSet({
+    [ARCHIVE_IMPORT_ENDPOINT_KEY]: endpoint,
+    [ARCHIVE_IMPORT_TOKEN_KEY]: token
+  });
+  await refreshArchiveUploadUi();
+  return true;
+}
+
+async function refreshArchiveUploadUi(prepared = null) {
+  const config = await loadArchiveUploadConfig();
+  const endpointInput = $("botStatusArchiveEndpoint");
+  const tokenInput = $("botStatusArchiveToken");
+  if (endpointInput && document.activeElement !== endpointInput) endpointInput.value = config.endpoint || DEFAULT_ARCHIVE_IMPORT_ENDPOINT;
+  if (tokenInput && document.activeElement !== tokenInput && !tokenInput.value) tokenInput.value = config.token || "";
+
+  const actions = $("botStatusArchiveUploadActions");
+  const sendChanged = $("sendBotStatusArchiveChanged");
+  const sendAll = $("sendBotStatusArchiveAll");
+  const summary = $("botStatusArchiveUploadSummary");
+  const configured = !!config.endpoint && !!config.token;
+  if (actions) actions.hidden = !configured;
+  if (!configured) {
+    if (summary) summary.textContent = "Configure the endpoint and private import token to enable archive upload. The token stays only in extension local storage and is never included in QoL backups.";
+    return;
+  }
+
+  const { records, fingerprints } = prepared || await currentArchiveUploadRecords();
+  const previous = config.state.fingerprints || {};
+  const changed = records.filter(record => previous[record.botId] !== fingerprints[record.botId]).length;
+  const first = !config.state.lastUploadAt || !Object.keys(previous).length;
+  if (sendChanged) {
+    sendChanged.disabled = records.length === 0 || (!first && changed === 0);
+    sendChanged.textContent = first
+      ? "Send saved copies to Archive"
+      : changed
+        ? `Send new/changed copies to Archive (${changed})`
+        : "No new/changed copies to send";
+  }
+  if (sendAll) sendAll.hidden = first || !records.length;
+  if (summary) {
+    const last = config.state.lastUploadAt ? new Date(config.state.lastUploadAt).toLocaleString() : "Never";
+    summary.textContent = config.state.lastUploadAt
+      ? `Last archive upload: ${last} · ${config.state.lastSnapshotCount || config.state.lastSentCount} copies at that snapshot · ${changed} saved cop${changed === 1 ? "y has" : "ies have"} changed since.`
+      : `${records.length} saved copies ready for the first archive upload.`;
+  }
+}
+
+async function testArchiveUploadEndpoint() {
+  const button = $("testBotStatusArchiveEndpoint");
+  const status = $("botStatusArchiveConfigStatus");
+  if (button) button.disabled = true;
+  try {
+    const saved = await saveArchiveUploadConfig({ quiet: true });
+    if (!saved) throw new Error("Enter a valid HTTPS endpoint first.");
+    const config = await loadArchiveUploadConfig();
+    const health = archiveHealthUrl(config.endpoint);
+    if (!health) throw new Error("Could not derive the Worker health URL.");
+    if (status) status.textContent = "Testing Worker health…";
+    const response = await fetch(health, { method: "GET", cache: "no-store", headers: { Accept: "application/json,text/plain" } });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`Health endpoint returned HTTP ${response.status}${text ? `: ${text.slice(0, 180)}` : ""}`);
+    if (status) status.textContent = `✓ Worker health responded HTTP ${response.status}. Token is saved locally and will be validated on the first upload.`;
+  } catch (error) {
+    if (status) status.textContent = `Endpoint test failed: ${String(error?.message || error || "unknown error")}`;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function sendBotStatusArchiveToArchive({ forceAll = false } = {}) {
+  const changedButton = $("sendBotStatusArchiveChanged");
+  const allButton = $("sendBotStatusArchiveAll");
+  const status = $("botStatusArchiveUploadStatus");
+  if (changedButton) changedButton.disabled = true;
+  if (allButton) allButton.disabled = true;
+  const setStatus = text => { if (status) status.textContent = text; };
+  try {
+    await saveArchiveUploadConfig({ quiet: true });
+    const config = await loadArchiveUploadConfig();
+    if (!config.endpoint || !config.token) throw new Error("Configure both the Archive endpoint and import token first.");
+    setStatus("Preparing saved copies…");
+    const { records, fingerprints } = await currentArchiveUploadRecords({ updateProgress: true });
+    if (!records.length) throw new Error("No public / Bot Status saved copies are available to upload.");
+    const previous = config.state.fingerprints || {};
+    const firstUpload = !config.state.lastUploadAt || !Object.keys(previous).length;
+    const selected = forceAll || firstUpload
+      ? records
+      : records.filter(record => previous[record.botId] !== fingerprints[record.botId]);
+    if (!selected.length) {
+      setStatus("No new or changed saved copies to upload.");
+      return;
+    }
+
+    const exportedAt = new Date().toISOString();
+    setStatus(`Compressing ${selected.length} saved copies…`);
+    let chunks = [];
+    const fullBlob = await gzipArchiveUploadRecords(selected, exportedAt);
+    if (fullBlob.size <= ARCHIVE_UPLOAD_SOFT_MAX_BYTES) chunks = [{ records: selected, blob: fullBlob }];
+    else {
+      setStatus(`Compressed upload is ${(fullBlob.size / 1024 / 1024).toFixed(1)} MB; splitting into safe chunks…`);
+      chunks = await splitArchiveUploadRecords(selected, exportedAt);
+    }
+
+    const queueIds = [];
+    let uploadedBytes = 0;
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      let blob = chunk.blob;
+      if (chunks.length > 1) blob = await gzipArchiveUploadRecords(chunk.records, exportedAt, { index: i + 1, total: chunks.length });
+      if (blob.size > ARCHIVE_UPLOAD_SOFT_MAX_BYTES) throw new Error(`Chunk ${i + 1} is still above the 60 MB safe upload limit.`);
+      setStatus(`Uploading bundle ${i + 1} / ${chunks.length} · ${chunk.records.length} saved copies…`);
+      const result = await postArchiveUpload(config.endpoint, config.token, blob, {
+        exportedAt,
+        filename: archiveUploadFilename(exportedAt, i, chunks.length)
+      });
+      uploadedBytes += Number(result?.bytes || blob.size) || blob.size;
+      if (result?.queueId) queueIds.push(String(result.queueId));
+    }
+
+    const currentIds = new Set(records.map(record => record.botId));
+    const nextFingerprints = forceAll || firstUpload ? {} : { ...previous };
+    for (const id of Object.keys(nextFingerprints)) if (!currentIds.has(id)) delete nextFingerprints[id];
+    for (const record of selected) nextFingerprints[record.botId] = fingerprints[record.botId];
+    await storageSet({
+      [ARCHIVE_UPLOAD_STATE_KEY]: {
+        version: 1,
+        lastUploadAt: Date.now(),
+        lastSentCount: selected.length,
+        lastSnapshotCount: records.length,
+        lastMode: forceAll || firstUpload ? "all" : "changed",
+        lastQueueIds: queueIds,
+        fingerprints: nextFingerprints
+      }
+    });
+    setStatus(`✓ ${selected.length.toLocaleString()} saved cop${selected.length === 1 ? "y" : "ies"} queued for archive import${chunks.length > 1 ? ` in ${chunks.length} bundles` : ""}. They'll be processed during the next archive run.`);
+    showSettingsToast(`Archive upload queued: ${selected.length.toLocaleString()} saved bot cop${selected.length === 1 ? "y" : "ies"}.`);
+  } catch (error) {
+    console.error("SpicyChat QoL archive upload failed", error);
+    setStatus(`Archive upload failed: ${String(error?.message || error || "unknown error")}`);
+  } finally {
+    if (changedButton) changedButton.disabled = false;
+    if (allButton) allButton.disabled = false;
+    await refreshArchiveUploadUi().catch(() => {});
+  }
 }
 
 function portableBotProfileJson(archiveValue) {
@@ -6484,6 +7907,7 @@ function portableBotProfileJson(archiveValue) {
           exported_at: new Date().toISOString(),
           spicychat_id: id,
           spicychat_profile_url: archive.profileUrl || `https://spicychat.ai/chatbot/${id}`,
+          old_chat_urls: [...(archive.chatUrls || [])],
           avatar_url: fields.image || archive.image || "",
           visibility: fields.visibility || "",
           own_bot: !!archive.ownBot,
@@ -7123,8 +8547,9 @@ function setupCreatorBackupManager() {
 
 function botAvailabilityCard(entry) {
   const card = makeElement("div", { className: "bot-manager-card", dataset: { id: entry.id } });
-  if (entry.image) {
-    card.appendChild(makeElement("img", { className: "bot-manager-image", attrs: { src: entry.image, alt: "", loading: "lazy", decoding: "async" } }));
+  const cardImage = canonicalBotImage(entry.image || entry.archive?.image || entry.archive?.fields?.image || "");
+  if (cardImage) {
+    card.appendChild(makeElement("img", { className: "bot-manager-image", attrs: { src: cardImage, alt: "", loading: "lazy", decoding: "async" } }));
   } else {
     card.appendChild(makeElement("div", { className: "bot-manager-placeholder", text: "?" }));
   }
@@ -7194,12 +8619,18 @@ function botAvailabilityCard(entry) {
   return card;
 }
 
-function renderBotAvailability() {
+function renderBotAvailability(renderOptions = {}) {
+  if (!renderOptions?.skipRecoveryRerender) {
+    renderSavedBotInfo();
+    renderDeletedSavedBots();
+  }
   const host = $("botAvailabilityManager");
   if (!host) return;
 
   const scope = String($("botAvailabilityScope")?.value || "all");
-  const base = botStatusCenterBaseEntries(scope);
+  const base = Array.isArray(renderOptions?.baseEntries)
+    ? renderOptions.baseEntries
+    : botStatusCenterBaseEntries(scope);
   const duplicates = botDuplicateCacheReady && botDuplicateCacheScope === scope
     ? botDuplicateMatchesCache
     : new Map();
@@ -7210,14 +8641,36 @@ function renderBotAvailability() {
   const updatedCount = base.filter(entry => entry.updateStatus === "updated").length;
   const checkedCount = base.filter(entry => Number(entry.checkedAt) > 0).length;
   const archivedCount = base.filter(entry => !!entry.archive).length;
+  const unavailableCandidateCount = base.filter(entry => Number(entry.unavailableEvidenceCount || 0) === 1 && entry.status !== "unavailable").length;
+  const confirmedUnavailableCount = base.filter(entry => entry.status === "unavailable").length;
+  const staleDays = Math.max(1, Number(value("botStatusStaleDays", "7")) || 7);
+  const staleCutoff = Date.now() - staleDays * 24 * 60 * 60 * 1000;
+  const staleCount = base.filter(entry => Number(entry.checkedAt || 0) > 0 && Number(entry.checkedAt || 0) <= staleCutoff).length;
   let limit = Math.max(20, Number(botAvailabilityUiState.visible || 20) || 20);
   const shown = entries.slice(0, limit);
 
   const summary = $("botAvailabilitySummary");
+  const uncheckedCount = Math.max(0, base.length - checkedCount);
   if (summary) {
     const matches = entries.length !== base.length ? ` · ${entries.length} matching` : "";
-    const duplicateText = duplicateBots == null ? "duplicates not calculated" : `${duplicateBots} duplicate matches`;
-    summary.textContent = `${base.length} tracked · ${checkedCount} checked · ${archivedCount} saved copies · ${updatedCount} updated · ${duplicateText}${matches}`;
+    const duplicateText = duplicateBots == null ? "" : ` · ${duplicateBots} duplicate matches`;
+    summary.textContent = `${base.length} tracked · ${checkedCount} checked · ${archivedCount} saved copies · ${updatedCount} updated${duplicateText}${matches}`;
+  }
+  const uncheckedButton = $("scanUncheckedBotAvailability");
+  if (uncheckedButton && !botAvailabilityScanRunning) {
+    uncheckedButton.disabled = uncheckedCount === 0;
+    uncheckedButton.textContent = uncheckedCount ? `Check unchecked bots (${uncheckedCount})` : "No unchecked bots";
+  }
+  const staleButton = $("scanStaleBotAvailability");
+  if (staleButton && !botAvailabilityScanRunning) {
+    staleButton.disabled = staleCount === 0;
+    staleButton.textContent = staleCount ? `Refresh stale bots (${staleCount})` : "No stale bots";
+  }
+  const unavailableSummary = $("botAvailabilityUnavailableSummary");
+  if (unavailableSummary) {
+    unavailableSummary.textContent = unavailableCandidateCount || confirmedUnavailableCount
+      ? `Unavailable candidates: ${unavailableCandidateCount} · Confirmed unavailable: ${confirmedUnavailableCount}${unavailableCandidateCount ? ` · Needs recheck: ${unavailableCandidateCount}` : ""}`
+      : "";
   }
 
   const showMore = $("botAvailabilityShowMore");
@@ -7253,20 +8706,41 @@ function renderBotAvailability() {
       const rawResult = await checkBotAvailability({ ...tracked, ...(previous || {}), sources: uniqueClean([...(previous?.sources || []), ...(tracked?.sources || [])]) });
       const result = reconcileBotUpdate(previous, rawResult);
       botAvailabilityState.meta[id] = result;
-      botAvailabilityState = normalizeBotAvailability(botAvailabilityState);
+      const metadataRepaired = applyAuthoritativeBotMetadata(rawResult);
+      let archiveChanged = false;
       if (rawResult.status === "available" && rawResult.archiveSnapshot) {
-        saveArchiveSnapshotForBot(id, rawResult.archiveSnapshot, {
+        archiveChanged = saveArchiveSnapshotForBot(id, rawResult.archiveSnapshot, {
           name: result.name,
           creator: result.creator,
           image: result.image,
           profileUrl: result.profileUrl,
+          chatUrls: knownChatUrlsForBot(id),
           source: "Bot Status Center"
         });
       }
+      const restored = result.status === "available"
+        ? restoreUnavailableRecoveryEntryInMemory(id)
+        : { restored: false, blocked: false };
       invalidateDuplicateCache();
-      await storageSet({ [BOT_AVAILABILITY_KEY]: botAvailabilityState, [BOT_ARCHIVE_KEY]: botArchiveState });
-      renderBotAvailability();
-      refreshStorageUsageIfVisible();
+      botStatusStorageSelfWriteUntil = Date.now() + 5000;
+      const payload = {
+        [BOT_AVAILABILITY_KEY]: botAvailabilityState,
+        ...(archiveChanged ? { [BOT_ARCHIVE_KEY]: botArchiveState } : {}),
+        ...(metadataRepaired ? botStatusMetadataStoragePayload() : {})
+      };
+      if (restored.restored) {
+        Object.assign(payload, botStatusRecoveryStoragePayload({ restoreBlockedIds: restored.blocked ? [id] : [] }).payload);
+        if (restored.blocked) {
+          const stored = await storageGet(["settings"]);
+          const settings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+          settings.blockedBotIds = uniqueClean([...(settings.blockedBotIds || []), id]).filter(validBotId);
+          settings.blockedBotNames = [];
+          payload.settings = settings;
+        }
+      }
+      await storageSet(payload);
+      renderBotAvailability({ skipRecoveryRerender: true });
+      setTimeout(() => refreshStorageUsageIfVisible(), 120);
     });
   });
   host.querySelectorAll(".bot-update-accept").forEach(button => {
@@ -7355,15 +8829,57 @@ function renderBotAvailability() {
   });
 }
 
-async function runBotAvailabilityScan() {
+async function noteBotStatusRunEvent(event, detail = {}) {
+  try {
+    await runtimeMessage({ type: "DS_BOT_STATUS_RUN_EVENT", event, detail });
+  } catch {}
+}
+
+function botStatusScanDelayMs() {
+  const speed = String(value("botStatusScanSpeed", "safe"));
+  return Number(BOT_STATUS_SCAN_SPEED_DELAYS[speed] || BOT_STATUS_SCAN_SPEED_DELAYS.safe);
+}
+
+function sortBotStatusRefreshQueue(entries, availability, archives) {
+  return [...entries].sort((a, b) => {
+    const av = availability[a.id] || {};
+    const bv = availability[b.id] || {};
+    const priority = (entry, state) => {
+      if (Number(state.unavailableEvidenceCount || 0) > 0 && state.status !== "unavailable") return 0;
+      if (state.status === "restricted") return 1;
+      if (!archives[entry.id]) return 2;
+      return 3;
+    };
+    return priority(a, av) - priority(b, bv) || Number(av.checkedAt || 0) - Number(bv.checkedAt || 0) || String(a.name || a.id).localeCompare(String(b.name || b.id));
+  });
+}
+
+async function runBotAvailabilityScan(options = {}) {
   await ensureSavedListsDataLoaded();
   if (botAvailabilityScanRunning) return;
   const scope = String($("botAvailabilityScope")?.value || "all");
-  const entries = collectTrackedAvailabilityBots(scope);
+  const mode = options?.mode || (options?.uncheckedOnly === true ? "unchecked" : "all");
+  const allEntries = collectTrackedAvailabilityBots(scope);
+  const existingAvailability = normalizeBotAvailability(botAvailabilityState).meta;
+  const archives = normalizeBotArchive(botArchiveState).meta;
+  const staleDays = Math.max(1, Number(value("botStatusStaleDays", "7")) || 7);
+  const staleCutoff = Date.now() - staleDays * 24 * 60 * 60 * 1000;
+  let entries = mode === "unchecked"
+    ? allEntries.filter(entry => Number(existingAvailability[entry.id]?.checkedAt || 0) <= 0)
+    : mode === "stale"
+      ? allEntries.filter(entry => Number(existingAvailability[entry.id]?.checkedAt || 0) > 0 && Number(existingAvailability[entry.id]?.checkedAt || 0) <= staleCutoff)
+      : allEntries;
+  entries = sortBotStatusRefreshQueue(entries, existingAvailability, archives);
+
   const status = $("botAvailabilityScanStatus");
   if (!entries.length) {
-    if (status) status.textContent = "No locally tracked bots found in that scope.";
-    showSettingsToast("No tracked bots found for this scan.");
+    const message = mode === "unchecked"
+      ? "No unchecked tracked bots in this scope."
+      : mode === "stale"
+        ? `No tracked bots in this scope are older than ${staleDays} day${staleDays === 1 ? "" : "s"}.`
+        : "No locally tracked bots found in that scope.";
+    if (status) status.textContent = message;
+    showSettingsToast(message);
     renderBotAvailability();
     return;
   }
@@ -7371,53 +8887,184 @@ async function runBotAvailabilityScan() {
   botAvailabilityScanRunning = true;
   botAvailabilityStopRequested = false;
   const scanButton = $("scanBotAvailability");
+  const uncheckedButton = $("scanUncheckedBotAvailability");
+  const staleButton = $("scanStaleBotAvailability");
   const stopButton = $("stopBotAvailabilityScan");
   if (scanButton) scanButton.disabled = true;
+  if (uncheckedButton) uncheckedButton.disabled = true;
+  if (staleButton) staleButton.disabled = true;
   if (stopButton) stopButton.disabled = false;
 
   let completed = 0;
   let updatesFound = 0;
+  let unknownCount = 0;
+  let candidateCount = 0;
+  let archiveChangedCount = 0;
+  let recoveredCount = 0;
+  let recoveryStateDirty = false;
+  const recoveredBlockedIds = new Set();
+  const availabilityChangedIds = new Set();
+  const archiveChangedIds = new Set();
+  const metadataDirtyKeys = new Set();
+  let terminalMessage = "";
+  let lastProgressPaintAt = 0;
+  let adaptiveDelay = botStatusScanDelayMs();
+  const runStartedAt = Date.now();
+
+  await noteBotStatusRunEvent("bot-status-run-start", { mode, scope, count: entries.length, speed: String(value("botStatusScanSpeed", "safe")), staleDays });
   try {
+    if (status) status.textContent = mode === "unchecked"
+      ? `Preparing to check ${entries.length} unchecked bot${entries.length === 1 ? "" : "s"}…`
+      : mode === "stale"
+        ? `Preparing to refresh ${entries.length} stale bot${entries.length === 1 ? "" : "s"}…`
+        : "Preparing one background Bot Status helper on SpicyChat Home…";
+    const prepared = await prepareBotStatusHelper({ forceOwnHelper: true, timeoutMs: 17000 });
+    if (!prepared?.ok || prepared?.ready === false) {
+      terminalMessage = "Could not initialize the Bot Status helper. No bots were changed; try the scan again after SpicyChat Home is signed in.";
+      return;
+    }
+
+    botAvailabilityState = normalizeBotAvailability(botAvailabilityState);
+    botArchiveState = normalizeBotArchive(botArchiveState);
+    const metadataIndex = buildBotStatusMetadataScanIndex();
+
     for (const entry of entries) {
       if (botAvailabilityStopRequested) break;
-      if (status) status.textContent = `Checking ${completed + 1} / ${entries.length}: ${entry.name || entry.id}`;
-      const previous = normalizeBotAvailability(botAvailabilityState).meta[entry.id] || null;
-      const rawResult = await checkBotAvailability({ ...entry, ...(previous || {}), sources: uniqueClean([...(previous?.sources || []), ...(entry.sources || [])]) });
+      const now = Date.now();
+      if (status && (now - lastProgressPaintAt >= 400 || completed === 0)) {
+        status.textContent = `Checking ${completed + 1} / ${entries.length}: ${entry.name || entry.id}`;
+        lastProgressPaintAt = now;
+      }
+      const previous = botAvailabilityState?.meta?.[entry.id] || null;
+      const rawResult = await checkBotAvailability(
+        { ...entry, ...(previous || {}), sources: uniqueClean([...(previous?.sources || []), ...(entry.sources || [])]) },
+        { keepHelper: true, forceOwnHelper: true, bulkScan: true, timeoutMs: 17000 }
+      );
       const result = reconcileBotUpdate(previous, rawResult);
       if (result.updateStatus === "updated") updatesFound++;
+      if (result.status === "unknown") unknownCount++;
+      if (Number(result.unavailableEvidenceCount || 0) === 1 && result.status !== "unavailable") candidateCount++;
       botAvailabilityState.meta[result.id] = result;
-      if (rawResult.status === "available" && rawResult.archiveSnapshot) {
-        saveArchiveSnapshotForBot(result.id, rawResult.archiveSnapshot, {
+      availabilityChangedIds.add(result.id);
+      if (applyAuthoritativeBotMetadata(rawResult, metadataIndex, metadataDirtyKeys)) botStatusMetadataDirty = true;
+      const blockedFromRecovery = metadataIndex?.blocked instanceof Set && metadataIndex.blocked.has(result.id);
+      if (rawResult.status === "available" && rawResult.archiveSnapshot && !blockedFromRecovery) {
+        const archiveChanged = saveArchiveSnapshotForBot(result.id, rawResult.archiveSnapshot, {
           name: result.name,
           creator: result.creator,
           image: result.image,
           profileUrl: result.profileUrl,
+          chatUrls: knownChatUrlsForBot(result.id),
           source: "Bot Status Center"
         });
+        if (archiveChanged) { archiveChangedCount++; archiveChangedIds.add(result.id); }
+      }
+      if (result.status === "available") {
+        const restored = restoreUnavailableRecoveryEntryInMemory(result.id);
+        if (restored.restored) {
+          recoveryStateDirty = true;
+          recoveredCount++;
+          if (restored.blocked) recoveredBlockedIds.add(result.id);
+        }
       }
       completed++;
-      if (completed % 5 === 0) {
-        botAvailabilityState = normalizeBotAvailability(botAvailabilityState);
-        await storageSet({ [BOT_AVAILABILITY_KEY]: botAvailabilityState, [BOT_ARCHIVE_KEY]: botArchiveState });
-      }
-      if (completed % 5 === 0 || completed === entries.length) renderBotAvailability();
+
       if (!botAvailabilityStopRequested && completed < entries.length) {
-        await new Promise(resolve => setTimeout(resolve, result.httpStatus === 429 ? 1200 : 250));
+        const http = Number(result.httpStatus || 0);
+        const transientServerFailure = http === 429 || http >= 500;
+        if (transientServerFailure) adaptiveDelay = Math.min(8000, Math.max(1500, adaptiveDelay * 2));
+        else adaptiveDelay = Math.max(botStatusScanDelayMs(), Math.round(adaptiveDelay * 0.85));
+        await new Promise(resolve => setTimeout(resolve, adaptiveDelay));
       }
     }
   } finally {
-    botAvailabilityState = normalizeBotAvailability(botAvailabilityState);
+    await releaseBotStatusHelper();
     invalidateDuplicateCache();
-    await storageSet({ [BOT_AVAILABILITY_KEY]: botAvailabilityState, [BOT_ARCHIVE_KEY]: botArchiveState });
+    if (completed > 0) {
+      // Keep the scan's hot in-memory state as-is. Re-normalizing the entire
+      // 6k+ availability table and ~4k rich recovery archive here was a major
+      // source of the brief "page stopped responding" stalls at scan finish.
+      botStatusStorageSelfWriteUntil = Date.now() + 8000;
+
+      if (status) status.textContent = `Saving ${completed} completed Bot Status checks…`;
+      await nextOptionsIdleSlice(120);
+
+      // Persist only the IDs this run touched. The service worker merges the
+      // delta into the large availability/archive stores so the Options page
+      // does not structured-clone and serialize 6k+ status rows / 4k rich bot
+      // copies on its UI thread. Fall back to the old full write if messaging
+      // ever fails so scan results remain crash-safe.
+      const availabilityUpdates = Object.fromEntries(
+        [...availabilityChangedIds]
+          .map(id => [id, botAvailabilityState.meta?.[id]])
+          .filter(([, entry]) => !!entry)
+      );
+      const archiveUpdates = Object.fromEntries(
+        [...archiveChangedIds]
+          .map(id => [id, botArchiveState.meta?.[id]])
+          .filter(([, entry]) => !!entry)
+      );
+      const deltaSaved = await runtimeMessage({
+        type: "DS_BOT_STATUS_PERSIST_DELTA",
+        availabilityUpdates,
+        archiveUpdates
+      });
+
+      if (!deltaSaved?.ok) {
+        await storageSet({ [BOT_AVAILABILITY_KEY]: botAvailabilityState });
+        if (archiveChangedCount > 0) {
+          await nextOptionsIdleSlice(140);
+          await storageSet({ [BOT_ARCHIVE_KEY]: botArchiveState });
+        }
+      }
+
+      if (botStatusMetadataDirty || recoveryStateDirty) {
+        await nextOptionsIdleSlice(140);
+        if (status) status.textContent = recoveryStateDirty
+          ? "Saving recovered QoL memberships…"
+          : "Saving repaired saved-bot details…";
+        const payload = botStatusMetadataDirty ? botStatusMetadataStoragePayload(metadataDirtyKeys) : {};
+        if (recoveryStateDirty) {
+          Object.assign(payload, botStatusRecoveryStoragePayload({ restoreBlockedIds: [...recoveredBlockedIds] }).payload);
+          if (recoveredBlockedIds.size) {
+            const stored = await storageGet(["settings"]);
+            const settings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+            settings.blockedBotIds = uniqueClean([...(settings.blockedBotIds || []), ...recoveredBlockedIds]).filter(validBotId);
+            settings.blockedBotNames = [];
+            payload.settings = settings;
+          }
+        }
+        await storageSet(payload);
+      }
+    }
+    botStatusMetadataDirty = false;
     botAvailabilityScanRunning = false;
     if (scanButton) scanButton.disabled = false;
+    if (uncheckedButton) uncheckedButton.disabled = false;
+    if (staleButton) staleButton.disabled = false;
     if (stopButton) stopButton.disabled = true;
-    if (status) status.textContent = botAvailabilityStopRequested
+    if (status) status.textContent = terminalMessage || (botAvailabilityStopRequested
       ? `Stopped after ${completed} / ${entries.length}. Completed status/update checks were saved.`
-      : `Finished ${completed} bot${completed === 1 ? "" : "s"}. ${updatesFound ? `${updatesFound} update${updatesFound === 1 ? "" : "s"} detected. ` : ""}Duplicate matches refreshed locally.`;
+      : `${mode === "unchecked" ? `Finished ${completed} unchecked bot${completed === 1 ? "" : "s"}` : mode === "stale" ? `Refreshed ${completed} stale bot${completed === 1 ? "" : "s"}` : `Finished ${completed} bot${completed === 1 ? "" : "s"}`}. ${updatesFound ? `${updatesFound} update${updatesFound === 1 ? "" : "s"} detected. ` : ""}${recoveredCount ? `${recoveredCount} previously unavailable bot${recoveredCount === 1 ? " was" : "s were"} recovered and restored. ` : ""}${candidateCount ? `${candidateCount} unavailable candidate${candidateCount === 1 ? " needs" : "s need"} another check. ` : ""}${unknownCount ? `${unknownCount} temporary/unknown check${unknownCount === 1 ? "" : "s"}; they were left untouched.` : "Status and saved bot details updated."}`);
+    await noteBotStatusRunEvent("bot-status-run-complete", {
+      mode, scope, completed, requested: entries.length, stopped: !!botAvailabilityStopRequested,
+      updatesFound, unknownCount, candidateCount, archiveChangedCount, recoveredCount,
+      durationMs: Date.now() - runStartedAt
+    });
     botAvailabilityStopRequested = false;
-    renderBotAvailability();
-    refreshStorageUsageIfVisible();
+
+    // Paint the light Bot Status view first. Recovery/archive managers and
+    // storage-size accounting are deferred so they cannot all rebuild in the
+    // same task immediately after a large scan commits.
+    renderBotAvailability({ skipRecoveryRerender: true });
+    setTimeout(() => {
+      nextOptionsIdleSlice(240).then(() => {
+        renderSavedBotInfo();
+        renderDeletedSavedBots();
+        refreshArchiveTransferUi().catch(() => {});
+        refreshStorageUsageIfVisible();
+      }).catch(() => {});
+    }, 120);
   }
 }
 
@@ -7444,6 +9091,682 @@ async function acceptAllBotUpdates() {
   await storageSet({ [BOT_AVAILABILITY_KEY]: botAvailabilityState });
   renderBotAvailability();
   showSettingsToast(`Accepted ${updated.length} bot update${updated.length === 1 ? "" : "s"}.`);
+}
+
+
+function removeBotIdsFromStore(storeValue, idSet) {
+  const store = normalizeBotStore(storeValue);
+  const ids = store.ids.filter(id => !idSet.has(id));
+  const meta = { ...store.meta };
+  for (const id of idSet) delete meta[id];
+  return { ids, names: [], meta };
+}
+
+
+function recoveryBotStoreSnapshot(storeValue, id) {
+  const store = storeValue && Array.isArray(storeValue.ids) && storeValue.meta && typeof storeValue.meta === "object"
+    ? storeValue
+    : normalizeBotStore(storeValue);
+  return {
+    present: store.ids.includes(id),
+    record: store.meta?.[id] && typeof store.meta[id] === "object" ? { ...store.meta[id] } : null
+  };
+}
+
+function buildUnavailableRecoveryCaptureContext() {
+  const organizer = normalizeBotOrganization(botOrganizationState);
+  const recent = normalizeRecentlySeenStore(recentlySeenBotState);
+  const watch = normalizeCreatorBotWatchState(creatorBotWatchState);
+  return {
+    organizer,
+    recentById: new Map(recent.entries.map(item => [item.id, item])),
+    watch,
+    watchRecentById: new Map(watch.recent.map(item => [item.id, item]))
+  };
+}
+
+function captureUnavailableRecoveryEntry(idValue, availabilityEntry = {}, captureContext = null) {
+  const id = String(idValue || "").trim();
+  if (!BOT_ID_RE.test(id)) return null;
+
+  const blocked = recoveryBotStoreSnapshot(blockedState, id);
+  const notInterested = recoveryBotStoreSnapshot(notInterestedState, id);
+  const favorite = recoveryBotStoreSnapshot(favoriteBotState, id);
+  const later = recoveryBotStoreSnapshot(laterBotState, id);
+  const context = captureContext || buildUnavailableRecoveryCaptureContext();
+  const organizer = context.organizer || normalizeBotOrganization(botOrganizationState);
+  const organizerRecord = organizer.meta?.[id] && typeof organizer.meta[id] === "object" ? { ...organizer.meta[id] } : null;
+  const recentRecord = context.recentById?.get(id) || null;
+  const watchRecord = context.watchRecentById?.get(id) || null;
+  const openedMeta = openedChatMetaState?.[id] && typeof openedChatMetaState[id] === "object" ? { ...openedChatMetaState[id] } : null;
+  const archive = botArchiveState?.meta?.[id] || null;
+  const previous = botUnavailableRecoveryState?.meta?.[id] || null;
+
+  const firstText = (...values) => values.map(value => String(value || "").trim()).find(Boolean) || "";
+  const name = cleanAuthoritativeBotName(firstText(
+    archive?.fields?.name, archive?.name, availabilityEntry?.name,
+    favorite.record?.name, later.record?.name, blocked.record?.name, notInterested.record?.name,
+    openedMeta?.name, recentRecord?.name, organizerRecord?.name, watchRecord?.name, previous?.name
+  ), id);
+  const creator = canonicalBotCreator(firstText(
+    archive?.fields?.creator, archive?.creator, availabilityEntry?.creator,
+    favorite.record?.creator, later.record?.creator, blocked.record?.creator, notInterested.record?.creator,
+    openedMeta?.creator, recentRecord?.creator, organizerRecord?.creator, watchRecord?.creator, previous?.creator
+  ));
+  const image = canonicalBotImage(firstText(
+    archive?.fields?.image, archive?.image, availabilityEntry?.image,
+    favorite.record?.image, later.record?.image, blocked.record?.image, notInterested.record?.image,
+    openedMeta?.image, recentRecord?.image, organizerRecord?.image, watchRecord?.image, previous?.image
+  ));
+
+  const recovery = {
+    id,
+    capturedAt: Date.now(),
+    recoveredAt: 0,
+    name: name || previous?.name || id,
+    creator: creator || previous?.creator || "",
+    image: image || previous?.image || "",
+    profileUrl: String(
+      archive?.profileUrl ||
+      availabilityEntry?.profileUrl ||
+      favorite.record?.profileUrl ||
+      later.record?.profileUrl ||
+      openedMeta?.profileUrl ||
+      previous?.profileUrl ||
+      `https://spicychat.ai/chatbot/${id}`
+    ).trim(),
+    sources: uniqueClean([
+      ...(previous?.sources || []),
+      ...(availabilityEntry?.sources || []),
+      blocked.present ? "blocked" : "",
+      notInterested.present ? "notInterested" : "",
+      favorite.present ? "favorite" : "",
+      later.present ? "later" : "",
+      currentOpened.includes(id) ? "opened" : "",
+      organizerRecord ? "organizer" : "",
+      recentRecord ? "recent" : "",
+      watchRecord ? "creatorWatch" : "",
+      archive ? "archive" : ""
+    ]),
+    archiveAvailable: !!archive,
+    memberships: {
+      blocked: blocked.present,
+      notInterested: notInterested.present,
+      favorite: favorite.present,
+      later: later.present,
+      opened: currentOpened.includes(id),
+      organizer: !!organizerRecord,
+      recent: !!recentRecord,
+      creatorWatch: !!watchRecord
+    },
+    records: {
+      blocked: blocked.record,
+      notInterested: notInterested.record,
+      favorite: favorite.record,
+      later: later.record,
+      openedMeta,
+      organizer: organizerRecord,
+      recent: recentRecord ? { ...recentRecord } : null,
+      creatorWatch: watchRecord ? { ...watchRecord } : null
+    }
+  };
+
+  if (!botUnavailableRecoveryState || typeof botUnavailableRecoveryState !== "object") {
+    botUnavailableRecoveryState = { version: 1, meta: {} };
+  }
+  if (!botUnavailableRecoveryState.meta || typeof botUnavailableRecoveryState.meta !== "object") {
+    botUnavailableRecoveryState.meta = {};
+  }
+  botUnavailableRecoveryState.meta[id] = normalizeBotUnavailableRecovery({ meta: { [id]: recovery } }).meta[id];
+  return botUnavailableRecoveryState.meta[id];
+}
+
+function restoreRecoveryBotStore(storeValue, id, membership, record) {
+  if (!membership) return storeValue;
+  const store = normalizeBotStore(storeValue);
+  if (!store.ids.includes(id)) store.ids.push(id);
+  store.ids = uniqueClean(store.ids);
+  store.names = [];
+  store.meta = { ...(store.meta || {}) };
+  store.meta[id] = { ...(record && typeof record === "object" ? record : {}), ...(store.meta[id] || {}), id };
+  return store;
+}
+
+function restoreUnavailableRecoveryEntryInMemory(idValue) {
+  const id = String(idValue || "").trim();
+  if (!BOT_ID_RE.test(id)) return { restored: false, blocked: false };
+  if (!botUnavailableRecoveryState || typeof botUnavailableRecoveryState !== "object") {
+    botUnavailableRecoveryState = { version: 1, meta: {} };
+  }
+  if (!botUnavailableRecoveryState.meta || typeof botUnavailableRecoveryState.meta !== "object") {
+    botUnavailableRecoveryState.meta = {};
+  }
+  const recovery = botUnavailableRecoveryState.meta[id];
+  if (!recovery || Number(recovery.recoveredAt || 0) > 0) return { restored: false, blocked: false };
+
+  const m = recovery.memberships || {};
+  const r = recovery.records || {};
+  blockedState = restoreRecoveryBotStore(blockedState, id, m.blocked, r.blocked);
+  notInterestedState = restoreRecoveryBotStore(notInterestedState, id, m.notInterested, r.notInterested);
+  favoriteBotState = restoreRecoveryBotStore(favoriteBotState, id, m.favorite, r.favorite);
+  laterBotState = restoreRecoveryBotStore(laterBotState, id, m.later, r.later);
+
+  if (m.opened && !currentOpened.includes(id)) currentOpened = uniqueClean([...currentOpened, id]);
+  if (m.opened && r.openedMeta) openedChatMetaState = { ...openedChatMetaState, [id]: { ...r.openedMeta, id } };
+
+  if (m.organizer) {
+    const org = normalizeBotOrganization(botOrganizationState);
+    org.meta = { ...(org.meta || {}), [id]: { ...(r.organizer || {}), ...(org.meta?.[id] || {}), id } };
+    botOrganizationState = org;
+  }
+
+  if (m.recent && r.recent) {
+    const recent = normalizeRecentlySeenStore(recentlySeenBotState);
+    if (!recent.entries.some(item => item.id === id)) recent.entries.unshift({ ...r.recent, id });
+    recentlySeenBotState = normalizeRecentlySeenStore(recent);
+  }
+
+  if (m.creatorWatch && r.creatorWatch) {
+    const watch = normalizeCreatorBotWatchState(creatorBotWatchState);
+    if (!watch.recent.some(item => item.id === id)) watch.recent.unshift({ ...r.creatorWatch, id });
+    creatorBotWatchState = normalizeCreatorBotWatchState(watch);
+  }
+
+  const recoveredAt = Date.now();
+  botUnavailableRecoveryState.meta[id] = { ...recovery, recoveredAt };
+  const availability = botAvailabilityState?.meta?.[id];
+  if (availability) {
+    botAvailabilityState.meta[id] = {
+      ...availability,
+      recoverySources: [],
+      recoveredAt,
+      reason: `${availability.reason || "Available."} Local QoL memberships restored from unavailable-bot recovery.`
+    };
+  }
+
+  return { restored: true, blocked: !!m.blocked };
+}
+
+function botStatusRecoveryStoragePayload({ restoreBlockedIds = [] } = {}) {
+  const payload = {
+    [BOT_UNAVAILABLE_RECOVERY_KEY]: botUnavailableRecoveryState,
+    [BLOCKED_BOTS_KEY]: blockedState,
+    [NOT_INTERESTED_KEY]: notInterestedState,
+    [FAVORITE_BOTS_KEY]: favoriteBotState,
+    [LATER_BOTS_KEY]: laterBotState,
+    [OPENED_KEY]: currentOpened,
+    [OPENED_META_KEY]: openedChatMetaState,
+    [RECENTLY_SEEN_BOTS_KEY]: recentlySeenBotState,
+    [BOT_ORGANIZER_KEY]: botOrganizationState,
+    [CREATOR_BOT_WATCH_KEY]: creatorBotWatchState
+  };
+  return { payload, restoreBlockedIds: uniqueClean(restoreBlockedIds).filter(validBotId) };
+}
+
+function preserveUnavailableRecoveryCopy(idValue, availabilityEntry = {}) {
+  const id = String(idValue || "").trim();
+  if (!BOT_ID_RE.test(id)) return false;
+  const existing = normalizeBotArchive(botArchiveState).meta[id] || null;
+  const trusted = [
+    favoriteBotState?.meta?.[id], laterBotState?.meta?.[id], blockedState?.meta?.[id],
+    notInterestedState?.meta?.[id], botOrganizationState?.meta?.[id],
+    ...normalizeRecentlySeenStore(recentlySeenBotState).entries.filter(item => item.id === id),
+    ...normalizeCreatorBotWatchState(creatorBotWatchState).recent.filter(item => item.id === id)
+  ].filter(Boolean);
+  const opened = openedChatMetaState?.[id] || {};
+  const first = key => trusted.map(item => item?.[key]).find(value => String(value || "").trim()) || "";
+  const name = cleanAuthoritativeBotName(existing?.fields?.name || existing?.name || availabilityEntry?.name || first("name") || opened.name || "", id);
+  const creator = String(existing?.fields?.creator || existing?.creator || availabilityEntry?.creator || first("creator") || opened.creator || "").replace(/\s+/g, " ").trim();
+  const image = String(existing?.fields?.image || existing?.image || availabilityEntry?.image || first("image") || opened.image || "").trim();
+  const description = String(existing?.fields?.description || first("description") || first("summary") || "").replace(/\s+/g, " ").trim();
+  const fields = {
+    ...(existing?.fields || {}),
+    name: existing?.fields?.name || name,
+    description: existing?.fields?.description || description,
+    creator: existing?.fields?.creator || creator,
+    image: existing?.fields?.image || image
+  };
+  const raw = {
+    ...(existing || {}),
+    id,
+    name: name || existing?.name || id,
+    creator,
+    image,
+    profileUrl: existing?.profileUrl || `https://spicychat.ai/chatbot/${id}`,
+    chatUrls: uniqueClean([...(existing?.chatUrls || []), ...knownChatUrlsForBot(id)]).slice(0, 50),
+    firstSavedAt: Number(existing?.firstSavedAt) || Date.now(),
+    lastSavedAt: Date.now(),
+    lastAvailableAt: Number(existing?.lastAvailableAt) || 0,
+    source: existing?.source || "Unavailable bot recovery",
+    fields
+  };
+  const normalized = normalizeBotArchive({ meta: { [id]: raw } }).meta[id];
+  if (!normalized?.coverage?.length) return false;
+  if (!botArchiveState || typeof botArchiveState !== "object") botArchiveState = { meta: {} };
+  if (!botArchiveState.meta || typeof botArchiveState.meta !== "object") botArchiveState.meta = {};
+  botArchiveState.meta[id] = mergeBotArchiveEntry(botArchiveState.meta[id], normalized);
+  return true;
+}
+
+async function cleanConfirmedUnavailableBots() {
+  await ensureSavedListsDataLoaded();
+  const unavailable = Object.values(normalizeBotAvailability(botAvailabilityState).meta)
+    .filter(entry => isConfirmedUnavailableBotStatus(entry) && validBotId(entry.id));
+  if (!unavailable.length) {
+    showSettingsToast("No confirmed unavailable bots are waiting for cleanup.");
+    return;
+  }
+
+  const ids = new Set(unavailable.map(entry => entry.id));
+  if (!confirm(
+    `Archive + clean ${ids.size} confirmed unavailable/deleted bot${ids.size === 1 ? "" : "s"} from active QoL lists?\n\n` +
+    "QoL will save a recovery ledger first. Saved bot copies, old chat/history data, and recommendation-feedback history are kept. " +
+    "If a cleaned bot becomes available again, QoL can restore the memberships it removed."
+  )) return;
+
+  // Phase 1: build and VERIFY a compact recovery ledger before removing any ID
+  // from an active store. This guarantees that even a bot with no rich archive
+  // snapshot still keeps its UUID, list memberships and whatever local metadata
+  // was recoverable.
+  botUnavailableRecoveryState = normalizeBotUnavailableRecovery(botUnavailableRecoveryState);
+  const recoveryCaptureContext = buildUnavailableRecoveryCaptureContext();
+  let newArchiveCopies = 0;
+  for (const entry of unavailable) {
+    captureUnavailableRecoveryEntry(entry.id, entry, recoveryCaptureContext);
+    if (!botArchiveState?.meta?.[entry.id] && preserveUnavailableRecoveryCopy(entry.id, entry)) {
+      newArchiveCopies++;
+      // The newly-created archive entry is useful to the ledger immediately.
+      const recovery = botUnavailableRecoveryState.meta?.[entry.id];
+      if (recovery) recovery.archiveAvailable = true;
+    }
+  }
+
+  await nextOptionsIdleSlice(140);
+  botStatusStorageSelfWriteUntil = Date.now() + 8000;
+  const recoverySaved = await storageSetVerified({
+    [BOT_UNAVAILABLE_RECOVERY_KEY]: botUnavailableRecoveryState
+  });
+  if (!recoverySaved) {
+    showSettingsToast("Cleanup cancelled: the unavailable-bot recovery ledger could not be verified. No active IDs were removed.");
+    return;
+  }
+
+  // Only write the very large archive when cleanup actually had to create a
+  // missing recovery copy. Existing saved copies are left untouched.
+  if (newArchiveCopies > 0) {
+    await nextOptionsIdleSlice(180);
+    botStatusStorageSelfWriteUntil = Date.now() + 8000;
+    const archiveSaved = await storageSet({ [BOT_ARCHIVE_KEY]: botArchiveState });
+    if (!archiveSaved) {
+      showSettingsToast("Cleanup cancelled: new saved recovery copies could not be written. No active IDs were removed.");
+      return;
+    }
+  }
+
+  // Phase 2: remove only active memberships. Historical evidence stays intact.
+  // In particular, Less Like / Dislike history is NEVER erased by cleanup.
+  blockedState = removeBotIdsFromStore(blockedState, ids);
+  notInterestedState = removeBotIdsFromStore(notInterestedState, ids);
+  favoriteBotState = removeBotIdsFromStore(favoriteBotState, ids);
+  laterBotState = removeBotIdsFromStore(laterBotState, ids);
+
+  currentOpened = uniqueClean(currentOpened).filter(id => !ids.has(id));
+  openedChatMetaState = { ...openedChatMetaState };
+  ids.forEach(id => delete openedChatMetaState[id]);
+
+  recentlySeenBotState = {
+    entries: normalizeRecentlySeenStore(recentlySeenBotState).entries.filter(item => !ids.has(item.id))
+  };
+
+  const org = normalizeBotOrganization(botOrganizationState);
+  ids.forEach(id => delete org.meta[id]);
+  botOrganizationState = org;
+
+  const watch = normalizeCreatorBotWatchState(creatorBotWatchState);
+  watch.recent = watch.recent.filter(item => !ids.has(item.id));
+  // seenIds is historical evidence, not an active membership. Keep it so a
+  // cleanup does not make QoL forget that the creator previously had this bot.
+  creatorBotWatchState = watch;
+
+  // Remove dead IDs from unfinished bulk queues so workers do not keep trying
+  // them. Completed recommendation-feedback history is deliberately preserved.
+  quickDislikeBulkState = filterBulkStateIds({
+    ...quickDislikeBulkState,
+    pendingIds: (quickDislikeBulkState.pendingIds || []).filter(id => !ids.has(id)),
+    failedIds: (quickDislikeBulkState.failedIds || []).filter(id => !ids.has(id)),
+    currentId: ids.has(quickDislikeBulkState.currentId) ? "" : quickDislikeBulkState.currentId
+  }, normalizeQuickDislikeBulkState);
+  quickLessLikeBulkState = filterBulkStateIds({
+    ...quickLessLikeBulkState,
+    pendingIds: (quickLessLikeBulkState.pendingIds || []).filter(id => !ids.has(id)),
+    failedIds: (quickLessLikeBulkState.failedIds || []).filter(id => !ids.has(id)),
+    currentId: ids.has(quickLessLikeBulkState.currentId) ? "" : quickLessLikeBulkState.currentId
+  }, normalizeQuickLessLikeBulkState);
+
+  const stored = await storageGet(["settings"]);
+  const settings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+  settings.blockedBotIds = uniqueClean(settings.blockedBotIds || []).filter(id => !ids.has(id) && validBotId(id));
+  settings.blockedBotNames = [];
+
+  const availability = normalizeBotAvailability(botAvailabilityState);
+  const archives = botArchiveState?.meta || {};
+  const cleanedAt = Date.now();
+  for (const id of ids) {
+    const current = availability.meta[id];
+    if (!current) continue;
+    const recovery = botUnavailableRecoveryState.meta?.[id];
+    availability.meta[id] = {
+      ...current,
+      recoverySources: uniqueClean([...(current.sources || []), ...(current.recoverySources || []), ...(recovery?.sources || [])]),
+      sources: uniqueClean(["recovery", ...(archives[id] ? ["archive"] : [])]),
+      reason: `${current.reason || "Confirmed unavailable."} Active QoL memberships quarantined; recovery ledger kept${archives[id] ? " with saved bot copy" : ""}.`,
+      cleanupAppliedAt: cleanedAt,
+      recoveredAt: 0
+    };
+  }
+  botAvailabilityState = availability;
+
+  // Keep this commit split from the archive/recovery-ledger phase and yield
+  // before it. This prevents the old "serialize every giant store in one task"
+  // behavior that caused repeated brief Options-page hangs.
+  await nextOptionsIdleSlice(180);
+  botStatusStorageSelfWriteUntil = Date.now() + 8000;
+  const cleanedSaved = await storageSet({
+    settings,
+    [BLOCKED_BOTS_KEY]: blockedState,
+    [NOT_INTERESTED_KEY]: notInterestedState,
+    [FAVORITE_BOTS_KEY]: favoriteBotState,
+    [LATER_BOTS_KEY]: laterBotState,
+    [OPENED_KEY]: currentOpened,
+    [OPENED_META_KEY]: openedChatMetaState,
+    [RECENTLY_SEEN_BOTS_KEY]: recentlySeenBotState,
+    [BOT_ORGANIZER_KEY]: botOrganizationState,
+    [CREATOR_BOT_WATCH_KEY]: creatorBotWatchState,
+    [QUICK_DISLIKE_BULK_STATE_KEY]: quickDislikeBulkState,
+    [QUICK_LESS_LIKE_BULK_STATE_KEY]: quickLessLikeBulkState,
+    [BOT_AVAILABILITY_KEY]: botAvailabilityState,
+    [BOT_UNAVAILABLE_RECOVERY_KEY]: botUnavailableRecoveryState
+  });
+
+  if (!cleanedSaved) {
+    showSettingsToast("Cleanup write failed. The verified recovery ledger was kept; reload before trying again.");
+    return;
+  }
+
+  invalidateDuplicateCache();
+  renderBotAvailability({ skipRecoveryRerender: true });
+  setTimeout(() => {
+    nextOptionsIdleSlice(240).then(() => {
+      renderSavedBotInfo();
+      renderSavedBotsHub();
+      if (activeOptionsTab() === "blocking") {
+        renderBotManager("blocked");
+        renderBotManager("notInterested");
+      }
+      if (activeOptionsTab() === "saved") {
+        renderBotManager("favorite");
+        renderBotManager("later");
+        renderBotManager("opened");
+      }
+      refreshStorageUsageIfVisible();
+    }).catch(() => {});
+  }, 120);
+
+  showSettingsToast(
+    `Cleaned ${ids.size} unavailable bot${ids.size === 1 ? "" : "s"} from active lists. ` +
+    `Recovery ledger saved${newArchiveCopies ? ` · ${newArchiveCopies} new saved cop${newArchiveCopies === 1 ? "y" : "ies"} recovered` : ""}.`
+  );
+}
+
+const savedBotInfoUiState = { query: "", visible: 20, collapsed: true };
+
+function renderSavedBotInfo() {
+  const host = $("savedBotInfoManager");
+  if (!host) return;
+  const query = String($("savedBotInfoSearch")?.value || savedBotInfoUiState.query || "").toLowerCase().replace(/\s+/g, " ").trim();
+  savedBotInfoUiState.query = query;
+  const archives = normalizeBotArchive(botArchiveState).meta;
+  const availability = normalizeBotAvailability(botAvailabilityState).meta;
+  const blockedIds = new Set(normalizeBotStore(blockedState).ids);
+  const visibleArchives = Object.values(archives).filter(archive => !blockedIds.has(archive.id));
+  const items = visibleArchives
+    .filter(archive => {
+      if (!query) return true;
+      const fields = archive.fields || {};
+      return `${archive.id} ${archive.name || ""} ${archive.creator || ""} ${fields.title || ""} ${fields.description || ""}`.toLowerCase().includes(query);
+    })
+    .sort((a, b) => Number(b.lastSavedAt || 0) - Number(a.lastSavedAt || 0));
+  const total = visibleArchives.length;
+  const blockedHidden = Math.max(0, Object.keys(archives).length - total);
+  const limit = Math.max(20, Number(savedBotInfoUiState.visible || 20) || 20);
+  const shown = items.slice(0, limit);
+  if ($("savedBotInfoSummary")) {
+    $("savedBotInfoSummary").textContent = `${total} saved cop${total === 1 ? "y" : "ies"}${blockedHidden ? ` · ${blockedHidden} blocked hidden` : ""}${query ? ` · ${items.length} matching` : ""} · showing ${shown.length}`;
+  }
+  const showMore = $("savedBotInfoShowMore");
+  const showLess = $("savedBotInfoShowLess");
+  const collapse = $("savedBotInfoCollapse");
+  if (showMore) {
+    showMore.style.display = items.length > shown.length ? "" : "none";
+    showMore.textContent = `Show 20 more (${Math.max(0, items.length - shown.length)} left)`;
+  }
+  if (showLess) showLess.style.display = shown.length > 20 || !savedBotInfoUiState.collapsed ? "" : "none";
+  if (collapse) {
+    collapse.style.display = items.length > 20 ? "" : "none";
+    collapse.textContent = limit <= 20 ? "Show 100" : "Collapse to 20";
+  }
+  if (!items.length) {
+    setEmptyState(host, query ? "No saved recovery copies match that search." : "No saved bot recovery copies yet. Run Bot Status Center on saved bots or enable archive capture to build them.");
+    return;
+  }
+  const nodes = shown.map(archive => {
+    const status = availability[archive.id] || null;
+    const entry = {
+      id: archive.id,
+      name: archive.name || archive.fields?.name || archive.id,
+      creator: archive.creator || archive.fields?.creator || "",
+      image: archive.image || archive.fields?.image || "",
+      profileUrl: archive.profileUrl || `https://spicychat.ai/chatbot/${archive.id}`,
+      sources: ["archive"],
+      checkedAt: Number(status?.checkedAt) || 0,
+      status: status?.status || "unknown",
+      reason: status?.reason || "Saved local recovery copy.",
+      httpStatus: Number(status?.httpStatus) || 0,
+      updateStatus: status?.updateStatus || "current",
+      changedFields: status?.changedFields || [],
+      archive,
+      duplicateMatches: []
+    };
+    const card = botAvailabilityCard(entry);
+    card.querySelector(".bot-availability-recheck")?.remove();
+    card.querySelector(".bot-availability-forget")?.remove();
+    card.querySelector(".bot-update-accept")?.remove();
+    return card;
+  });
+  host.replaceChildren(...nodes);
+  host.querySelectorAll(".bot-archive-copy").forEach(button => button.addEventListener("click", async () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (!archive) return;
+    try { await navigator.clipboard.writeText(botArchiveReadableText(archive)); showSettingsToast("Saved bot copy copied to clipboard."); } catch {}
+  }));
+  host.querySelectorAll(".bot-archive-portable").forEach(button => button.addEventListener("click", () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (archive) downloadPortableBotProfile(archive);
+  }));
+  host.querySelectorAll(".bot-archive-download").forEach(button => button.addEventListener("click", () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (archive) downloadBotArchiveEntry(archive);
+  }));
+  host.querySelectorAll(".bot-archive-delete").forEach(button => button.addEventListener("click", async () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (!archive || !confirm(`Delete the saved local recovery copy of ${archive.name || id}?`)) return;
+    delete botArchiveState.meta[id];
+    botArchiveState = normalizeBotArchive(botArchiveState);
+    await storageSet({ [BOT_ARCHIVE_KEY]: botArchiveState });
+    renderSavedBotInfo();
+    renderBotAvailability();
+  }));
+}
+
+
+const deletedSavedBotsUiState = { query: "", visible: 20, collapsed: true };
+
+function isConfirmedUnavailableBotStatus(entry) {
+  if (!entry || String(entry.status || "") !== "unavailable") return false;
+  const httpStatus = Number(entry.httpStatus || 0);
+  if (httpStatus === 404 || httpStatus === 410) return true;
+  const reason = String(entry.reason || "").toLowerCase();
+  return /(?:character api|profile).*(?:not found|unavailable|deleted)|(?:http\s*)?(?:404|410)|page says .*?(?:not found|unavailable|deleted)/i.test(reason);
+}
+
+function deletedSavedBotEntries() {
+  const availability = normalizeBotAvailability(botAvailabilityState).meta;
+  const archives = normalizeBotArchive(botArchiveState).meta;
+  const blockedIds = new Set(normalizeBotStore(blockedState).ids);
+  const query = String($("deletedSavedBotSearch")?.value || deletedSavedBotsUiState.query || "")
+    .toLowerCase().replace(/\s+/g, " ").trim();
+  deletedSavedBotsUiState.query = query;
+  return Object.values(availability)
+    .filter(entry => isConfirmedUnavailableBotStatus(entry) && archives[entry.id] && !blockedIds.has(entry.id))
+    .map(entry => ({ ...entry, archive: archives[entry.id] }))
+    .filter(entry => {
+      if (!query) return true;
+      const fields = entry.archive?.fields || {};
+      return `${entry.id} ${entry.name || ""} ${entry.creator || ""} ${fields.name || ""} ${fields.title || ""} ${fields.description || ""} ${fields.tags || ""}`.toLowerCase().includes(query);
+    })
+    .sort((a, b) => Number(b.checkedAt || 0) - Number(a.checkedAt || 0) || String(a.archive?.name || a.name || a.id).localeCompare(String(b.archive?.name || b.name || b.id)));
+}
+
+function deletedSavedBotCard(entry) {
+  const archive = entry.archive;
+  const fields = archive?.fields || {};
+  const card = makeElement("div", { className: "bot-manager-card deleted-saved-bot-card", dataset: { id: entry.id } });
+  const image = canonicalBotImage(archive?.image || fields.image || entry.image || "");
+  if (image) card.appendChild(makeElement("img", { className: "bot-manager-image", attrs: { src: image, alt: "", loading: "lazy", decoding: "async" } }));
+  else card.appendChild(makeElement("div", { className: "bot-manager-placeholder", text: "?" }));
+
+  const main = makeElement("div", { className: "bot-manager-main" });
+  main.appendChild(makeElement("div", { className: "bot-manager-title", text: displayNormalizedSavedText(archive?.name || fields.name || entry.name || entry.id) }));
+  const creator = archive?.creator || fields.creator || entry.creator || "";
+  if (creator) main.appendChild(makeElement("div", { className: "bot-manager-creator", text: displayNormalizedSavedText(creator) }));
+  main.appendChild(makeElement("div", { className: "bot-manager-id", text: entry.id }));
+
+  const badges = makeElement("div", { className: "bot-status-badges" });
+  badges.appendChild(makeElement("span", { className: "bot-availability-status", text: "Unavailable / deleted", dataset: { status: "unavailable" } }));
+  const count = archive?.coverage?.length || 0;
+  badges.appendChild(makeElement("span", { className: "bot-update-badge", text: `Recovery copy · ${count} field${count === 1 ? "" : "s"}`, dataset: { status: "current" } }));
+  main.appendChild(badges);
+
+  const meta = [];
+  if (archive?.lastAvailableAt) meta.push(`Last available: ${new Date(archive.lastAvailableAt).toLocaleString()}`);
+  if (entry.checkedAt) meta.push(`Checked: ${new Date(entry.checkedAt).toLocaleString()}`);
+  if (archive?.chatUrls?.length) meta.push(`${archive.chatUrls.length} old chat link${archive.chatUrls.length === 1 ? "" : "s"}`);
+  if (meta.length) main.appendChild(makeElement("div", { className: "bot-availability-meta", text: meta.join(" · ") }));
+
+  const description = fields.description || fields.title || "";
+  if (description) main.appendChild(makeElement("div", { className: "bot-manager-description", text: displayNormalizedSavedText(description) }));
+  const archiveDetails = botArchiveDetails({ archive });
+  if (archiveDetails) main.appendChild(archiveDetails);
+
+  if ((archive?.chatUrls || []).length > 1) {
+    const chats = makeElement("details", { className: "bot-update-details bot-archive-details" });
+    chats.appendChild(makeElement("summary", { text: `Old chats (${archive.chatUrls.length})` }));
+    const links = makeElement("div", { className: "bot-manager-actions" });
+    archive.chatUrls.slice(0, 50).forEach((url, index) => links.appendChild(makeElement("a", {
+      text: `Open chat ${index + 1}`,
+      attrs: { href: url, target: "_blank", rel: "noopener noreferrer" }
+    })));
+    chats.appendChild(links);
+    main.appendChild(chats);
+  }
+
+  const actions = makeElement("div", { className: "bot-manager-actions" });
+  if (archive?.chatUrls?.length) actions.appendChild(makeElement("a", { text: "Open old chat", attrs: { href: archive.chatUrls[0], target: "_blank", rel: "noopener noreferrer" } }));
+  actions.appendChild(makeElement("button", { className: "deleted-bot-recheck", text: "Check again", attrs: { type: "button" } }));
+  actions.appendChild(makeElement("button", { className: "bot-archive-copy", text: "Copy saved bot", attrs: { type: "button" } }));
+  actions.appendChild(makeElement("button", { className: "bot-archive-portable", text: "Importable JSON", attrs: { type: "button", title: "Character Card JSON that QoL can import back into SpicyChat" } }));
+  actions.appendChild(makeElement("button", { className: "bot-archive-download", text: "Archive JSON", attrs: { type: "button", title: "Exact QoL saved-copy record" } }));
+  main.appendChild(actions);
+  card.appendChild(main);
+  return card;
+}
+
+function renderDeletedSavedBots() {
+  const host = $("deletedSavedBotManager");
+  if (!host) return;
+  const all = deletedSavedBotEntries();
+  const archives = normalizeBotArchive(botArchiveState).meta;
+  const blockedIds = new Set(normalizeBotStore(blockedState).ids);
+  const totalRecoverable = Object.values(normalizeBotAvailability(botAvailabilityState).meta)
+    .filter(entry => isConfirmedUnavailableBotStatus(entry) && archives[entry.id] && !blockedIds.has(entry.id)).length;
+  const limit = Math.max(20, Number(deletedSavedBotsUiState.visible || 20) || 20);
+  const shown = all.slice(0, limit);
+  if ($("deletedSavedBotSummary")) {
+    $("deletedSavedBotSummary").textContent = `${totalRecoverable} recoverable deleted bot${totalRecoverable === 1 ? "" : "s"}${deletedSavedBotsUiState.query ? ` · ${all.length} matching` : ""}`;
+  }
+  const showMore = $("deletedSavedBotShowMore");
+  const showLess = $("deletedSavedBotShowLess");
+  const collapse = $("deletedSavedBotCollapse");
+  if (showMore) {
+    showMore.style.display = all.length > shown.length ? "" : "none";
+    showMore.textContent = `Show 20 more (${Math.max(0, all.length - shown.length)} left)`;
+  }
+  if (showLess) showLess.style.display = shown.length > 20 || !deletedSavedBotsUiState.collapsed ? "" : "none";
+  if (collapse) {
+    collapse.style.display = all.length > 20 ? "" : "none";
+    collapse.textContent = limit <= 20 ? "Show 100" : "Collapse to 20";
+  }
+  if (!all.length) {
+    setEmptyState(host, deletedSavedBotsUiState.query ? "No deleted recovery copies match that search." : "No confirmed deleted/unavailable bots with recovery copies yet.");
+    return;
+  }
+  host.replaceChildren(...shown.map(deletedSavedBotCard));
+
+  host.querySelectorAll(".deleted-bot-recheck").forEach(button => button.addEventListener("click", async () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const previous = normalizeBotAvailability(botAvailabilityState).meta[id] || null;
+    if (!id) return;
+    button.disabled = true;
+    button.textContent = "Checking...";
+    const rawResult = await checkBotAvailability({ ...(previous || {}), id, sources: uniqueClean([...(previous?.sources || []), "archive"]) });
+    const result = reconcileBotUpdate(previous, rawResult);
+    botAvailabilityState.meta[id] = result;
+    const metadataRepaired = applyAuthoritativeBotMetadata(rawResult);
+    if (rawResult.status === "available" && rawResult.archiveSnapshot) {
+      saveArchiveSnapshotForBot(id, rawResult.archiveSnapshot, {
+        name: result.name,
+        creator: result.creator,
+        image: result.image,
+        profileUrl: result.profileUrl,
+        chatUrls: knownChatUrlsForBot(id),
+        source: "Bot Status Center"
+      });
+    }
+    botAvailabilityState = normalizeBotAvailability(botAvailabilityState);
+    await storageSet({ [BOT_AVAILABILITY_KEY]: botAvailabilityState, [BOT_ARCHIVE_KEY]: botArchiveState, ...(metadataRepaired ? botStatusMetadataStoragePayload() : {}) });
+    renderBotAvailability();
+    showSettingsToast(result.status === "available" ? "Bot is available again." : `Bot status: ${botAvailabilityStatusLabel(result.status)}.`);
+  }));
+  host.querySelectorAll(".bot-archive-copy").forEach(button => button.addEventListener("click", async () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (!archive) return;
+    try { await navigator.clipboard.writeText(botArchiveReadableText(archive)); showSettingsToast("Saved bot copy copied to clipboard."); } catch {}
+  }));
+  host.querySelectorAll(".bot-archive-portable").forEach(button => button.addEventListener("click", () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (archive) downloadPortableBotProfile(archive);
+  }));
+  host.querySelectorAll(".bot-archive-download").forEach(button => button.addEventListener("click", () => {
+    const id = button.closest(".bot-manager-card")?.dataset.id || "";
+    const archive = normalizeBotArchive(botArchiveState).meta[id];
+    if (archive) downloadBotArchiveEntry(archive);
+  }));
 }
 
 async function clearBotAvailabilityResults() {
@@ -7477,7 +9800,62 @@ async function clearBotArchive() {
 }
 
 function setupBotAvailabilityControls() {
-  $("scanBotAvailability")?.addEventListener("click", runBotAvailabilityScan);
+  $("scanBotAvailability")?.addEventListener("click", () => runBotAvailabilityScan({ mode: "all" }));
+  $("scanUncheckedBotAvailability")?.addEventListener("click", () => runBotAvailabilityScan({ mode: "unchecked" }));
+  $("scanStaleBotAvailability")?.addEventListener("click", () => runBotAvailabilityScan({ mode: "stale" }));
+  $("cleanUnavailableBots")?.addEventListener("click", () => cleanConfirmedUnavailableBots().catch(() => showSettingsToast("Could not clean unavailable bots.")));
+  $("savedBotInfoSearch")?.addEventListener("input", event => {
+    savedBotInfoUiState.query = event?.target?.value || "";
+    savedBotInfoUiState.visible = 20;
+    savedBotInfoUiState.collapsed = true;
+    renderSavedBotInfo();
+  });
+  $("savedBotInfoShowMore")?.addEventListener("click", () => {
+    savedBotInfoUiState.visible = Math.min(5000, Number(savedBotInfoUiState.visible || 20) + 20);
+    savedBotInfoUiState.collapsed = true;
+    renderSavedBotInfo();
+  });
+  $("savedBotInfoShowLess")?.addEventListener("click", () => {
+    savedBotInfoUiState.visible = 20;
+    savedBotInfoUiState.collapsed = true;
+    renderSavedBotInfo();
+  });
+  $("savedBotInfoCollapse")?.addEventListener("click", () => {
+    if (Number(savedBotInfoUiState.visible || 20) <= 20) {
+      const archiveCount = Object.keys(normalizeBotArchive(botArchiveState).meta).length;
+      savedBotInfoUiState.visible = Math.min(100, archiveCount);
+      savedBotInfoUiState.collapsed = false;
+    } else {
+      savedBotInfoUiState.visible = 20;
+      savedBotInfoUiState.collapsed = true;
+    }
+    renderSavedBotInfo();
+  });
+  $("deletedSavedBotSearch")?.addEventListener("input", () => {
+    deletedSavedBotsUiState.visible = 20;
+    deletedSavedBotsUiState.collapsed = true;
+    renderDeletedSavedBots();
+  });
+  $("deletedSavedBotShowMore")?.addEventListener("click", () => {
+    deletedSavedBotsUiState.visible = Math.min(5000, Number(deletedSavedBotsUiState.visible || 20) + 20);
+    deletedSavedBotsUiState.collapsed = true;
+    renderDeletedSavedBots();
+  });
+  $("deletedSavedBotShowLess")?.addEventListener("click", () => {
+    deletedSavedBotsUiState.visible = 20;
+    deletedSavedBotsUiState.collapsed = true;
+    renderDeletedSavedBots();
+  });
+  $("deletedSavedBotCollapse")?.addEventListener("click", () => {
+    if (Number(deletedSavedBotsUiState.visible || 20) <= 20) {
+      deletedSavedBotsUiState.visible = Math.min(100, deletedSavedBotEntries().length);
+      deletedSavedBotsUiState.collapsed = false;
+    } else {
+      deletedSavedBotsUiState.visible = 20;
+      deletedSavedBotsUiState.collapsed = true;
+    }
+    renderDeletedSavedBots();
+  });
   $("stopBotAvailabilityScan")?.addEventListener("click", () => {
     botAvailabilityStopRequested = true;
     const status = $("botAvailabilityScanStatus");
@@ -7490,16 +9868,35 @@ function setupBotAvailabilityControls() {
     if (button) button.disabled = true;
     showSettingsToast("Calculating duplicate / reupload matches...");
     await nextUiFrame();
+
+    // Duplicate matching is local analysis only. Snapshot the already-checked
+    // availability data and the rendered base before doing the heavier match
+    // pass so refreshing duplicates can never replace Available/Restricted/etc.
+    // with the tracked-list default of Unknown.
+    const availabilitySnapshot = normalizeBotAvailability(botAvailabilityState);
     const base = botStatusCenterBaseEntries(scope);
     botDuplicateMatchesCache = computeBotDuplicateMatches(base);
     botDuplicateCacheScope = scope;
     botDuplicateCacheReady = true;
-    renderBotAvailability();
+    botAvailabilityState = availabilitySnapshot;
+    renderBotAvailability({ baseEntries: base, skipRecoveryRerender: true });
     if (button) button.disabled = false;
-    showSettingsToast("Duplicate / reupload matches refreshed from local bot data.");
+    showSettingsToast("Duplicate / reupload matches refreshed. Bot availability statuses were left unchanged.");
   });
   $("clearBotAvailabilityResults")?.addEventListener("click", clearBotAvailabilityResults);
   $("clearBotArchive")?.addEventListener("click", clearBotArchive);
+  $("exportBotStatusArchiveJsonGz")?.addEventListener("click", downloadBotStatusArchiveJsonGz);
+  $("testBotStatusArchiveEndpoint")?.addEventListener("click", testArchiveUploadEndpoint);
+  $("sendBotStatusArchiveChanged")?.addEventListener("click", () => sendBotStatusArchiveToArchive({ forceAll: false }));
+  $("sendBotStatusArchiveAll")?.addEventListener("click", () => sendBotStatusArchiveToArchive({ forceAll: true }));
+  $("enableBotStatusArchiveContribution")?.addEventListener("change", event => setArchiveContributionEnabled(!!event.target.checked).catch(() => {}));
+  $("submitBotStatusArchiveChanged")?.addEventListener("click", () => sendBotStatusArchiveContribution({ forceAll: false }));
+  $("submitBotStatusArchiveAll")?.addEventListener("click", () => sendBotStatusArchiveContribution({ forceAll: true }));
+  const persistArchiveConfig = debounceCallback(() => saveArchiveUploadConfig({ quiet: true }).catch(() => {}), 350);
+  $("botStatusArchiveEndpoint")?.addEventListener("change", persistArchiveConfig);
+  $("botStatusArchiveToken")?.addEventListener("input", persistArchiveConfig);
+  $("botStatusScanSpeed")?.addEventListener("change", () => save().catch(() => {}));
+  $("botStatusStaleDays")?.addEventListener("change", () => { save().catch(() => {}); renderBotAvailability(); });
   $("botAvailabilityScope")?.addEventListener("change", () => {
     invalidateDuplicateCache();
     botAvailabilityUiState.visible = 20;
@@ -7513,9 +9910,14 @@ function setupBotAvailabilityControls() {
     if (BOT_DUPLICATE_LEVELS.has(botAvailabilityUiState.status) && !botDuplicateCacheReady) {
       const scope = String($("botAvailabilityScope")?.value || "all");
       await nextUiFrame();
-      botDuplicateMatchesCache = computeBotDuplicateMatches(botStatusCenterBaseEntries(scope));
+      const availabilitySnapshot = normalizeBotAvailability(botAvailabilityState);
+      const base = botStatusCenterBaseEntries(scope);
+      botDuplicateMatchesCache = computeBotDuplicateMatches(base);
       botDuplicateCacheScope = scope;
       botDuplicateCacheReady = true;
+      botAvailabilityState = availabilitySnapshot;
+      renderBotAvailability({ baseEntries: base, skipRecoveryRerender: true });
+      return;
     }
     renderBotAvailability();
   });
@@ -8212,7 +10614,16 @@ function isPlaceholderBotName(value, id = "") {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return true;
   if (id && text.toLowerCase() === String(id).toLowerCase()) return true;
-  return ["for you", "unknown bot", "unknown", "chatbot"].includes(text.toLowerCase());
+  const lower = text.toLowerCase();
+  return [
+    "for you", "unknown bot", "unknown", "chatbot", "spicychat", "404",
+    "create personalized ai characters chatbots", "create personalized ai characters chatbot"
+  ].includes(lower) || /^create personalized ai characters chatbots?\b/i.test(text);
+}
+
+function cleanAuthoritativeBotName(value, id = "") {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return isPlaceholderBotName(text, id) ? "" : text;
 }
 
 function localBotNameCandidates(id) {
@@ -8253,6 +10664,167 @@ function repairBlockedNamesFromLocalMetadata() {
   return repaired;
 }
 
+function knownChatUrlsForBot(idValue) {
+  const id = String(idValue || "").trim();
+  if (!BOT_ID_RE.test(id)) return [];
+  const urls = [];
+  const add = raw => {
+    if (!raw) return;
+    const values = [raw.chatUrl, ...(Array.isArray(raw.chatUrls) ? raw.chatUrls : [])];
+    for (const value of values) {
+      const url = String(value || "").trim();
+      if (/^https:\/\/[^/]*spicychat\.ai\/chat\//i.test(url)) urls.push(url);
+    }
+  };
+  add(openedChatMetaState?.[id]);
+  add(blockedState?.meta?.[id]);
+  add(notInterestedState?.meta?.[id]);
+  add(favoriteBotState?.meta?.[id]);
+  add(laterBotState?.meta?.[id]);
+  add(botOrganizationState?.meta?.[id]);
+  add(normalizeBotArchive(botArchiveState).meta[id]);
+  for (const item of normalizeRecentlySeenStore(recentlySeenBotState).entries) if (item.id === id) add(item);
+  for (const item of normalizeCreatorBotWatchState(creatorBotWatchState).recent) if (item.id === id) add(item);
+  if (uniqueClean(currentOpened).includes(id) && !urls.length) urls.push(`https://spicychat.ai/chat/${id}`);
+  return uniqueClean(urls).slice(0, 50);
+}
+
+function liveBotMetadataFields(result) {
+  const archiveFields = result?.archiveSnapshot?.fields || {};
+  const snapshotFields = result?.snapshot?.fields || {};
+  const name = cleanAuthoritativeBotName(archiveFields.name || snapshotFields.name || result?.name || "", result?.id || "");
+  return {
+    name,
+    creator: canonicalBotCreator(archiveFields.creator || snapshotFields.creator || result?.creator || ""),
+    image: canonicalBotImage(archiveFields.image || snapshotFields.image || result?.image || ""),
+    description: String(archiveFields.description || snapshotFields.description || archiveFields.title || snapshotFields.title || "").replace(/\s+/g, " ").trim()
+  };
+}
+
+function mergeLiveMetaIntoRecord(raw, id, live, { clearChatPreviewDescription = false } = {}) {
+  const current = raw && typeof raw === "object" ? raw : {};
+  const next = { ...current, id };
+  let changed = false;
+  const set = (key, value) => {
+    if (!value || String(next[key] || "") === String(value)) return;
+    next[key] = value;
+    changed = true;
+  };
+  set("name", live.name);
+  set("creator", live.creator);
+  set("image", live.image);
+  if (live.description) {
+    set("description", live.description);
+    if (next.descriptionSource !== "bot-status-api") { next.descriptionSource = "bot-status-api"; changed = true; }
+  } else if (clearChatPreviewDescription && current.cardMetaCaptured && current.description) {
+    next.description = "";
+    changed = true;
+  }
+  return { next, changed };
+}
+
+function buildBotStatusMetadataScanIndex() {
+  return {
+    blocked: new Set(Array.isArray(blockedState?.ids) ? blockedState.ids : []),
+    notInterested: new Set(Array.isArray(notInterestedState?.ids) ? notInterestedState.ids : []),
+    favorite: new Set(Array.isArray(favoriteBotState?.ids) ? favoriteBotState.ids : []),
+    later: new Set(Array.isArray(laterBotState?.ids) ? laterBotState.ids : []),
+    opened: new Set(uniqueClean(currentOpened)),
+    recent: new Map((Array.isArray(recentlySeenBotState?.entries) ? recentlySeenBotState.entries : []).map((item, index) => [item?.id, index]).filter(([id]) => !!id)),
+    watch: new Map((Array.isArray(creatorBotWatchState?.recent) ? creatorBotWatchState.recent : []).map((item, index) => [item?.id, index]).filter(([id]) => !!id))
+  };
+}
+
+function applyAuthoritativeBotMetadata(result, scanIndex = null, dirtyKeys = null) {
+  if (result?.status !== "available" || !BOT_ID_RE.test(String(result?.id || ""))) return false;
+  const id = String(result.id);
+  const live = liveBotMetadataFields(result);
+  if (!live.name && !live.creator && !live.image && !live.description) return false;
+  let changed = false;
+
+  const markDirty = key => { if (dirtyKeys instanceof Set && key) dirtyKeys.add(key); };
+  const updateStore = (store, indexedIds = null, storageKey = "") => {
+    const normalized = store && Array.isArray(store.ids) && store.meta && typeof store.meta === "object"
+      ? store
+      : normalizeBotStore(store);
+    const hasId = indexedIds instanceof Set ? indexedIds.has(id) : normalized.ids.includes(id);
+    if (!hasId) return normalized;
+    const merged = mergeLiveMetaIntoRecord(normalized.meta?.[id], id, live);
+    if (merged.changed) { normalized.meta[id] = merged.next; changed = true; markDirty(storageKey); }
+    return normalized;
+  };
+  blockedState = updateStore(blockedState, scanIndex?.blocked, BLOCKED_BOTS_KEY);
+  notInterestedState = updateStore(notInterestedState, scanIndex?.notInterested, NOT_INTERESTED_KEY);
+  favoriteBotState = updateStore(favoriteBotState, scanIndex?.favorite, FAVORITE_BOTS_KEY);
+  laterBotState = updateStore(laterBotState, scanIndex?.later, LATER_BOTS_KEY);
+
+  const openedHasId = scanIndex?.opened instanceof Set ? scanIndex.opened.has(id) : uniqueClean(currentOpened).includes(id);
+  if (openedHasId) {
+    const merged = mergeLiveMetaIntoRecord(openedChatMetaState?.[id], id, live, { clearChatPreviewDescription: true });
+    if (merged.changed) { openedChatMetaState = { ...openedChatMetaState, [id]: merged.next }; changed = true; markDirty(OPENED_META_KEY); }
+  }
+
+  const organizer = botOrganizationState?.meta && typeof botOrganizationState.meta === "object"
+    ? botOrganizationState
+    : normalizeBotOrganization(botOrganizationState);
+  if (organizer.meta?.[id]) {
+    const merged = mergeLiveMetaIntoRecord(organizer.meta[id], id, live);
+    if (merged.changed) { organizer.meta[id] = merged.next; botOrganizationState = organizer; changed = true; markDirty(BOT_ORGANIZER_KEY); }
+  }
+
+  if (scanIndex?.recent instanceof Map) {
+    const index = scanIndex.recent.get(id);
+    if (Number.isInteger(index) && recentlySeenBotState?.entries?.[index]?.id === id) {
+      const merged = mergeLiveMetaIntoRecord(recentlySeenBotState.entries[index], id, live);
+      if (merged.changed) { recentlySeenBotState.entries[index] = merged.next; changed = true; markDirty(RECENTLY_SEEN_BOTS_KEY); }
+    }
+  } else {
+    const recent = normalizeRecentlySeenStore(recentlySeenBotState);
+    let recentChanged = false;
+    recent.entries = recent.entries.map(item => {
+      if (item.id !== id) return item;
+      const merged = mergeLiveMetaIntoRecord(item, id, live);
+      if (merged.changed) recentChanged = true;
+      return merged.next;
+    });
+    if (recentChanged) { recentlySeenBotState = recent; changed = true; markDirty(RECENTLY_SEEN_BOTS_KEY); }
+  }
+
+  if (scanIndex?.watch instanceof Map) {
+    const index = scanIndex.watch.get(id);
+    if (Number.isInteger(index) && creatorBotWatchState?.recent?.[index]?.id === id) {
+      const merged = mergeLiveMetaIntoRecord(creatorBotWatchState.recent[index], id, live);
+      if (merged.changed) { creatorBotWatchState.recent[index] = merged.next; changed = true; markDirty(CREATOR_BOT_WATCH_KEY); }
+    }
+  } else {
+    const watch = normalizeCreatorBotWatchState(creatorBotWatchState);
+    let watchChanged = false;
+    watch.recent = watch.recent.map(item => {
+      if (item.id !== id) return item;
+      const merged = mergeLiveMetaIntoRecord(item, id, live);
+      if (merged.changed) watchChanged = true;
+      return merged.next;
+    });
+    if (watchChanged) { creatorBotWatchState = watch; changed = true; markDirty(CREATOR_BOT_WATCH_KEY); }
+  }
+  return changed;
+}
+
+function botStatusMetadataStoragePayload(dirtyKeys = null) {
+  const candidates = {
+    [BLOCKED_BOTS_KEY]: blockedState,
+    [NOT_INTERESTED_KEY]: notInterestedState,
+    [FAVORITE_BOTS_KEY]: favoriteBotState,
+    [LATER_BOTS_KEY]: laterBotState,
+    [OPENED_META_KEY]: openedChatMetaState,
+    [RECENTLY_SEEN_BOTS_KEY]: recentlySeenBotState,
+    [BOT_ORGANIZER_KEY]: botOrganizationState,
+    [CREATOR_BOT_WATCH_KEY]: creatorBotWatchState
+  };
+  if (!(dirtyKeys instanceof Set)) return candidates;
+  return Object.fromEntries(Object.entries(candidates).filter(([key]) => dirtyKeys.has(key)));
+}
+
 function normalizeRecentlySeenStore(value) {
   const source = value && typeof value === "object" ? value : {};
   const items = Array.isArray(source.entries) ? source.entries : [];
@@ -8268,6 +10840,7 @@ function normalizeRecentlySeenStore(value) {
       name: String(raw.name || id).replace(/\s+/g, " ").trim(),
       creator: String(raw.creator || "").replace(/\s+/g, " ").trim(),
       image: String(raw.image || "").trim(),
+      description: String(raw.description || raw.summary || "").replace(/\s+/g, " ").trim().slice(0, 12000),
       chatUrl: String(raw.chatUrl || `https://spicychat.ai/chat/${id}`).trim(),
       profileUrl: String(raw.profileUrl || `https://spicychat.ai/chatbot/${id}`).trim(),
       lastSeenAt: Number(raw.lastSeenAt) || 0,
@@ -8931,10 +11504,15 @@ function managerExtraFilter(entry, kind) {
   const id = String(entry?.id || "").trim();
 
   if (kind === "blocked") {
-    const filter = value("blockedBotDislikeFilter", "all");
-    if (filter === "all") return true;
-    const handled = !!quickDislikeHistoryEntry(id);
-    return filter === "handled" ? handled : !handled;
+    const dislikeFilter = value("blockedBotDislikeFilter", "all");
+    const lessLikeFilter = value("blockedBotLessLikeFilter", "all");
+    const dislikeHandled = !!quickDislikeHistoryEntry(id);
+    const lessLikeHandled = !!quickLessLikeHistoryEntry(id);
+    if (dislikeFilter === "handled" && !dislikeHandled) return false;
+    if (dislikeFilter === "remaining" && dislikeHandled) return false;
+    if (lessLikeFilter === "handled" && !lessLikeHandled) return false;
+    if (lessLikeFilter === "remaining" && lessLikeHandled) return false;
+    return true;
   }
 
   if (!["favorite", "later"].includes(kind)) return true;
@@ -9127,6 +11705,10 @@ async function applyBlockedBotBulkAction() {
     if (actionSelect) actionSelect.value = "";
     await runBlockedBulkDislike("selected");
     return;
+  } else if (action === "less-like-selected") {
+    if (actionSelect) actionSelect.value = "";
+    await runBlockedBulkLessLike("selected");
+    return;
   }
 
   if (actionSelect) actionSelect.value = "";
@@ -9276,9 +11858,38 @@ function updateBlockedDislikeStatus(text = "") {
   const status = $("blockedBotDislikeStatus");
   if (!status) return;
   const counts = blockedQuickDislikeCounts();
-  const suffix = counts.nameOnly ? ` · ${counts.nameOnly} name-only skipped` : "";
-  const next = text || `${counts.handled} handled · ${counts.remaining} remaining${suffix}`;
+  const next = text || `${counts.handled} handled · ${counts.remaining} remaining`;
   if (status.textContent !== next) status.textContent = next;
+  const shared = $("blockedBotNameOnlyStatus");
+  if (shared) {
+    const label = counts.nameOnly ? `${counts.nameOnly} name-only skipped` : "";
+    if (shared.textContent !== label) shared.textContent = label;
+  }
+}
+
+function blockedQuickLessLikeCounts() {
+  const ids = uniqueClean(blockedState?.ids || []);
+  let handled = 0;
+  ids.forEach(id => { if (quickLessLikeHistoryEntry(id)) handled += 1; });
+  return {
+    total: ids.length,
+    handled,
+    remaining: Math.max(0, ids.length - handled),
+    nameOnly: uniqueClean(blockedState?.names || []).length
+  };
+}
+
+function updateBlockedLessLikeStatus(text = "") {
+  const status = $("blockedBotLessLikeStatus");
+  if (!status) return;
+  const counts = blockedQuickLessLikeCounts();
+  const next = text || `${counts.handled} handled · ${counts.remaining} remaining`;
+  if (status.textContent !== next) status.textContent = next;
+  const shared = $("blockedBotNameOnlyStatus");
+  if (shared) {
+    const label = counts.nameOnly ? `${counts.nameOnly} name-only skipped` : "";
+    if (shared.textContent !== label) shared.textContent = label;
+  }
 }
 
 function optionsLooksMobile() {
@@ -9574,6 +12185,32 @@ async function bulkDislikeBlockedBots() {
   return runBlockedBulkDislike("remaining");
 }
 
+async function resetQuickDislikeLocalHistory() {
+  quickDislikeHistoryState = { version: 1, bots: {} };
+  quickDislikeBulkState = { version: 1, status: "idle", pendingIds: [], failedIds: [], startedAt: 0, updatedAt: Date.now(), currentId: "", lastMode: "remaining" };
+  await storageSet({ [QUICK_DISLIKE_HISTORY_KEY]: quickDislikeHistoryState, [QUICK_DISLIKE_BULK_STATE_KEY]: quickDislikeBulkState });
+  renderBotManager("blocked");
+  updateBlockedBulkResumeControls();
+  updateBlockedDislikeStatus();
+}
+
+async function resetAndRedoBlockedDislikes() {
+  if (blockedBulkDislikeRunning) {
+    showSettingsToast("Stop Bulk Dislike before resetting and redoing the history.");
+    return;
+  }
+  await ensureBlockingDataLoaded();
+  const blockedCount = blockedQuickDislikeCounts().total || 0;
+  if (!blockedCount) {
+    showSettingsToast("There are no blocked bots to reprocess.");
+    return;
+  }
+  if (!window.confirm(`Reset the local Quick/Bulk Dislike handled log, then run Dislike again for all ${blockedCount} currently blocked bot${blockedCount === 1 ? "" : "s"}? This does not undo existing SpicyChat ratings first; already-rated bots will be detected again.`)) return;
+  await resetQuickDislikeLocalHistory();
+  showSettingsToast("Handled history reset. Starting a fresh pass over all blocked bots…");
+  await runBlockedBulkDislike("remaining");
+}
+
 async function clearBlockedDislikeHistory() {
   if (blockedBulkDislikeRunning) {
     showSettingsToast("Stop Bulk Dislike before clearing its handled history.");
@@ -9587,13 +12224,872 @@ async function clearBlockedDislikeHistory() {
     return;
   }
   if (!window.confirm(`Forget Quick/Bulk Dislike history for ${totalHistory} bot${totalHistory === 1 ? "" : "s"}? ${counts.handled} of them are currently blocked. This does not change any SpicyChat rating.`)) return;
-  quickDislikeHistoryState = { version: 1, bots: {} };
-  quickDislikeBulkState = { version: 1, status: "idle", pendingIds: [], failedIds: [], startedAt: 0, updatedAt: Date.now(), currentId: "", lastMode: "remaining" };
-  await storageSet({ [QUICK_DISLIKE_HISTORY_KEY]: quickDislikeHistoryState, [QUICK_DISLIKE_BULK_STATE_KEY]: quickDislikeBulkState });
-  renderBotManager("blocked");
-  updateBlockedBulkResumeControls();
-  updateBlockedDislikeStatus();
+  await resetQuickDislikeLocalHistory();
   showSettingsToast("Handled dislike history cleared. Those bots can be processed again.");
+}
+
+function quickLessLikeFailureMeta(response) {
+  return {
+    status: String(response?.status || "failed").slice(0, 80),
+    stage: String(response?.stage || "").slice(0, 80),
+    reason: String(response?.reason || response?.error || "").slice(0, 300),
+    httpStatus: Number(response?.httpStatus || 0) || 0,
+    tokenAttempts: Number(response?.tokenAttempts || 0) || 0,
+    networkAttempts: Number(response?.networkAttempts || 0) || 0,
+    availabilityNetworkAttempts: Number(response?.availabilityNetworkAttempts || 0) || 0,
+    availabilityConfirmed: !!response?.availabilityConfirmed,
+    tokenSource: String(response?.tokenSource || "").slice(0, 80),
+    requestSent: !!response?.requestSent,
+    retryable: !!response?.retryable,
+    retryAfterMs: Math.max(0, Number(response?.retryAfterMs || 0) || 0),
+    throttleSignal: String(response?.throttleSignal || "").slice(0, 40),
+    networkAmbiguous: !!response?.networkAmbiguous,
+    feedbackTabsTried: Number(response?.feedbackTabsTried || 0) || 0,
+    nativeSignedSamples: Number(response?.nativeSignedSamples || 0) || 0,
+    workerRecovered: !!response?.workerRecovered,
+    at: Date.now()
+  };
+}
+
+function quickLessLikeHttpStatuses(response) {
+  return [
+    Number(response?.ratingHttpStatus || 0) || 0,
+    Number(response?.availabilityHttpStatus || 0) || 0,
+    Number(response?.httpStatus || 0) || 0
+  ].filter(Boolean);
+}
+
+function quickLessLikeRetryDecision(response) {
+  if (!response || response.ok) return { retryable: false, kind: "success", httpStatus: 0 };
+  const status = String(response?.status || "failed");
+  const statuses = quickLessLikeHttpStatuses(response);
+  const http429 = statuses.find(value => value === 429) || 0;
+  const http5xx = statuses.find(value => value >= 500 && value <= 599) || 0;
+
+  // A confirmed missing bot is a terminal availability result, not a failed
+  // request. Do not waste another API round-trip re-confirming the same 404.
+  if (status === "bot-not-found" && response?.availabilityConfirmed) {
+    return { retryable: false, kind: "unavailable", httpStatus: Number(response?.httpStatus || 0) || 0 };
+  }
+
+  // Explicit server responses are safe to retry: the server told us the write
+  // did not succeed. This is intentionally different from an ambiguous fetch
+  // exception after a POST may already have left the browser.
+  if (http429) return { retryable: true, kind: "429", httpStatus: http429 };
+  if (http5xx) return { retryable: true, kind: "5xx", httpStatus: http5xx };
+
+  const mayHaveSentRating = !!response?.requestSent || Number(response?.networkAttempts || 0) > 0;
+  if (mayHaveSentRating) {
+    return { retryable: false, kind: "ambiguous-post", httpStatus: Number(response?.httpStatus || 0) || 0 };
+  }
+
+  if (response?.retryable === true || BULK_LESS_LIKE_TRANSIENT_STATUSES.has(status)) {
+    return {
+      retryable: true,
+      kind: /network|timeout|offline/i.test(status) ? "network" : "transient",
+      httpStatus: Number(response?.httpStatus || 0) || 0
+    };
+  }
+
+  return { retryable: false, kind: "terminal", httpStatus: Number(response?.httpStatus || 0) || 0 };
+}
+
+function quickLessLikeResponseIsTransient(response) {
+  return quickLessLikeRetryDecision(response).retryable;
+}
+
+function quickLessLikeMedian(values) {
+  const nums = (Array.isArray(values) ? values : [])
+    .map(Number)
+    .filter(value => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b);
+  if (!nums.length) return 0;
+  const middle = Math.floor(nums.length / 2);
+  return nums.length % 2 ? nums[middle] : (nums[middle - 1] + nums[middle]) / 2;
+}
+
+function createQuickLessLikePacing(startIntervalMs, restored = {}) {
+  const configured = Number(startIntervalMs || 0) || 750;
+  const restoredInterval = Number(restored?.intervalMs || 0) || 0;
+  const intervalMs = Math.min(
+    BULK_LESS_LIKE_PACING.maxIntervalMs,
+    Math.max(BULK_LESS_LIKE_PACING.minIntervalMs, restoredInterval || configured)
+  );
+  return {
+    intervalMs,
+    successStreak: Math.max(0, Number(restored?.successStreak || 0) || 0),
+    backoffLevel: Math.max(0, Number(restored?.backoffLevel || 0) || 0),
+    state: String(restored?.state || "warming").slice(0, 80) || "warming",
+    http429: Math.max(0, Number(restored?.http429 || 0) || 0),
+    http5xx: Math.max(0, Number(restored?.http5xx || 0) || 0),
+    recentLatencies: [],
+    recentMedianMs: Math.max(0, Number(restored?.recentMedianMs || 0) || 0)
+  };
+}
+
+function snapshotQuickLessLikePacing(pacing) {
+  return {
+    intervalMs: Math.round(Number(pacing?.intervalMs || 0)),
+    successStreak: Math.max(0, Number(pacing?.successStreak || 0) || 0),
+    backoffLevel: Math.max(0, Number(pacing?.backoffLevel || 0) || 0),
+    state: String(pacing?.state || "adaptive").slice(0, 80),
+    http429: Math.max(0, Number(pacing?.http429 || 0) || 0),
+    http5xx: Math.max(0, Number(pacing?.http5xx || 0) || 0),
+    recentMedianMs: Math.round(Number(pacing?.recentMedianMs || 0) || 0)
+  };
+}
+
+function noteQuickLessLikeAttemptOutcome(pacing, response) {
+  if (!pacing) return;
+  const decision = quickLessLikeRetryDecision(response);
+  const ratingMs = Number(response?.ratingMs || 0) || 0;
+  if (ratingMs > 0) {
+    pacing.recentLatencies.push(ratingMs);
+    if (pacing.recentLatencies.length > BULK_LESS_LIKE_PACING.latencyWindowSize) pacing.recentLatencies.shift();
+    pacing.recentMedianMs = quickLessLikeMedian(pacing.recentLatencies);
+  }
+
+  if (decision.kind === "429") {
+    pacing.http429 += 1;
+    pacing.successStreak = 0;
+    pacing.backoffLevel = Math.min(8, pacing.backoffLevel + 1);
+    pacing.intervalMs = Math.min(
+      BULK_LESS_LIKE_PACING.maxIntervalMs,
+      Math.max(pacing.intervalMs + BULK_LESS_LIKE_PACING.transientStepUpMs, Math.ceil(pacing.intervalMs * BULK_LESS_LIKE_PACING.throttleMultiplier))
+    );
+    pacing.state = "throttled (429)";
+    return;
+  }
+
+  if (decision.kind === "5xx") {
+    pacing.http5xx += 1;
+    pacing.successStreak = 0;
+    pacing.backoffLevel = Math.min(8, pacing.backoffLevel + 1);
+    pacing.intervalMs = Math.min(
+      BULK_LESS_LIKE_PACING.maxIntervalMs,
+      Math.max(pacing.intervalMs + BULK_LESS_LIKE_PACING.transientStepUpMs, Math.ceil(pacing.intervalMs * BULK_LESS_LIKE_PACING.serverErrorMultiplier))
+    );
+    pacing.state = "server backoff (5xx)";
+    return;
+  }
+
+  if (["network", "ambiguous-post"].includes(decision.kind) || /network|timeout/i.test(String(response?.status || ""))) {
+    pacing.successStreak = 0;
+    pacing.backoffLevel = Math.min(8, pacing.backoffLevel + 1);
+    pacing.intervalMs = Math.min(BULK_LESS_LIKE_PACING.maxIntervalMs, pacing.intervalMs + BULK_LESS_LIKE_PACING.transientStepUpMs);
+    pacing.state = decision.kind === "ambiguous-post" ? "cautious after ambiguous POST" : "network backoff";
+    return;
+  }
+
+  const ratingStatus = Number(response?.ratingHttpStatus || response?.httpStatus || 0) || 0;
+  const successfulRating = !!response?.ok && String(response?.status || "") === "less-liked" && ratingStatus >= 200 && ratingStatus <= 299;
+  if (successfulRating) {
+    pacing.backoffLevel = 0;
+    pacing.successStreak += 1;
+    pacing.state = pacing.intervalMs > BULK_LESS_LIKE_PACING.minIntervalMs ? "adaptive warm-up" : "adaptive steady";
+    if (pacing.successStreak >= BULK_LESS_LIKE_PACING.successWindow) {
+      pacing.successStreak = 0;
+      pacing.intervalMs = Math.max(BULK_LESS_LIKE_PACING.minIntervalMs, pacing.intervalMs - BULK_LESS_LIKE_PACING.successStepDownMs);
+      pacing.state = pacing.intervalMs > BULK_LESS_LIKE_PACING.minIntervalMs ? "adaptive faster" : "adaptive steady";
+    }
+    return;
+  }
+
+  if (response?.ok) {
+    // Unavailable/already-handled outcomes are not evidence that the rating
+    // endpoint can safely be driven faster, but they also are not throttle signals.
+    pacing.state = pacing.intervalMs > BULK_LESS_LIKE_PACING.minIntervalMs ? "adaptive" : "adaptive steady";
+  } else {
+    pacing.successStreak = 0;
+  }
+}
+
+function quickLessLikeRetryBackoffMs(response, retryIndex) {
+  const requested = Math.max(0, Number(response?.retryAfterMs || 0) || 0);
+  const exponential = Math.min(
+    BULK_LESS_LIKE_PACING.retryMaxMs,
+    BULK_LESS_LIKE_PACING.retryBaseMs * (2 ** Math.max(0, Number(retryIndex || 0)))
+  );
+  return Math.min(BULK_LESS_LIKE_PACING.retryMaxMs, Math.max(requested, exponential));
+}
+
+async function waitQuickLessLikeDelay(ms) {
+  let remaining = Math.max(0, Number(ms || 0));
+  while (remaining > 0) {
+    if (blockedBulkLessLikeStopRequested || quickLessLikeBulkState?.stopRequested) return false;
+    const slice = Math.min(150, remaining);
+    await new Promise(resolve => setTimeout(resolve, slice));
+    remaining -= slice;
+  }
+  return !(blockedBulkLessLikeStopRequested || quickLessLikeBulkState?.stopRequested);
+}
+
+function formatQuickLessLikeDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round((Number(ms || 0) || 0) / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m ${seconds}s`;
+}
+
+function renderQuickLessLikeJobStats(stats, pacing, { force = false, note = "" } = {}) {
+  if (!stats) return;
+  const now = Date.now();
+  if (!force && now - Number(stats.lastUiAt || 0) < BULK_LESS_LIKE_PACING.uiUpdateEveryMs) return;
+  stats.lastUiAt = now;
+  const elapsedMs = Math.max(0, now - Number(stats.startedAt || now));
+  const queuePosition = Math.max(0, Number(stats.queuePosition || 0));
+  const total = Math.max(0, Number(stats.total || 0));
+  const remaining = Math.max(0, total - queuePosition);
+  const perItemMs = queuePosition > 0 ? elapsedMs / queuePosition : 0;
+  const etaMs = queuePosition >= 3 && perItemMs > 0 ? remaining * perItemMs : 0;
+  const duplicateText = Number(stats.duplicates || 0) ? ` (${stats.duplicates} dup)` : "";
+  const parts = [
+    `${queuePosition}/${total} queue`,
+    `${Number(stats.attempted || 0)} attempted`,
+    `${Number(stats.succeeded || 0)} succeeded`,
+    `${Number(stats.failed || 0)} failed`,
+    `${Number(stats.retried || 0)} retried`,
+    `${Number(stats.skipped || 0)} skipped${duplicateText}`,
+    `${formatQuickLessLikeDuration(elapsedMs)} elapsed`,
+    etaMs ? `ETA ${formatQuickLessLikeDuration(etaMs)}` : "ETA —",
+    `${Math.round(Number(pacing?.intervalMs || 0))} ms interval`,
+    String(pacing?.state || "adaptive"),
+    "batch cooldown none",
+    `POST med ${Math.round(Number(pacing?.recentMedianMs || 0)) || "—"} ms`,
+    `429 ${Number(pacing?.http429 || 0)}`,
+    `5xx ${Number(pacing?.http5xx || 0)}`
+  ];
+  if (note) parts.unshift(note);
+  updateBlockedLessLikeStatus(parts.join(" · "));
+}
+
+async function runQuickLessLikeWithBackoff(payload, label = "", pacing = null, stats = null) {
+  let response = null;
+  for (let attempt = 0; attempt <= BULK_LESS_LIKE_PACING.retryLimit; attempt += 1) {
+    if (navigator.onLine === false) return { ok: false, status: "offline-paused" };
+    if (blockedBulkLessLikeStopRequested || quickLessLikeBulkState?.stopRequested) return { ok: false, status: "bulk-canceled" };
+
+    if (attempt > 0) {
+      if (stats) stats.retried += 1;
+      const wait = quickLessLikeRetryBackoffMs(response, attempt - 1);
+      if (pacing) pacing.state = `retry backoff ${formatQuickLessLikeDuration(wait)}`;
+      renderQuickLessLikeJobStats(stats, pacing, {
+        force: true,
+        note: `Retrying ${label || payload.botName || payload.botId} · attempt ${attempt + 1}/${BULK_LESS_LIKE_PACING.retryLimit + 1}`
+      });
+      if (!(await waitQuickLessLikeDelay(wait))) return { ok: false, status: "bulk-canceled" };
+      if (navigator.onLine === false) return { ok: false, status: "offline-paused" };
+      if (pacing) pacing.state = "adaptive";
+    }
+
+    try {
+      response = await runtimeMessage({ ...payload, retryAttempt: attempt });
+    } catch (error) {
+      response = {
+        ok: false,
+        status: "worker-error",
+        stage: "runtime-message",
+        retryable: true,
+        requestSent: false,
+        reason: String(error?.message || error || "Less Like API feedback failed")
+      };
+    }
+
+    noteQuickLessLikeAttemptOutcome(pacing, response);
+    const decision = quickLessLikeRetryDecision(response);
+    if (!decision.retryable || attempt >= BULK_LESS_LIKE_PACING.retryLimit) {
+      return response || { ok: false, status: "worker-error" };
+    }
+  }
+  return response || { ok: false, status: "worker-error" };
+}
+
+function applyQuickLessLikeResponseToLocalHistory(id, name, response) {
+  const botId = String(id || "").trim();
+  if (!botId || !response?.ok) return "";
+  const status = response.status === "already-handled" ? String(response.rememberedStatus || "") : String(response.status || "");
+  if (!["less-liked", "unavailable"].includes(status)) return "";
+  quickLessLikeHistoryState = normalizeQuickLessLikeHistory(quickLessLikeHistoryState);
+  quickLessLikeHistoryState.bots[botId] = {
+    status,
+    name: String(name || quickLessLikeHistoryState.bots[botId]?.name || "").slice(0, 160),
+    handledAt: Number(response.handledAt || 0) || Date.now(),
+    stage: String(response.stage || "").slice(0, 80),
+    reason: String(response.reason || "").slice(0, 300),
+    httpStatus: Number(response.httpStatus || 0) || 0
+  };
+  return status;
+}
+
+async function refreshQuickLessLikeHistoryState() {
+  const result = await storageGet([QUICK_LESS_LIKE_HISTORY_KEY, QUICK_LESS_LIKE_BULK_STATE_KEY]);
+  quickLessLikeHistoryState = normalizeQuickLessLikeHistory(result[QUICK_LESS_LIKE_HISTORY_KEY]);
+  quickLessLikeBulkState = normalizeQuickLessLikeBulkState(result[QUICK_LESS_LIKE_BULK_STATE_KEY]);
+  updateBlockedLessLikeResumeControls();
+  return quickLessLikeHistoryState;
+}
+
+function buildBlockedLessLikeCandidates(mode = "remaining") {
+  const blockedRaw = Array.isArray(blockedState?.ids) ? blockedState.ids : [];
+  const blockedSet = new Set(blockedRaw.map(id => String(id || "").trim().toLowerCase()).filter(validBotId));
+  let raw = blockedRaw;
+  if (mode === "selected") raw = [...botManagerBulkSet("blocked")];
+  else if (mode === "resume") raw = [quickLessLikeBulkState.currentId, ...(quickLessLikeBulkState.pendingIds || [])];
+  else if (mode === "failed") raw = quickLessLikeBulkState.failedIds || [];
+
+  const ids = [];
+  const seen = new Set();
+  let duplicates = 0;
+  let skipped = 0;
+  for (const value of raw) {
+    const id = String(value || "").trim().toLowerCase();
+    if (!id) continue;
+    if (seen.has(id)) { duplicates += 1; continue; }
+    seen.add(id);
+    if (!validBotId(id) || !blockedSet.has(id) || quickLessLikeHistoryEntry(id)) { skipped += 1; continue; }
+    ids.push(id);
+  }
+  return { ids, duplicates, skipped };
+}
+
+function blockedLessLikeCandidateIds(mode = "remaining") {
+  return buildBlockedLessLikeCandidates(mode).ids;
+}
+
+function updateBlockedLessLikeResumeControls() {
+  const resume = $("resumeBlockedLessLikeRun");
+  const retry = $("retryFailedBlockedLessLikes");
+  if (!resume || !retry) return;
+  const resumeCount = blockedLessLikeCandidateIds("resume").length;
+  const failedCount = blockedLessLikeCandidateIds("failed").length;
+  const interrupted = ["running", "paused", "interrupted"].includes(quickLessLikeBulkState?.status);
+  resume.hidden = !(interrupted && resumeCount);
+  resume.textContent = resumeCount ? `Resume unfinished (${resumeCount})` : "Resume unfinished";
+  retry.hidden = !failedCount;
+  retry.textContent = failedCount ? `Retry last failed (${failedCount})` : "Retry last failed";
+}
+
+async function runBlockedBulkLessLike(mode = "remaining") {
+  const button = $("bulkLessLikeBlockedBots");
+  const clearButton = $("clearBlockedLessLikeHistory");
+
+  if (blockedBulkLessLikeRunning) {
+    blockedBulkLessLikeStopRequested = true;
+    const runId = activeBlockedBulkLessLikeRunId || quickLessLikeBulkState?.runId || "";
+    if (button) button.textContent = "Stopping after current bot...";
+    updateBlockedLessLikeStatus("Stopping after the current bot...");
+    if (runId) await runtimeMessage({ type: "DS_QUICK_LESS_LIKE_CANCEL_BULK", bulkRunId: runId });
+    await persistQuickLessLikeBulkState({ ...quickLessLikeBulkState, status: "paused", runId, stopRequested: true });
+    return;
+  }
+
+  if (optionsLooksMobile()) {
+    showSettingsToast("Bulk Stop recommending is desktop-browser only for now.");
+    return;
+  }
+
+  blockedBulkLessLikeRunning = true;
+  blockedBulkLessLikeStopRequested = false;
+  const previousJobId = String(quickLessLikeBulkState?.jobId || "").trim();
+  const jobId = mode === "resume" && previousJobId
+    ? previousJobId
+    : `blocked-less-like-job-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const runId = `blocked-less-like-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  activeBlockedBulkLessLikeRunId = runId;
+  if (button) button.textContent = "Stop after current bot";
+  if (clearButton) clearButton.disabled = true;
+
+  let updated = 0;
+  let unavailable = 0;
+  let failed = 0;
+  let processed = 0;
+  let consecutiveWorkerFailures = 0;
+  let autoPausedAfterFailures = false;
+  const failedIds = [];
+  const setFailure = (id, response) => {
+    quickLessLikeBulkState = normalizeQuickLessLikeBulkState(quickLessLikeBulkState);
+    quickLessLikeBulkState.failureMeta = { ...(quickLessLikeBulkState.failureMeta || {}), [id]: quickLessLikeFailureMeta(response) };
+  };
+  const clearFailure = id => {
+    quickLessLikeBulkState = normalizeQuickLessLikeBulkState(quickLessLikeBulkState);
+    if (quickLessLikeBulkState.failureMeta?.[id]) {
+      quickLessLikeBulkState.failureMeta = { ...quickLessLikeBulkState.failureMeta };
+      delete quickLessLikeBulkState.failureMeta[id];
+    }
+  };
+
+  let candidates = [];
+  let candidateInfo = { ids: [], duplicates: 0, skipped: 0 };
+  let startedAt = Date.now();
+  const activeStartedAt = Date.now();
+  let availabilityDirty = false;
+  let lessLikeFeedbackTabId = 0;
+  let lessLikeRunTelemetryStarted = false;
+  let nextQueueIndex = 0;
+  let lastCheckpointAt = 0;
+  let lastCheckpointProcessed = 0;
+  let pacing = null;
+  let stats = null;
+
+  const checkpoint = async ({ force = false, status = "running", currentId = "", nextIndex = nextQueueIndex, stopRequested = false } = {}) => {
+    if (!candidates.length) return false;
+    const now = Date.now();
+    const dueByItems = processed - lastCheckpointProcessed >= BULK_LESS_LIKE_PACING.checkpointEveryItems;
+    const dueByTime = now - lastCheckpointAt >= BULK_LESS_LIKE_PACING.checkpointEveryMs;
+    if (!force && !dueByItems && !dueByTime) return false;
+    const safeNext = Math.max(0, Math.min(candidates.length, Number(nextIndex || 0)));
+    quickLessLikeBulkState = normalizeQuickLessLikeBulkState({
+      ...quickLessLikeBulkState,
+      version: 2,
+      status,
+      pendingIds: candidates.slice(safeNext),
+      failedIds: uniqueClean([...(quickLessLikeBulkState.failedIds || []), ...failedIds]),
+      failureMeta: quickLessLikeBulkState.failureMeta,
+      startedAt,
+      currentId,
+      lastMode: mode,
+      runId,
+      jobId,
+      stopRequested,
+      totalBots: candidates.length,
+      nextQueuePosition: safeNext,
+      attempted: Number(stats?.attempted || 0),
+      succeeded: Number(stats?.succeeded || 0),
+      failedCount: Number(stats?.failed || 0),
+      retried: Number(stats?.retried || 0),
+      skipped: Number(stats?.skipped || 0),
+      pacing: snapshotQuickLessLikePacing(pacing)
+    });
+    await persistQuickLessLikeBulkState(quickLessLikeBulkState);
+    lastCheckpointAt = Date.now();
+    lastCheckpointProcessed = processed;
+    return true;
+  };
+
+  try {
+    await ensureSavedListsDataLoaded();
+    await refreshQuickLessLikeHistoryState();
+    if (blockedBulkLessLikeStopRequested) return;
+
+    candidateInfo = buildBlockedLessLikeCandidates(mode);
+    candidates = candidateInfo.ids;
+    if (!candidates.length) {
+      updateBlockedLessLikeStatus();
+      const message = mode === "failed"
+        ? "There are no failed Stop recommending actions left to retry."
+        : mode === "resume"
+          ? "There is no unfinished Stop recommending run to resume."
+          : mode === "selected"
+            ? "Select at least one blocked bot that has not been processed by Stop recommending yet."
+            : ((blockedState?.ids || []).length ? "All blocked bot IDs already have Stop recommending history." : "No blocked bot IDs are available.");
+      showSettingsToast(message);
+      return;
+    }
+
+    const restoredPacing = mode === "resume" ? (quickLessLikeBulkState?.pacing || {}) : {};
+    const configuredStartMs = Math.min(
+      BULK_LESS_LIKE_PACING.maxIntervalMs,
+      Math.max(BULK_LESS_LIKE_PACING.minIntervalMs, Number(value("blockedBulkDislikeDelayMs", "750")) || 750)
+    );
+    pacing = createQuickLessLikePacing(configuredStartMs, restoredPacing);
+    startedAt = mode === "resume" && quickLessLikeBulkState.startedAt ? quickLessLikeBulkState.startedAt : Date.now();
+    stats = {
+      jobId,
+      total: candidates.length,
+      queuePosition: 0,
+      attempted: 0,
+      succeeded: 0,
+      failed: 0,
+      retried: 0,
+      skipped: Number(candidateInfo.skipped || 0) + Number(candidateInfo.duplicates || 0),
+      duplicates: Number(candidateInfo.duplicates || 0),
+      startedAt: activeStartedAt,
+      lastUiAt: 0
+    };
+
+    await persistQuickLessLikeBulkState({
+      version: 2,
+      status: "running",
+      pendingIds: candidates,
+      failedIds: mode === "failed" ? [] : uniqueClean(quickLessLikeBulkState.failedIds || []),
+      failureMeta: { ...(quickLessLikeBulkState.failureMeta || {}) },
+      startedAt,
+      currentId: "",
+      lastMode: mode,
+      runId,
+      jobId,
+      stopRequested: false,
+      totalBots: candidates.length,
+      nextQueuePosition: 0,
+      attempted: 0,
+      succeeded: 0,
+      failedCount: 0,
+      retried: 0,
+      skipped: stats.skipped,
+      pacing: snapshotQuickLessLikePacing(pacing)
+    });
+    lastCheckpointAt = Date.now();
+
+    updateBlockedLessLikeStatus("Preparing one background recommendation helper…");
+    const helperPrepareStartedAt = performance.now?.() || Date.now();
+    const helperReady = await runtimeMessage({ type: "DS_QUICK_LESS_LIKE_PREPARE_BULK", bulkRunId: runId, jobId });
+    const helperReadyMs = Math.max(0, (performance.now?.() || Date.now()) - helperPrepareStartedAt);
+    lessLikeFeedbackTabId = Number(helperReady?.tabId || 0);
+    if (!helperReady?.ready) {
+      blockedBulkLessLikeStopRequested = true;
+      await checkpoint({ force: true, status: "paused", currentId: "", nextIndex: 0, stopRequested: true });
+      const helperStatus = String(helperReady?.status || "recommendation-worker-not-ready");
+      updateBlockedLessLikeStatus(helperStatus === "recommendation-worker-closed"
+        ? "Stop recommending paused: the recommendation helper tab was closed. Click Resume to recreate it."
+        : "Stop recommending paused: SpicyChat Home did not expose a ready recommendation/auth context. Click Resume to try the helper again.");
+      return;
+    }
+
+    pacing.state = "adaptive warm-up";
+    renderQuickLessLikeJobStats(stats, pacing, { force: true, note: "Recommendation helper ready" });
+    if (lessLikeFeedbackTabId) {
+      await runtimeMessage({
+        type: "DS_QUICK_LESS_LIKE_RUN_TIMING",
+        feedbackTabId: lessLikeFeedbackTabId,
+        runId,
+        phase: "start",
+        timing: {
+          helperReadyMs: Math.round(helperReadyMs * 10) / 10,
+          configuredDelayMs: configuredStartMs,
+          currentIntervalMs: Math.round(pacing.intervalMs),
+          minIntervalMs: BULK_LESS_LIKE_PACING.minIntervalMs
+        },
+        meta: {
+          jobId,
+          mode,
+          queued: candidates.length,
+          duplicatesSkipped: candidateInfo.duplicates,
+          preSkipped: candidateInfo.skipped,
+          workerStatus: String(helperReady?.status || "")
+        }
+      }).catch?.(() => null);
+      lessLikeRunTelemetryStarted = true;
+    }
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      nextQueueIndex = index;
+      if (blockedBulkLessLikeStopRequested || quickLessLikeBulkState?.stopRequested) break;
+      const id = candidates[index];
+
+      // A stale resume checkpoint can contain items already committed to the
+      // per-success Less Like history. Skip them instead of issuing the rating
+      // again; this is the crash/reload de-duplication safety net.
+      if (quickLessLikeHistoryEntry(id) || !(blockedState?.ids || []).includes(id)) {
+        processed += 1;
+        stats.skipped += 1;
+        stats.queuePosition = index + 1;
+        nextQueueIndex = index + 1;
+        await checkpoint({ nextIndex: nextQueueIndex });
+        renderQuickLessLikeJobStats(stats, pacing);
+        continue;
+      }
+
+      processed += 1;
+      stats.queuePosition = index + 1;
+      const meta = blockedState?.meta?.[id] || {};
+      const name = String(meta.name || "").trim();
+      quickLessLikeBulkState.currentId = id;
+      quickLessLikeBulkState.nextQueuePosition = index;
+      quickLessLikeBulkState.pacing = snapshotQuickLessLikePacing(pacing);
+      renderQuickLessLikeJobStats(stats, pacing, { note: `Processing ${name || id}` });
+      const itemStartedAt = performance.now?.() || Date.now();
+
+      if (!BOT_ID_RE.test(id)) {
+        failed += 1;
+        stats.failed += 1;
+        stats.skipped += 1;
+        failedIds.push(id);
+        setFailure(id, { status: "invalid-bot", stage: "local-validation", reason: "Saved record has no valid SpicyChat bot ID." });
+        nextQueueIndex = index + 1;
+        await checkpoint({ nextIndex: nextQueueIndex });
+        renderQuickLessLikeJobStats(stats, pacing);
+        continue;
+      }
+
+      stats.attempted += 1;
+      const response = await runQuickLessLikeWithBackoff({
+        type: "DS_QUICK_LESS_LIKE_BOT",
+        botId: id,
+        botName: name,
+        bulkRunId: runId,
+        jobId
+      }, name || id, pacing, stats);
+
+      if (["recommendation-worker-closed", "recommendation-worker-not-ready", "recommendation-worker-wrong-page", "recommendation-worker-navigation-failed", "recommendation-worker-create-failed", "recommendation-worker-error"].includes(String(response?.status || ""))) {
+        blockedBulkLessLikeStopRequested = true;
+        await checkpoint({ force: true, status: "paused", currentId: "", nextIndex: index, stopRequested: true });
+        updateBlockedLessLikeStatus(response?.status === "recommendation-worker-closed"
+          ? "Stop recommending paused: the recommendation helper tab was closed. Click Resume to recreate it."
+          : "Stop recommending paused: the recommendation helper is not ready. Click Resume to reload SpicyChat Home and continue.");
+        break;
+      }
+      if (response?.status === "spicychat-tab-required") {
+        blockedBulkLessLikeStopRequested = true;
+        await checkpoint({ force: true, status: "paused", currentId: "", nextIndex: index, stopRequested: true });
+        updateBlockedLessLikeStatus("Stop recommending paused: the recommendation helper could not be created. Click Resume to try again.");
+        break;
+      }
+      if (response?.status === "offline-paused") {
+        blockedBulkLessLikeStopRequested = true;
+        await checkpoint({ force: true, status: "paused", currentId: "", nextIndex: index, stopRequested: true });
+        updateBlockedLessLikeStatus("Stop recommending paused because the browser is offline. Resume when the connection is back.");
+        break;
+      }
+      if (response?.status === "bulk-canceled") {
+        blockedBulkLessLikeStopRequested = true;
+        await checkpoint({ force: true, status: "paused", currentId: "", nextIndex: index, stopRequested: true });
+        break;
+      }
+
+      if (response?.availabilityConfirmed) {
+        const previousAvailability = normalizeBotAvailability(botAvailabilityState).meta[id] || {};
+        const directStatus = response?.status === "unavailable" ? "unavailable" : "available";
+        botAvailabilityState.meta[id] = {
+          ...previousAvailability,
+          id,
+          name: name || previousAvailability.name || id,
+          profileUrl: `https://spicychat.ai/chatbot/${id}`,
+          sources: uniqueClean([...(previousAvailability.sources || []), "blocked"]),
+          checkedAt: Date.now(),
+          httpStatus: Number(response?.httpStatus || 0) || 0,
+          status: directStatus,
+          reason: directStatus === "available"
+            ? "Less Like preflight confirmed this bot through SpicyChat's character API."
+            : (response?.reason || "SpicyChat's character API confirmed this bot is unavailable.")
+        };
+        availabilityDirty = true;
+        if (processed % BULK_LESS_LIKE_PACING.availabilityCheckpointEvery === 0) {
+          await storageSet({ [BOT_AVAILABILITY_KEY]: normalizeBotAvailability(botAvailabilityState) });
+          availabilityDirty = false;
+        }
+      }
+
+      const handledStatus = applyQuickLessLikeResponseToLocalHistory(id, name, response);
+      const remembered = !!handledStatus;
+      if (handledStatus === "less-liked") {
+        updated += 1;
+        stats.succeeded += 1;
+        clearFailure(id);
+      } else if (handledStatus === "unavailable") {
+        unavailable += 1;
+        stats.skipped += 1;
+        clearFailure(id);
+      } else {
+        failed += 1;
+        stats.failed += 1;
+        failedIds.push(id);
+        setFailure(id, response);
+      }
+
+      if (remembered) consecutiveWorkerFailures = 0;
+      else if (quickLessLikeResponseIsTransient(response)) {
+        consecutiveWorkerFailures += 1;
+        if (consecutiveWorkerFailures >= BULK_DISLIKE_FAILURE_PAUSE_THRESHOLD) {
+          autoPausedAfterFailures = true;
+          blockedBulkLessLikeStopRequested = true;
+        }
+      } else {
+        consecutiveWorkerFailures = 0;
+      }
+
+      nextQueueIndex = index + 1;
+      quickLessLikeBulkState.currentId = "";
+      quickLessLikeBulkState.nextQueuePosition = nextQueueIndex;
+      quickLessLikeBulkState.attempted = stats.attempted;
+      quickLessLikeBulkState.succeeded = stats.succeeded;
+      quickLessLikeBulkState.failedCount = stats.failed;
+      quickLessLikeBulkState.retried = stats.retried;
+      quickLessLikeBulkState.skipped = stats.skipped;
+      quickLessLikeBulkState.pacing = snapshotQuickLessLikePacing(pacing);
+      if (quickLessLikeBulkState?.stopRequested) blockedBulkLessLikeStopRequested = true;
+      await checkpoint({
+        // A failed/ambiguous action must be checkpointed immediately so a
+        // browser crash cannot silently move it back into the automatic resume
+        // queue. Successful actions are protected separately by the compact
+        // per-success journal written by the background worker.
+        force: blockedBulkLessLikeStopRequested || !remembered,
+        status: blockedBulkLessLikeStopRequested ? "paused" : "running",
+        currentId: "",
+        nextIndex: nextQueueIndex,
+        stopRequested: blockedBulkLessLikeStopRequested
+      });
+
+      renderQuickLessLikeJobStats(stats, pacing);
+      const itemBeforeDelayMs = Math.max(0, (performance.now?.() || Date.now()) - itemStartedAt);
+      if (response?.feedbackTabId) {
+        runtimeMessage({
+          type: "DS_QUICK_LESS_LIKE_CLIENT_TIMING",
+          feedbackTabId: Number(response.feedbackTabId || 0),
+          botId: id,
+          timing: {
+            configuredDelayMs: configuredStartMs,
+            currentIntervalMs: Math.round(pacing.intervalMs),
+            pacingState: String(pacing.state || ""),
+            itemBeforeDelayMs: Math.round(itemBeforeDelayMs * 10) / 10,
+            workerReadyMs: Number(response.workerReadyMs || 0),
+            coordinatorWaitMs: Number(response.coordinatorWaitMs || 0),
+            feedbackMs: Number(response.feedbackMs || response.elapsedMs || 0),
+            availabilityMs: Number(response.availabilityMs || 0),
+            ratingMs: Number(response.ratingMs || 0),
+            userLookupMs: Number(response.userLookupMs || 0),
+            requestElapsedMs: Number(response.elapsedMs || 0),
+            historyPersistMs: Number(response.historyPersistMs || 0),
+            backgroundTotalMs: Number(response.totalMs || 0),
+            recentMedianRequestMs: Number(pacing.recentMedianMs || 0),
+            retries: Number(response.retryAttempt || 0),
+            http429: pacing.http429,
+            http5xx: pacing.http5xx,
+            status: String(response.status || "")
+          }
+        }).catch?.(() => null);
+      }
+
+      if (blockedBulkLessLikeStopRequested) break;
+      if (index < candidates.length - 1 && pacing.intervalMs > 0) {
+        pacing.state = pacing.intervalMs > BULK_LESS_LIKE_PACING.minIntervalMs ? "adaptive pacing" : "adaptive steady";
+        if (!(await waitQuickLessLikeDelay(pacing.intervalMs))) {
+          blockedBulkLessLikeStopRequested = true;
+          break;
+        }
+      }
+    }
+  } finally {
+    if (availabilityDirty) {
+      try { await storageSet({ [BOT_AVAILABILITY_KEY]: normalizeBotAvailability(botAvailabilityState) }); } catch {}
+      availabilityDirty = false;
+    }
+
+    const stopped = blockedBulkLessLikeStopRequested || !!quickLessLikeBulkState?.stopRequested;
+    if (stopped && candidates.length && stats && pacing) {
+      try {
+        await checkpoint({ force: true, status: "paused", currentId: "", nextIndex: nextQueueIndex, stopRequested: true });
+      } catch {}
+    }
+
+    blockedBulkLessLikeRunning = false;
+    blockedBulkLessLikeStopRequested = false;
+    activeBlockedBulkLessLikeRunId = "";
+    if (lessLikeRunTelemetryStarted && lessLikeFeedbackTabId) {
+      await runtimeMessage({
+        type: "DS_QUICK_LESS_LIKE_RUN_TIMING",
+        feedbackTabId: lessLikeFeedbackTabId,
+        runId,
+        phase: "end",
+        timing: {
+          totalRunMs: Math.max(0, Date.now() - activeStartedAt),
+          currentIntervalMs: Math.round(Number(pacing?.intervalMs || 0)),
+          recentMedianRequestMs: Math.round(Number(pacing?.recentMedianMs || 0))
+        },
+        meta: {
+          jobId,
+          processed,
+          attempted: Number(stats?.attempted || 0),
+          sent: updated,
+          unavailable,
+          failed,
+          retried: Number(stats?.retried || 0),
+          skipped: Number(stats?.skipped || 0),
+          duplicates: Number(stats?.duplicates || 0),
+          http429: Number(pacing?.http429 || 0),
+          http5xx: Number(pacing?.http5xx || 0),
+          stopped: !!stopped
+        }
+      }).catch?.(() => null);
+    }
+    if (runId) await runtimeMessage({ type: "DS_QUICK_LESS_LIKE_RELEASE_BULK", bulkRunId: runId }).catch?.(() => null);
+
+    const localFailureMeta = { ...(quickLessLikeBulkState.failureMeta || {}) };
+    await refreshQuickLessLikeHistoryState();
+    quickLessLikeBulkState.failureMeta = localFailureMeta;
+    const remainingFromQueue = stopped
+      ? candidates.slice(Math.max(0, Math.min(candidates.length, nextQueueIndex))).filter(id => !quickLessLikeHistoryEntry(id) && (blockedState?.ids || []).includes(id))
+      : [];
+    const finalFailed = uniqueClean([...(quickLessLikeBulkState.failedIds || []), ...failedIds]).filter(id => !quickLessLikeHistoryEntry(id));
+    const finalFailedSet = new Set(finalFailed);
+    const finalFailureMeta = Object.fromEntries(Object.entries(quickLessLikeBulkState.failureMeta || {}).filter(([id]) => finalFailedSet.has(id)));
+    await persistQuickLessLikeBulkState({
+      ...quickLessLikeBulkState,
+      version: 2,
+      status: stopped && remainingFromQueue.length ? "paused" : (finalFailed.length ? "completed-with-failures" : "completed"),
+      currentId: "",
+      pendingIds: stopped ? remainingFromQueue : [],
+      failedIds: finalFailed,
+      failureMeta: finalFailureMeta,
+      startedAt,
+      runId: "",
+      jobId,
+      stopRequested: false,
+      totalBots: candidates.length,
+      nextQueuePosition: stopped ? Math.max(0, Math.min(candidates.length, nextQueueIndex)) : candidates.length,
+      attempted: Number(stats?.attempted || 0),
+      succeeded: Number(stats?.succeeded || 0),
+      failedCount: Number(stats?.failed || 0),
+      retried: Number(stats?.retried || 0),
+      skipped: Number(stats?.skipped || 0),
+      pacing: snapshotQuickLessLikePacing(pacing)
+    });
+    if (button) button.textContent = "Stop recommending remaining blocked bots";
+    if (clearButton) clearButton.disabled = false;
+    renderBotManager("blocked");
+    if (stats && pacing) renderQuickLessLikeJobStats(stats, pacing, { force: true, note: stopped ? "Paused" : "Finished" });
+    else updateBlockedLessLikeStatus();
+    if (candidates.length) {
+      showSettingsToast(autoPausedAfterFailures
+        ? `Stop recommending paused after ${BULK_DISLIKE_FAILURE_PAUSE_THRESHOLD} Less Like failures in a row. The remaining bots were kept for Resume.`
+        : stopped
+          ? `Stop recommending stopped. ${updated} sent, ${unavailable} unavailable, ${failed} failed.`
+          : `Stop recommending finished. ${updated} sent, ${unavailable} unavailable, ${failed} failed.`);
+    }
+  }
+}
+
+async function bulkLessLikeBlockedBots() {
+  return runBlockedBulkLessLike("remaining");
+}
+
+async function resetQuickLessLikeLocalHistory() {
+  quickLessLikeHistoryState = { version: 1, bots: {} };
+  quickLessLikeBulkState = { version: 2, status: "idle", pendingIds: [], failedIds: [], failureMeta: {}, startedAt: 0, updatedAt: Date.now(), currentId: "", lastMode: "remaining", totalBots: 0, nextQueuePosition: 0, attempted: 0, succeeded: 0, failedCount: 0, retried: 0, skipped: 0, pacing: {} };
+  await storageSet({ [QUICK_LESS_LIKE_HISTORY_KEY]: quickLessLikeHistoryState, [QUICK_LESS_LIKE_BULK_STATE_KEY]: quickLessLikeBulkState });
+  renderBotManager("blocked");
+  updateBlockedLessLikeResumeControls();
+  updateBlockedLessLikeStatus();
+}
+
+async function resetAndRedoBlockedLessLikes() {
+  if (blockedBulkLessLikeRunning) {
+    showSettingsToast("Stop the current Stop recommending run before resetting its history.");
+    return;
+  }
+  await ensureBlockingDataLoaded();
+  const blockedCount = blockedQuickLessLikeCounts().total || 0;
+  if (!blockedCount) { showSettingsToast("There are no blocked bots to reprocess."); return; }
+  if (!window.confirm(`Reset the local Stop recommending handled log, then send Less Like This again for all ${blockedCount} currently blocked bot${blockedCount === 1 ? "" : "s"}? This does not undo earlier SpicyChat recommendation feedback first.`)) return;
+  await resetQuickLessLikeLocalHistory();
+  showSettingsToast("Stop recommending history reset. Starting a fresh pass over all blocked bots…");
+  await runBlockedBulkLessLike("remaining");
+}
+
+async function clearBlockedLessLikeHistory() {
+  if (blockedBulkLessLikeRunning) {
+    showSettingsToast("Stop the current Stop recommending run before clearing its handled history.");
+    return;
+  }
+  await ensureBlockingDataLoaded();
+  const counts = blockedQuickLessLikeCounts();
+  const totalHistory = Object.keys(quickLessLikeHistoryState?.bots || {}).length;
+  if (!totalHistory) { showSettingsToast("There is no Stop recommending history to clear."); return; }
+  if (!window.confirm(`Forget Stop recommending history for ${totalHistory} bot${totalHistory === 1 ? "" : "s"}? ${counts.handled} of them are currently blocked. This does not undo feedback already sent to SpicyChat.`)) return;
+  await resetQuickLessLikeLocalHistory();
+  showSettingsToast("Stop recommending history cleared. Those bots can be processed again.");
 }
 
 function botManagerCardElement(entry, kind) {
@@ -9637,13 +13133,37 @@ function botManagerCardElement(entry, kind) {
   main.appendChild(makeElement("div", { className: "bot-manager-id", text: entry.id || "name-only block" }));
 
   if (kind === "blocked" && entry.id) {
-    const handled = quickDislikeHistoryEntry(entry.id);
-    if (handled) {
-      const when = handled.handledAt ? ` · ${new Date(handled.handledAt).toLocaleString()}` : "";
+    const dislikeHandled = quickDislikeHistoryEntry(entry.id);
+    const lessLikeHandled = quickLessLikeHistoryEntry(entry.id);
+    if (dislikeHandled) {
+      const when = dislikeHandled.handledAt ? ` · ${new Date(dislikeHandled.handledAt).toLocaleString()}` : "";
       main.appendChild(makeElement("div", {
         className: "bot-manager-creator",
-        text: `Rating handled: ${quickDislikeHistoryLabel(handled)}${when}`
+        text: `Dislike: ${quickDislikeHistoryLabel(dislikeHandled)}${when}`
       }));
+    }
+    if (lessLikeHandled) {
+      const when = lessLikeHandled.handledAt ? ` · ${new Date(lessLikeHandled.handledAt).toLocaleString()}` : "";
+      main.appendChild(makeElement("div", {
+        className: "bot-manager-creator",
+        text: `Less Like: ${quickLessLikeHistoryLabel(lessLikeHandled)}${when}`
+      }));
+    } else {
+      const failure = quickLessLikeBulkState?.failureMeta?.[entry.id];
+      if (failure) {
+        const statusBits = [failure.status || "failed"];
+        if (failure.httpStatus) statusBits.push(`HTTP ${failure.httpStatus}`);
+        if (failure.stage) statusBits.push(failure.stage);
+        if (failure.networkAttempts) statusBits.push(`${failure.networkAttempts} rating attempt${failure.networkAttempts === 1 ? "" : "s"}`);
+        else if (failure.tokenAttempts) statusBits.push(`${failure.tokenAttempts} token attempt${failure.tokenAttempts === 1 ? "" : "s"}`);
+        if (failure.availabilityNetworkAttempts) statusBits.push(`${failure.availabilityNetworkAttempts} availability check${failure.availabilityNetworkAttempts === 1 ? "" : "s"}`);
+        if (failure.tokenSource) statusBits.push(`token: ${failure.tokenSource}`);
+        const reason = String(failure.reason || "").trim();
+        main.appendChild(makeElement("div", {
+          className: "bot-manager-creator",
+          text: `Less Like last failure: ${statusBits.join(" · ")}${reason ? ` · ${reason}` : ""}`
+        }));
+      }
     }
   }
 
@@ -9709,9 +13229,15 @@ function renderBotManager(kind) {
   const shownEntries = entries.slice(0, limit);
 
   updateBotManagerSummary(kind, allEntries.length, entries.length, shownEntries.length);
-  if (kind === "blocked" && !blockedBulkDislikeRunning) {
-    updateBlockedDislikeStatus();
-    updateBlockedBulkResumeControls();
+  if (kind === "blocked") {
+    if (!blockedBulkDislikeRunning) {
+      updateBlockedDislikeStatus();
+      updateBlockedBulkResumeControls();
+    }
+    if (!blockedBulkLessLikeRunning) {
+      updateBlockedLessLikeStatus();
+      updateBlockedLessLikeResumeControls();
+    }
   }
 
   const showMore = $(managerElementId(kind, "ShowMore"));
@@ -10001,6 +13527,7 @@ function renderMiniPanelPreview() {
   }
 
   setPreviewShown("miniPanelPreviewStatus", checked("quickPanelShowStatus", true));
+  setPreviewShown("miniPanelPreviewMessageCount", mode === "chat" && checked("quickPanelShowLoadedMessageCount"));
   setPreviewShown("miniPanelPreviewOptions", checked("quickPanelShowOptions", true));
   setPreviewShown("miniPanelPreviewFill", mode === "listing" && checked("quickPanelShowFillNow", true));
   setPreviewShown("miniPanelPreviewSmartFilters", mode === "listing" && checked("quickPanelShowSmartFilterPins"));
@@ -10046,6 +13573,7 @@ function setupMiniPanelPreview() {
     "quickPanelUiScale",
     "quickPanelMaxHeightPercent",
     "quickPanelShowStatus",
+    "quickPanelShowLoadedMessageCount",
     "quickPanelStatusShowOpened",
     "quickPanelStatusShowBlocked",
     "quickPanelShowOptions",
@@ -10609,6 +14137,11 @@ async function load() {
     DEEPL_API_KEY,
     CHAT_BACKGROUNDS_KEY,
     CREATOR_BOT_WEBHOOK_KEY,
+    ARCHIVE_IMPORT_ENDPOINT_KEY,
+    ARCHIVE_IMPORT_TOKEN_KEY,
+    ARCHIVE_UPLOAD_STATE_KEY,
+    ARCHIVE_CONTRIBUTION_ENABLED_KEY,
+    ARCHIVE_CONTRIBUTION_STATE_KEY,
     "generationMetadataDefaultsMigrationV01841",
     "backupOptInMigrationV01990",
     "quickDislikeOptInMigrationV019119",
@@ -10928,6 +14461,8 @@ async function load() {
   setValue("chatListBlockedFilter", ["all", "blocked", "unblocked"].includes(settings.chatListBlockedFilter) ? settings.chatListBlockedFilter : "all");
 
   setChecked("trackOpenedChats", settings.trackOpenedChats);
+  setValue("botStatusScanSpeed", Object.prototype.hasOwnProperty.call(BOT_STATUS_SCAN_SPEED_DELAYS, settings.botStatusScanSpeed) ? settings.botStatusScanSpeed : "safe");
+  setValue("botStatusStaleDays", [1, 7, 14, 30].includes(Number(settings.botStatusStaleDays)) ? String(Number(settings.botStatusStaleDays)) : "7");
   setChecked("importOpenedFromChatsPage", settings.importOpenedFromChatsPage);
   setChecked("hideOpenedChats", settings.hideOpenedChats);
   setValue("openedBotSortMode", settings.openedBotSortMode || "newest");
@@ -10946,6 +14481,7 @@ async function load() {
   setValue("quickPanelCustomYPercent", Math.min(100, Math.max(0, Number.isFinite(Number(settings.quickPanelCustomYPercent)) ? Number(settings.quickPanelCustomYPercent) : 12)));
   setChecked("quickPanelAutoCollapseOverlap", settings.quickPanelAutoCollapseOverlap !== false);
   setChecked("quickPanelShowStatus", settings.quickPanelShowStatus !== false);
+  setChecked("quickPanelShowLoadedMessageCount", !!settings.quickPanelShowLoadedMessageCount);
   setChecked("quickPanelStatusShowOpened", settings.quickPanelStatusShowOpened !== false);
   setChecked("quickPanelStatusShowBlocked", settings.quickPanelStatusShowBlocked !== false);
   setChecked("popupShowOpenedCount", !!settings.popupShowOpenedCount);
@@ -11003,6 +14539,8 @@ async function load() {
   setChecked("showCardGreetingTokenInfo", !!settings.showCardGreetingTokenInfo);
   setChecked("showExactMessageCounts", !!settings.showExactMessageCounts);
   setChecked("showBotCreationDates", !!settings.showBotCreationDates);
+  setChecked("expandBotNamesOnHover", !!settings.expandBotNamesOnHover);
+  setChecked("paginationTopJumpBox", !!settings.paginationTopJumpBox);
   setChecked("cardTokenShowGreeting", settings.cardTokenShowGreeting !== false);
   setChecked("cardTokenShowPersonality", !!settings.cardTokenShowPersonality);
   setChecked("cardTokenShowScenario", !!settings.cardTokenShowScenario);
@@ -11074,6 +14612,9 @@ async function load() {
   setValue("chatBubbleAiActionText", settings.chatBubbleAiActionText || "#79c8f5");
   setValue("chatBubbleAiDialogueMode", ["native", "base", "custom"].includes(settings.chatBubbleAiDialogueMode) ? settings.chatBubbleAiDialogueMode : "base");
   setValue("chatBubbleAiDialogueText", settings.chatBubbleAiDialogueText || settings.chatBubbleAiText || "#f2f2f2");
+  setValue("chatBubbleAiFont", settings.chatBubbleAiFont || "inherit");
+  setValue("chatBubbleAiActionFont", settings.chatBubbleAiActionFont || "inherit");
+  setValue("chatBubbleAiDialogueFont", settings.chatBubbleAiDialogueFont || "inherit");
   setValue("chatBubbleAiBorder", settings.chatBubbleAiBorder || "#555861");
   setValue("chatBubbleAiBorderWidth", String(settings.chatBubbleAiBorderWidth ?? 0));
   setValue("chatBubbleAiBorderStyle", ["solid", "dashed", "dotted", "double"].includes(settings.chatBubbleAiBorderStyle) ? settings.chatBubbleAiBorderStyle : "solid");
@@ -11092,6 +14633,9 @@ async function load() {
   setValue("chatBubbleUserActionText", settings.chatBubbleUserActionText || "#79c8f5");
   setValue("chatBubbleUserDialogueMode", ["native", "base", "custom"].includes(settings.chatBubbleUserDialogueMode) ? settings.chatBubbleUserDialogueMode : "base");
   setValue("chatBubbleUserDialogueText", settings.chatBubbleUserDialogueText || settings.chatBubbleUserText || "#f5f5f5");
+  setValue("chatBubbleUserFont", settings.chatBubbleUserFont || "inherit");
+  setValue("chatBubbleUserActionFont", settings.chatBubbleUserActionFont || "inherit");
+  setValue("chatBubbleUserDialogueFont", settings.chatBubbleUserDialogueFont || "inherit");
   setValue("chatBubbleUserBorder", settings.chatBubbleUserBorder || "#52718a");
   setValue("chatBubbleUserBorderWidth", String(settings.chatBubbleUserBorderWidth ?? 0));
   setValue("chatBubbleUserBorderStyle", ["solid", "dashed", "dotted", "double"].includes(settings.chatBubbleUserBorderStyle) ? settings.chatBubbleUserBorderStyle : "solid");
@@ -11108,6 +14652,7 @@ async function load() {
   setChecked("hideChatVoiceButton", settings.hideChatVoiceButton);
   setChecked("hideUnlockCustomVoices", settings.hideUnlockCustomVoices);
 
+  setChecked("stackChatMessages", !!settings.stackChatMessages);
   setChecked("showMessageQuickActions", !!settings.showMessageQuickActions);
   setChecked("showChatSearch", !!settings.showChatSearch);
   setChecked("chatSearchShowPanel", settings.chatSearchShowPanel !== false);
@@ -11188,8 +14733,12 @@ async function load() {
   setChecked("botArchiveOnProfileVisit", !!settings.botArchiveOnProfileVisit);
   setChecked("botArchiveOnChatOpen", !!settings.botArchiveOnChatOpen);
   setValue("botArchiveRefreshHours", [6, 24, 72, 168].includes(Number(settings.botArchiveRefreshHours)) ? String(Number(settings.botArchiveRefreshHours)) : "24");
+  setValue("botStatusArchiveEndpoint", normalizeArchiveImportEndpoint(result[ARCHIVE_IMPORT_ENDPOINT_KEY] || DEFAULT_ARCHIVE_IMPORT_ENDPOINT) || DEFAULT_ARCHIVE_IMPORT_ENDPOINT);
+  setValue("botStatusArchiveToken", String(result[ARCHIVE_IMPORT_TOKEN_KEY] || ""));
+  setChecked("enableBotStatusArchiveContribution", result[ARCHIVE_CONTRIBUTION_ENABLED_KEY] === true);
   setChecked("protectDraftDuringMessageRemoval", !!settings.protectDraftDuringMessageRemoval);
   setChecked("failedMessageHelper", !!settings.failedMessageHelper);
+  setChecked("autoRetryFailedMessageSends", !!settings.autoRetryFailedMessageSends);
   setChecked("chatPerformanceMode", !!settings.chatPerformanceMode);
   setValue("runtimePerformanceMode", ["normal", "adaptive", "aggressive", "maximum"].includes(settings.runtimePerformanceMode) ? settings.runtimePerformanceMode : "adaptive");
   setChecked("desktopAppPerformanceGuard", settings.desktopAppPerformanceGuard !== false);
@@ -11214,6 +14763,7 @@ async function load() {
   setChecked("showUpdateNotifications", !!settings.showUpdateNotifications);
 
   setValue("androidAppControlsMode", ["auto", "android", "always", "off"].includes(settings.androidAppControlsMode) ? settings.androidAppControlsMode : "auto");
+  setValue("qolSidebarButtonPlacement", settings.qolSidebarButtonPlacement || "after-sai");
   setChecked("androidTopBarMenu", !!settings.androidTopBarMenu);
   setChecked("androidHideComposerShortcuts", settings.androidHideComposerShortcuts !== false);
   setChecked("androidTopBarOoc", settings.androidTopBarOoc !== false);
@@ -11231,6 +14781,7 @@ async function load() {
   setChecked("chatExportIncludeGenerationDetails", settings.chatExportIncludeGenerationDetails !== false);
   setChecked("chatExportNumberMessages", settings.chatExportNumberMessages !== false);
   setChecked("chatExportIncludeAvatars", settings.chatExportIncludeAvatars !== false);
+  setValue("chatExportHistoryMode", settings.chatExportHistoryMode || "api");
   setValue("chatExportDefaultFormat", settings.chatExportDefaultFormat || "text");
   setValue("chatExportHtmlLayout", settings.chatExportHtmlLayout || "bubbles");
   setChecked("showOocTools", settings.showOocTools);
@@ -11324,6 +14875,8 @@ async function load() {
   setValue("recentlySeenLimit", Math.max(10, Math.min(250, Number(settings.recentlySeenLimit) || 100)));
   setChecked("enableBotComparison", !!settings.enableBotComparison);
   setChecked("showQuickNotInterestedButtons", !!settings.showQuickNotInterestedButtons);
+  setChecked("showQuickLessLikeButtons", !!settings.showQuickLessLikeButtons);
+  setChecked("showQuickDislikeButtons", !!settings.showQuickDislikeButtons);
   setChecked("showQuickUnblockButtons", !!settings.showQuickUnblockButtons);
   setChecked("reduceAnimatedBotImages", !!settings.reduceAnimatedBotImages);
   setValue("animatedImageMode", ["freeze", "once", "hover"].includes(settings.animatedImageMode) ? settings.animatedImageMode : "freeze");
@@ -11557,6 +15110,8 @@ function readSettingsFromPage() {
     chatListBlockedFilter: ["all", "blocked", "unblocked"].includes(value("chatListBlockedFilter")) ? value("chatListBlockedFilter") : "all",
 
     trackOpenedChats: checked("trackOpenedChats"),
+    botStatusScanSpeed: Object.prototype.hasOwnProperty.call(BOT_STATUS_SCAN_SPEED_DELAYS, value("botStatusScanSpeed", "safe")) ? value("botStatusScanSpeed", "safe") : "safe",
+    botStatusStaleDays: [1, 7, 14, 30].includes(Number(value("botStatusStaleDays", "7"))) ? Number(value("botStatusStaleDays", "7")) : 7,
     importOpenedFromChatsPage: checked("importOpenedFromChatsPage"),
     hideOpenedChats: checked("hideOpenedChats"),
     openedBotSortMode: value("openedBotSortMode", "newest"),
@@ -11575,6 +15130,7 @@ function readSettingsFromPage() {
     quickPanelCustomYPercent: Math.min(100, Math.max(0, Number.isFinite(Number(value("quickPanelCustomYPercent", "12"))) ? Number(value("quickPanelCustomYPercent", "12")) : 12)),
     quickPanelAutoCollapseOverlap: checked("quickPanelAutoCollapseOverlap", true),
     quickPanelShowStatus: checked("quickPanelShowStatus", true),
+    quickPanelShowLoadedMessageCount: checked("quickPanelShowLoadedMessageCount"),
     quickPanelStatusShowOpened: checked("quickPanelStatusShowOpened", true),
     quickPanelStatusShowBlocked: checked("quickPanelStatusShowBlocked", true),
     popupShowOpenedCount: checked("popupShowOpenedCount", false),
@@ -11626,6 +15182,7 @@ function readSettingsFromPage() {
     botOrganizerBulkTools: checked("botOrganizerBulkTools", true),
 
     autoFillListings: checked("autoFillListings"),
+    paginationTopJumpBox: checked("paginationTopJumpBox"),
     showListingRefillButton: checked("showListingRefillButton"),
     showListingFilterStats: checked("showListingFilterStats"),
     showListingFilterStatsDetails: checked("showListingFilterStatsDetails"),
@@ -11692,6 +15249,9 @@ function readSettingsFromPage() {
     chatBubbleAiActionText: value("chatBubbleAiActionText", "#79c8f5"),
     chatBubbleAiDialogueMode: ["native", "base", "custom"].includes(value("chatBubbleAiDialogueMode")) ? value("chatBubbleAiDialogueMode") : "base",
     chatBubbleAiDialogueText: value("chatBubbleAiDialogueText", "#f2f2f2"),
+    chatBubbleAiFont: value("chatBubbleAiFont", "inherit"),
+    chatBubbleAiActionFont: value("chatBubbleAiActionFont", "inherit"),
+    chatBubbleAiDialogueFont: value("chatBubbleAiDialogueFont", "inherit"),
     chatBubbleAiBorder: value("chatBubbleAiBorder", "#555861"),
     chatBubbleAiBorderWidth: Math.min(12, Math.max(0, Number(value("chatBubbleAiBorderWidth", "0")) || 0)),
     chatBubbleAiBorderStyle: ["solid", "dashed", "dotted", "double"].includes(value("chatBubbleAiBorderStyle")) ? value("chatBubbleAiBorderStyle") : "solid",
@@ -11710,6 +15270,9 @@ function readSettingsFromPage() {
     chatBubbleUserActionText: value("chatBubbleUserActionText", "#79c8f5"),
     chatBubbleUserDialogueMode: ["native", "base", "custom"].includes(value("chatBubbleUserDialogueMode")) ? value("chatBubbleUserDialogueMode") : "base",
     chatBubbleUserDialogueText: value("chatBubbleUserDialogueText", "#f5f5f5"),
+    chatBubbleUserFont: value("chatBubbleUserFont", "inherit"),
+    chatBubbleUserActionFont: value("chatBubbleUserActionFont", "inherit"),
+    chatBubbleUserDialogueFont: value("chatBubbleUserDialogueFont", "inherit"),
     chatBubbleUserBorder: value("chatBubbleUserBorder", "#52718a"),
     chatBubbleUserBorderWidth: Math.min(12, Math.max(0, Number(value("chatBubbleUserBorderWidth", "0")) || 0)),
     chatBubbleUserBorderStyle: ["solid", "dashed", "dotted", "double"].includes(value("chatBubbleUserBorderStyle")) ? value("chatBubbleUserBorderStyle") : "solid",
@@ -11725,6 +15288,7 @@ function readSettingsFromPage() {
     hideChatVoiceButton: checked("hideChatVoiceButton"),
     hideUnlockCustomVoices: checked("hideUnlockCustomVoices"),
 
+    stackChatMessages: checked("stackChatMessages"),
     showMessageQuickActions: checked("showMessageQuickActions"),
     showChatSearch: checked("showChatSearch"),
     chatSearchShowPanel: checked("chatSearchShowPanel", true),
@@ -11800,6 +15364,7 @@ function readSettingsFromPage() {
     botArchiveRefreshHours: [6, 24, 72, 168].includes(Number(value("botArchiveRefreshHours"))) ? Number(value("botArchiveRefreshHours")) : 24,
     protectDraftDuringMessageRemoval: checked("protectDraftDuringMessageRemoval"),
     failedMessageHelper: checked("failedMessageHelper"),
+    autoRetryFailedMessageSends: checked("autoRetryFailedMessageSends"),
     chatPerformanceMode: checked("chatPerformanceMode"),
     runtimePerformanceMode: ["normal", "adaptive", "aggressive", "maximum"].includes(value("runtimePerformanceMode")) ? value("runtimePerformanceMode") : "adaptive",
     desktopAppPerformanceGuard: checked("desktopAppPerformanceGuard", true),
@@ -11835,6 +15400,7 @@ function readSettingsFromPage() {
 
     showChatExportButton: checked("showChatExportButton"),
     chatExportLoadPreviousMessages: checked("chatExportLoadPreviousMessages"),
+    chatExportHistoryMode: value("chatExportHistoryMode", "api"),
     chatExportIncludeBotInfo: checked("chatExportIncludeBotInfo"),
     chatExportIncludeOocDirectives: checked("chatExportIncludeOocDirectives"),
     chatExportIncludeGenerationDetails: checked("chatExportIncludeGenerationDetails"),
@@ -11855,6 +15421,8 @@ function readSettingsFromPage() {
     autoAcceptPersonaChange: checked("autoAcceptPersonaChange"),
     personaQuickSwitchLimit: Math.max(1, Math.min(12, Number(value("personaQuickSwitchLimit", "6")) || 6)),
 
+    showQolSidebarButton: checked("showQolSidebarButton"),
+    qolSidebarButtonPlacement: value("qolSidebarButtonPlacement", "after-sai"),
     hideSidebarLogo: checked("hideSidebarLogo"),
     hideSidebarHome: checked("hideSidebarHome"),
     hideSidebarChats: checked("hideSidebarChats"),
@@ -11911,6 +15479,7 @@ function readSettingsFromPage() {
     showCardGreetingTokenInfo: checked("showCardGreetingTokenInfo"),
     showExactMessageCounts: checked("showExactMessageCounts"),
     showBotCreationDates: checked("showBotCreationDates"),
+    expandBotNamesOnHover: checked("expandBotNamesOnHover"),
     cardTokenShowGreeting: checked("cardTokenShowGreeting", true),
     cardTokenShowDescription: false,
     cardTokenShowPersonality: checked("cardTokenShowPersonality"),
@@ -11952,6 +15521,8 @@ function readSettingsFromPage() {
     recentlySeenLimit: Math.max(10, Math.min(250, Number(value("recentlySeenLimit", "100")) || 100)),
     enableBotComparison: checked("enableBotComparison"),
     showQuickNotInterestedButtons: checked("showQuickNotInterestedButtons"),
+    showQuickLessLikeButtons: checked("showQuickLessLikeButtons"),
+    showQuickDislikeButtons: checked("showQuickDislikeButtons"),
     showQuickUnblockButtons: checked("showQuickUnblockButtons"),
     reduceAnimatedBotImages: checked("reduceAnimatedBotImages"),
     animatedImageMode: ["freeze", "once", "hover"].includes(value("animatedImageMode")) ? value("animatedImageMode") : "freeze",
@@ -12299,6 +15870,8 @@ function buildExportPayload(scopes, result) {
     payload.blockedBots = result[BLOCKED_BOTS_KEY] || { ids: [], names: [], meta: {} };
     payload.quickDislikeHistory = normalizeQuickDislikeHistory(result[QUICK_DISLIKE_HISTORY_KEY]);
     payload.quickDislikeBulkState = normalizeQuickDislikeBulkState(result[QUICK_DISLIKE_BULK_STATE_KEY]);
+    payload.quickLessLikeHistory = normalizeQuickLessLikeHistory(result[QUICK_LESS_LIKE_HISTORY_KEY]);
+    payload.quickLessLikeBulkState = normalizeQuickLessLikeBulkState(result[QUICK_LESS_LIKE_BULK_STATE_KEY]);
   }
   if (has("notInterested")) payload.notInterestedBots = result[NOT_INTERESTED_KEY] || { ids: [], meta: {} };
   if (has("favoriteCreators")) payload.favoriteCreators = result[FAVORITE_CREATORS_KEY] || { handles: [], meta: {} };
@@ -12306,10 +15879,25 @@ function buildExportPayload(scopes, result) {
   if (has("creatorBotWatch")) payload.creatorBotWatch = normalizeCreatorBotWatchState(result[CREATOR_BOT_WATCH_KEY]);
   if (has("favoriteBots")) payload.favoriteBots = result[FAVORITE_BOTS_KEY] || { ids: [], meta: {} };
   if (has("laterBots")) payload.laterBots = result[LATER_BOTS_KEY] || { ids: [], meta: {} };
-  if (has("botOrganization")) payload.botOrganization = result[BOT_ORGANIZER_KEY] || { meta: {} };
+  if (has("botOrganization")) {
+    const organizer = normalizeBotOrganization(result[BOT_ORGANIZER_KEY]);
+    organizer.collections = uniqueClean([
+      ...(organizer.collections || []),
+      ...String(settings.botCollections || "").split(/[\n,]+/g)
+    ]);
+    organizer.config = {
+      enableBotOrganizer: !!settings.enableBotOrganizer,
+      botOrganizerShowCardMeta: settings.botOrganizerShowCardMeta !== false,
+      botOrganizerBulkTools: settings.botOrganizerBulkTools !== false
+    };
+    payload.botOrganization = organizer;
+  }
   if (has("chatOrganization")) payload.chatOrganization = normalizeChatOrganization(result[CHAT_ORGANIZER_KEY]);
   if (has("characterQolProfiles")) payload.characterQolProfiles = normalizeCharacterQolProfiles(result[CHARACTER_QOL_PROFILES_KEY]);
-  if (has("botAvailability")) payload.botAvailability = normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]);
+  if (has("botAvailability")) {
+    payload.botAvailability = normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]);
+    payload.botUnavailableRecovery = normalizeBotUnavailableRecovery(result[BOT_UNAVAILABLE_RECOVERY_KEY]);
+  }
   if (has("botArchive")) payload.botArchive = normalizeBotArchive(result[BOT_ARCHIVE_KEY]);
   if (has("lorebookBackups")) payload.lorebookBackups = normalizeLorebookBackups(result[LOREBOOK_BACKUPS_KEY]);
   if (has("chatbotLorebookLinks")) payload.chatbotLorebookLinks = result[CHATBOT_LOREBOOK_LINKS_KEY] && typeof result[CHATBOT_LOREBOOK_LINKS_KEY] === "object" ? result[CHATBOT_LOREBOOK_LINKS_KEY] : {};
@@ -12889,10 +16477,10 @@ function settingsScopeUsageCount(settingsValue, scope) {
 }
 
 const BACKUP_STORAGE_KEYS = [
-  "settings", OPENED_KEY, OPENED_META_KEY, BLOCKED_BOTS_KEY, QUICK_DISLIKE_HISTORY_KEY, QUICK_DISLIKE_BULK_STATE_KEY,
+  "settings", OPENED_KEY, OPENED_META_KEY, BLOCKED_BOTS_KEY, QUICK_DISLIKE_HISTORY_KEY, QUICK_DISLIKE_BULK_STATE_KEY, QUICK_LESS_LIKE_HISTORY_KEY, QUICK_LESS_LIKE_BULK_STATE_KEY,
   NOT_INTERESTED_KEY, PERSONAS_KEY, LEGACY_PERSONAS_KEY, PERSONA_ORG_KEY, OOC_TEMPLATES_KEY, FAVORITE_CREATORS_KEY,
   FOLLOWED_CREATORS_KEY, CREATOR_BOT_WATCH_KEY, FAVORITE_BOTS_KEY, LATER_BOTS_KEY, BOT_ORGANIZER_KEY, CHAT_ORGANIZER_KEY, CHARACTER_QOL_PROFILES_KEY,
-  BOT_AVAILABILITY_KEY, BOT_ARCHIVE_KEY, LOREBOOK_BACKUPS_KEY, CHATBOT_LOREBOOK_LINKS_KEY, SAVED_TEXT_SNIPPETS_KEY, CONTEXT_KEEPER_DATA_KEY,
+  BOT_AVAILABILITY_KEY, BOT_UNAVAILABLE_RECOVERY_KEY, BOT_ARCHIVE_KEY, LOREBOOK_BACKUPS_KEY, CHATBOT_LOREBOOK_LINKS_KEY, SAVED_TEXT_SNIPPETS_KEY, CONTEXT_KEEPER_DATA_KEY,
   STORY_DAY_TRACKER_KEY, RP_STATE_TRACKER_KEY, CHAT_NUDGE_STORE_KEY, GENERATION_PROFILES_KEY, SMART_FILTER_PRESETS_KEY, SMART_FILTER_PINNED_KEY,
   BOT_EDITOR_DRAFT_HISTORY_KEY, CHAT_BOOKMARKS_KEY, RECENTLY_SEEN_BOTS_KEY, SOUNDSCAPES_KEY, SOUNDSCAPE_AUDIO_KEY, CHAT_BACKGROUNDS_KEY,
   TAB_CLEANUP_SESSIONS_KEY, TAB_CLEANUP_TOPICS_KEY, TAB_CLEANUP_ENRICHMENT_KEY, LOCAL_CHANGE_HISTORY_KEY
@@ -12917,7 +16505,14 @@ const BACKUP_DATA_SCOPE_DEFS = {
   creatorBotWatch: { count: result => Object.keys(normalizeCreatorBotWatchState(result[CREATOR_BOT_WATCH_KEY]).creators || {}).length },
   favoriteBots: { count: result => uniqueClean(result[FAVORITE_BOTS_KEY]?.ids || []).length },
   laterBots: { count: result => uniqueClean(result[LATER_BOTS_KEY]?.ids || []).length },
-  botOrganization: { count: result => Object.keys(result[BOT_ORGANIZER_KEY]?.meta || {}).length },
+  botOrganization: { count: result => {
+    const organizer = normalizeBotOrganization(result[BOT_ORGANIZER_KEY]);
+    const folders = uniqueClean([
+      ...(organizer.collections || []),
+      ...String(result.settings?.botCollections || "").split(/[\n,]+/g)
+    ]);
+    return Object.keys(organizer.meta || {}).length + folders.length;
+  } },
   chatOrganization: { count: result => Object.keys(normalizeChatOrganization(result[CHAT_ORGANIZER_KEY]).meta).length },
   characterQolProfiles: { count: result => Object.keys(normalizeCharacterQolProfiles(result[CHARACTER_QOL_PROFILES_KEY])).length },
   botAvailability: { count: result => Object.keys(normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]).meta).length },
@@ -13178,7 +16773,16 @@ function normalizeBotOrganization(value) {
       status: ["needs-work", "testing", "finished"].includes(raw.status) ? raw.status : ""
     };
   }
-  return { meta: out };
+  const config = source.config && typeof source.config === "object" ? {
+    enableBotOrganizer: source.config.enableBotOrganizer !== false,
+    botOrganizerShowCardMeta: source.config.botOrganizerShowCardMeta !== false,
+    botOrganizerBulkTools: source.config.botOrganizerBulkTools !== false
+  } : null;
+  return {
+    collections: uniqueClean(source.collections || []),
+    ...(config ? { config } : {}),
+    meta: out
+  };
 }
 
 function mergeBotOrganizations(current, incoming) {
@@ -13194,7 +16798,11 @@ function mergeBotOrganizations(current, incoming) {
       tags: uniqueClean([...(previous.tags || []), ...(raw.tags || [])]).slice(0, 40)
     };
   }
-  return { meta };
+  return {
+    collections: uniqueClean([...(left.collections || []), ...(right.collections || [])]),
+    ...(right.config ? { config: right.config } : (left.config ? { config: left.config } : {})),
+    meta
+  };
 }
 
 function normalizeChatOrganization(value) {
@@ -13321,7 +16929,7 @@ function importCategoryEntries(parsed) {
   const source = parsed && typeof parsed === "object" ? parsed : {};
   const logExport = looksLikeAppLogExport(source);
   const settingsLike = !logExport && (source.settings || (
-    !source.openedChats && !source.blockedBots && !source.quickDislikeHistory && !source.quickDislikeBulkState && !source.notInterestedBots &&
+    !source.openedChats && !source.blockedBots && !source.quickDislikeHistory && !source.quickDislikeBulkState && !source.quickLessLikeHistory && !source.quickLessLikeBulkState && !source.notInterestedBots &&
     !source.favoriteCreators && !source.followedCreators && !source.favoriteBots &&
     !source.laterBots && !source.botOrganization && !source.chatOrganization && !source.characterQolProfiles &&
     !source.botAvailability && !source.botArchive && !source.lorebookBackups && !source.savedTextSnippets &&
@@ -13355,7 +16963,10 @@ function importCategoryEntries(parsed) {
   if (source.creatorBotWatch && typeof source.creatorBotWatch === "object") add("creatorBotWatch", "Creator follow/watch history", Object.keys(normalizeCreatorBotWatchState(source.creatorBotWatch).creators || {}).length);
   if (source.favoriteBots && typeof source.favoriteBots === "object") add("favoriteBots", "Favorite bots", uniqueClean(source.favoriteBots.ids || []).length);
   if (source.laterBots && typeof source.laterBots === "object") add("laterBots", "Later bots", uniqueClean(source.laterBots.ids || []).length);
-  if (source.botOrganization && typeof source.botOrganization === "object") add("botOrganization", "Bot organization", Object.keys(source.botOrganization.meta || {}).length);
+  if (source.botOrganization && typeof source.botOrganization === "object") {
+    const organizer = normalizeBotOrganization(source.botOrganization);
+    add("botOrganization", "Bot organization", Object.keys(organizer.meta || {}).length + (organizer.collections || []).length);
+  }
   if (source.chatOrganization && typeof source.chatOrganization === "object") add("chatOrganization", "Chat organization", Object.keys(normalizeChatOrganization(source.chatOrganization).meta).length);
   if (source.chatBookmarks && typeof source.chatBookmarks === "object") add("chatBookmarks", "Message bookmarks", Object.values(source.chatBookmarks).reduce((n, chat) => n + (Array.isArray(chat?.entries) ? chat.entries.length : 0), 0));
   if (source.characterQolProfiles && typeof source.characterQolProfiles === "object") add("characterQolProfiles", "Character QoL profiles", Object.keys(normalizeCharacterQolProfiles(source.characterQolProfiles)).length);
@@ -13400,7 +17011,7 @@ function validateBackupObject(parsed) {
   const migration = migrateBackupPayload(parsed);
   const source = migration.payload;
   const entries = importCategoryEntries(source);
-  const known = new Set(["_qolBackup", "settings", "openedChats", "openedChatMeta", "blockedBots", "quickDislikeHistory", "quickDislikeBulkState", "notInterestedBots", "favoriteCreators", "followedCreators", "creatorBotWatch", "favoriteBots", "laterBots", "botOrganization", "chatOrganization", "characterQolProfiles", "botAvailability", "botArchive", "lorebookBackups", "chatbotLorebookLinks", "savedTextSnippets", "contextKeeperData", "storyDayTrackerData", "rpStateTrackerData", "chatNudges", "personas", "personaOrganization", "oocTemplates", "generationProfiles", "smartFilterPresets", "smartFilterPinnedPresets", "botEditorDraftHistory", "chatBookmarks", "recentlySeenBots", "soundscapes", "tabCleanupSessions", "tabCleanupTopics", "tabCleanupEnrichment", "localChangeHistory", "localMedia"]);
+  const known = new Set(["_qolBackup", "settings", "openedChats", "openedChatMeta", "blockedBots", "quickDislikeHistory", "quickDislikeBulkState", "quickLessLikeHistory", "quickLessLikeBulkState", "notInterestedBots", "favoriteCreators", "followedCreators", "creatorBotWatch", "favoriteBots", "laterBots", "botOrganization", "chatOrganization", "characterQolProfiles", "botAvailability", "botArchive", "lorebookBackups", "chatbotLorebookLinks", "savedTextSnippets", "contextKeeperData", "storyDayTrackerData", "rpStateTrackerData", "chatNudges", "personas", "personaOrganization", "oocTemplates", "generationProfiles", "smartFilterPresets", "smartFilterPinnedPresets", "botEditorDraftHistory", "chatBookmarks", "recentlySeenBots", "soundscapes", "tabCleanupSessions", "tabCleanupTopics", "tabCleanupEnrichment", "localChangeHistory", "localMedia"]);
   const warnings = Object.keys(source).filter(key => !known.has(key)).map(key => `Unknown top-level field: ${key}`);
   const meta = source._qolBackup && typeof source._qolBackup === "object" ? source._qolBackup : null;
   if (!meta) warnings.push("Legacy backup: no QoL backup metadata found (still importable after preview). ");
@@ -13547,6 +17158,8 @@ async function importSettings() {
       BLOCKED_BOTS_KEY,
       QUICK_DISLIKE_HISTORY_KEY,
       QUICK_DISLIKE_BULK_STATE_KEY,
+      QUICK_LESS_LIKE_HISTORY_KEY,
+      QUICK_LESS_LIKE_BULK_STATE_KEY,
       NOT_INTERESTED_KEY,
       PERSONAS_KEY,
       LEGACY_PERSONAS_KEY,
@@ -13660,6 +17273,15 @@ async function importSettings() {
       payload[QUICK_DISLIKE_BULK_STATE_KEY] = normalizeQuickDislikeBulkState(parsed.quickDislikeBulkState);
     }
 
+    if (hasImportScope("blocked") && parsed.quickLessLikeHistory && typeof parsed.quickLessLikeHistory === "object") {
+      payload[QUICK_LESS_LIKE_HISTORY_KEY] = mode === "replace"
+        ? normalizeQuickLessLikeHistory(parsed.quickLessLikeHistory)
+        : mergeQuickLessLikeHistories(current[QUICK_LESS_LIKE_HISTORY_KEY], parsed.quickLessLikeHistory);
+    }
+    if (hasImportScope("blocked") && parsed.quickLessLikeBulkState && typeof parsed.quickLessLikeBulkState === "object") {
+      payload[QUICK_LESS_LIKE_BULK_STATE_KEY] = normalizeQuickLessLikeBulkState(parsed.quickLessLikeBulkState);
+    }
+
     if (hasImportScope("notInterested") && parsed.notInterestedBots && typeof parsed.notInterestedBots === "object") {
       payload[NOT_INTERESTED_KEY] = mode === "replace"
         ? normalizeBotStore(parsed.notInterestedBots)
@@ -13705,9 +17327,29 @@ async function importSettings() {
     }
 
     if (hasImportScope("botOrganization") && parsed.botOrganization && typeof parsed.botOrganization === "object") {
+      const incomingOrganizer = normalizeBotOrganization(parsed.botOrganization);
       payload[BOT_ORGANIZER_KEY] = mode === "replace"
-        ? normalizeBotOrganization(parsed.botOrganization)
-        : mergeBotOrganizations(current[BOT_ORGANIZER_KEY], parsed.botOrganization);
+        ? incomingOrganizer
+        : mergeBotOrganizations(current[BOT_ORGANIZER_KEY], incomingOrganizer);
+
+      const hasFolderDefinitions = Array.isArray(parsed.botOrganization.collections);
+      const hasOrganizerConfig = parsed.botOrganization.config && typeof parsed.botOrganization.config === "object";
+      if (hasFolderDefinitions || hasOrganizerConfig) {
+        const settings = { ...DEFAULT_SETTINGS, ...(current.settings || {}), ...(payload.settings || {}) };
+        if (hasFolderDefinitions) {
+          const currentFolders = uniqueClean(String(current.settings?.botCollections || "").split(/[\n,]+/g));
+          const importedFolders = incomingOrganizer.collections || [];
+          settings.botCollections = (mode === "replace"
+            ? importedFolders
+            : uniqueClean([...currentFolders, ...importedFolders])).join("\n");
+        }
+        if (hasOrganizerConfig) {
+          settings.enableBotOrganizer = incomingOrganizer.config?.enableBotOrganizer !== false;
+          settings.botOrganizerShowCardMeta = incomingOrganizer.config?.botOrganizerShowCardMeta !== false;
+          settings.botOrganizerBulkTools = incomingOrganizer.config?.botOrganizerBulkTools !== false;
+        }
+        payload.settings = settings;
+      }
     }
 
     if (hasImportScope("chatOrganization") && parsed.chatOrganization && typeof parsed.chatOrganization === "object") {
@@ -13726,6 +17368,11 @@ async function importSettings() {
       payload[BOT_AVAILABILITY_KEY] = mode === "replace"
         ? normalizeBotAvailability(parsed.botAvailability)
         : mergeBotAvailability(current[BOT_AVAILABILITY_KEY], parsed.botAvailability);
+      if (parsed.botUnavailableRecovery && typeof parsed.botUnavailableRecovery === "object") {
+        payload[BOT_UNAVAILABLE_RECOVERY_KEY] = mode === "replace"
+          ? normalizeBotUnavailableRecovery(parsed.botUnavailableRecovery)
+          : mergeBotUnavailableRecovery(current[BOT_UNAVAILABLE_RECOVERY_KEY], parsed.botUnavailableRecovery);
+      }
     }
 
     if (hasImportScope("botArchive") && parsed.botArchive && typeof parsed.botArchive === "object") {
@@ -14106,6 +17753,7 @@ const STORAGE_DATASET_DEFS = [
   { id: "chatOrganization", label: "Chat organization", keys: [CHAT_ORGANIZER_KEY], count: result => Object.keys(normalizeChatOrganization(result[CHAT_ORGANIZER_KEY]).meta).length },
   { id: "characterProfiles", label: "Character profiles", keys: [CHARACTER_QOL_PROFILES_KEY], count: result => Object.keys(normalizeCharacterQolProfiles(result[CHARACTER_QOL_PROFILES_KEY])).length },
   { id: "availability", label: "Availability checks", keys: [BOT_AVAILABILITY_KEY], count: result => Object.keys(normalizeBotAvailability(result[BOT_AVAILABILITY_KEY]).meta).length },
+  { id: "unavailableRecovery", label: "Unavailable-bot recovery ledger", keys: [BOT_UNAVAILABLE_RECOVERY_KEY], count: result => Object.keys(normalizeBotUnavailableRecovery(result[BOT_UNAVAILABLE_RECOVERY_KEY]).meta).length },
   { id: "botArchive", label: "Saved bot copies", keys: [BOT_ARCHIVE_KEY], count: result => Object.keys(normalizeBotArchive(result[BOT_ARCHIVE_KEY]).meta).length },
   { id: "lorebookBackups", label: "Lorebook backups", keys: [LOREBOOK_BACKUPS_KEY], count: result => Object.keys(normalizeLorebookBackups(result[LOREBOOK_BACKUPS_KEY]).meta).length },
   { id: "snippets", label: "Saved snippets", keys: [SAVED_TEXT_SNIPPETS_KEY], count: result => Array.isArray(result[SAVED_TEXT_SNIPPETS_KEY]) ? result[SAVED_TEXT_SNIPPETS_KEY].length : 0 },
@@ -15309,13 +18957,63 @@ async function markUpdatesSeen() {
   showSettingsToast("New/updated setting markers cleared.");
 }
 
-async function loadChangelog() {
+function promiseWithTimeout(promise, timeoutMs, label = "operation") {
+  let timer = 0;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function readBundledOptionsText(name) {
+  const filename = String(name || "").trim();
+  if (!filename) throw new Error("Missing bundled text filename");
+
+  // Android Options is rendered from an in-memory HTML document. Older
+  // WebView builds can leave fetch(CHANGELOG.md) pending forever even though
+  // the APK already exposes the file through optionsReadBundledText. Prefer
+  // that native path directly instead of depending on fetch interception.
+  if (window.__spicyChatQolAndroidWebView || window.__spicyChatQolAndroidApp) {
+    try {
+      const bridge = window.flutter_inappwebview;
+      if (bridge?.callHandler) {
+        const text = await promiseWithTimeout(
+          bridge.callHandler("optionsReadBundledText", filename),
+          3500,
+          `Android ${filename} bridge`
+        );
+        if (typeof text === "string" && text.trim()) return text;
+      }
+    } catch (error) {
+      console.warn(`[DS Options] Native ${filename} read failed; trying packaged fetch.`, error);
+    }
+  }
+
+  const url = chrome.runtime?.getURL?.(filename) || filename;
+  const response = await promiseWithTimeout(
+    fetch(url, { cache: "no-store" }),
+    5000,
+    `${filename} fetch`
+  );
+  if (!response?.ok) throw new Error(`${filename} returned HTTP ${response?.status || 0}`);
+  return await promiseWithTimeout(response.text(), 3000, `${filename} text read`);
+}
+
+async function loadChangelog({ force = false } = {}) {
   const host = $("changelogContent");
-  if (!host || host.dataset.loaded === "1") return;
+  if (!host || (!force && host.dataset.loaded === "1")) return;
+  if (!force && host.dataset.loading === "1") return;
+
+  host.dataset.loading = "1";
+  if (force) {
+    delete host.dataset.loaded;
+    host.textContent = "Loading changelog...";
+  }
 
   try {
-    const response = await fetch(chrome.runtime.getURL("CHANGELOG.md"));
-    const text = await response.text();
+    const text = await readBundledOptionsText("CHANGELOG.md");
     const blocks = text
       .split(/\n(?=##\s+)/g)
       .map(block => block.trim())
@@ -15354,11 +19052,19 @@ async function loadChangelog() {
       } else {
         host.replaceChildren(...recent);
       }
-    } else host.textContent = "No changelog entries yet.";
+    } else {
+      host.textContent = "No changelog entries yet.";
+    }
 
     host.dataset.loaded = "1";
-  } catch {
-    host.textContent = "Could not load the changelog.";
+  } catch (error) {
+    console.error("[DS Options] Could not load changelog", error);
+    const message = makeElement("span", { text: "Could not load the changelog. " });
+    const retry = makeElement("button", { text: "Retry", attrs: { type: "button" } });
+    retry.addEventListener("click", () => loadChangelog({ force: true }));
+    host.replaceChildren(message, retry);
+  } finally {
+    delete host.dataset.loading;
   }
 }
 
@@ -15479,7 +19185,18 @@ function setupBotManagerControls(kind) {
     $("resumeBlockedDislikeRun")?.addEventListener("click", () => runBlockedBulkDislike("resume").catch(() => showSettingsToast("Could not resume Bulk Dislike.")));
     $("retryFailedBlockedDislikes")?.addEventListener("click", () => runBlockedBulkDislike("failed").catch(() => showSettingsToast("Could not retry failed dislikes.")));
     $("clearBlockedDislikeHistory")?.addEventListener("click", () => clearBlockedDislikeHistory().catch(() => showSettingsToast("Could not clear handled dislike history.")));
+    $("resetAndRedoBlockedDislikes")?.addEventListener("click", () => resetAndRedoBlockedDislikes().catch(() => showSettingsToast("Could not reset and redo blocked dislikes.")));
+    $("bulkLessLikeBlockedBots")?.addEventListener("click", () => bulkLessLikeBlockedBots().catch(() => showSettingsToast("Stop recommending bulk run failed.")));
+    $("resumeBlockedLessLikeRun")?.addEventListener("click", () => runBlockedBulkLessLike("resume").catch(() => showSettingsToast("Could not resume Stop recommending.")));
+    $("retryFailedBlockedLessLikes")?.addEventListener("click", () => runBlockedBulkLessLike("failed").catch(() => showSettingsToast("Could not retry failed Stop recommending actions.")));
+    $("clearBlockedLessLikeHistory")?.addEventListener("click", () => clearBlockedLessLikeHistory().catch(() => showSettingsToast("Could not clear Stop recommending history.")));
+    $("resetAndRedoBlockedLessLikes")?.addEventListener("click", () => resetAndRedoBlockedLessLikes().catch(() => showSettingsToast("Could not reset and redo Stop recommending history.")));
     $("blockedBotDislikeFilter")?.addEventListener("change", () => {
+      botManagerUiState.blocked.visible = 20;
+      botManagerUiState.blocked.collapsed = true;
+      renderBotManager("blocked");
+    });
+    $("blockedBotLessLikeFilter")?.addEventListener("change", () => {
       botManagerUiState.blocked.visible = 20;
       botManagerUiState.blocked.collapsed = true;
       renderBotManager("blocked");
@@ -15731,6 +19448,38 @@ function compareFeatureChronology(left, right) {
   return 0;
 }
 
+const FEATURE_INDEX_GROUP_STATE_KEY = "dsFeatureIndexGroupStateV1";
+
+function normalizeFeatureIndexGroupState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(([key, state]) => String(key || "").trim() && typeof state === "boolean")
+  );
+}
+
+function loadFeatureIndexGroupState() {
+  try {
+    return normalizeFeatureIndexGroupState(
+      JSON.parse(localStorage.getItem(FEATURE_INDEX_GROUP_STATE_KEY) || "{}")
+    );
+  } catch {
+    return {};
+  }
+}
+
+function saveFeatureIndexGroupState(state) {
+  const clean = normalizeFeatureIndexGroupState(state);
+  // Keep a synchronous mirror so a collapse survives even if Settings closes
+  // immediately after the click, while extension storage is the durable copy.
+  try {
+    localStorage.setItem(FEATURE_INDEX_GROUP_STATE_KEY, JSON.stringify(clean));
+  } catch {}
+  try {
+    const pending = storageSet({ [FEATURE_INDEX_GROUP_STATE_KEY]: clean });
+    pending?.catch?.(() => {});
+  } catch {}
+}
+
 function setupFeaturesIndex() {
   const host = $("featureIndexList");
   const search = $("featureIndexSearch");
@@ -15747,6 +19496,37 @@ function setupFeaturesIndex() {
 
   const registryOrder = new Map(registry.map((entry, index) => [entry.id, index]));
   const categories = [...new Set(registry.map(entry => entry.category))];
+  const groupOpenState = loadFeatureIndexGroupState();
+  let featureGroupStateHydrated = false;
+
+  function rememberRenderedFeatureGroups({ persist = false } = {}) {
+    host.querySelectorAll("details.feature-index-group[data-feature-group]").forEach(section => {
+      const groupName = String(section.dataset.featureGroup || "").trim();
+      if (groupName) groupOpenState[groupName] = !!section.open;
+    });
+    if (persist) saveFeatureIndexGroupState(groupOpenState);
+  }
+
+  async function hydrateFeatureIndexGroupState() {
+    try {
+      const stored = normalizeFeatureIndexGroupState(
+        (await storageGet([FEATURE_INDEX_GROUP_STATE_KEY]))?.[FEATURE_INDEX_GROUP_STATE_KEY]
+      );
+      let changed = false;
+      for (const [groupName, open] of Object.entries(stored)) {
+        // The synchronous local mirror wins when both exist because it may
+        // contain a click made milliseconds before this async read finished.
+        if (Object.prototype.hasOwnProperty.call(groupOpenState, groupName)) continue;
+        groupOpenState[groupName] = open;
+        changed = true;
+      }
+      featureGroupStateHydrated = true;
+      if (changed) render();
+    } catch {
+      featureGroupStateHydrated = true;
+    }
+  }
+
   category.replaceChildren(
     makeElement("option", { text: "All categories", attrs: { value: "all" } }),
     ...categories.map(name => makeElement("option", { text: name, attrs: { value: name } }))
@@ -15785,6 +19565,10 @@ function setupFeaturesIndex() {
   }
 
   function render() {
+    // Preserve the actual on-screen state before replacing filtered/sorted
+    // <details> nodes. This prevents unrelated setting changes from resetting
+    // a group that the user just collapsed.
+    rememberRenderedFeatureGroups();
     const query = clean(search.value).toLowerCase();
     const wantedCategory = category.value || "all";
     const wantedStatus = status?.value || "all";
@@ -15829,7 +19613,14 @@ function setupFeaturesIndex() {
     for (const groupName of groupedCategories) {
       const groupEntries = ordered.filter(entry => entry.category === groupName);
       if (!groupEntries.length) continue;
-      const section = makeElement("details", { className: "feature-index-group", attrs: { open: "" } });
+      const rememberedOpen = groupOpenState[groupName];
+      const section = makeElement("details", {
+        className: "feature-index-group",
+        attrs: {
+          ...(rememberedOpen === false ? {} : { open: "" }),
+          "data-feature-group": groupName
+        }
+      });
       const groupDescriptions = {
         "Setup & Compatibility": "Setup, compatibility, update and diagnostic helpers.",
         "Saved Lists & Bot Discovery": "Local lists, organization, archives and rediscovery tools.",
@@ -15847,6 +19638,17 @@ function setupFeaturesIndex() {
         makeElement("span", { className: "hint", text: `${groupEntries.length} feature${groupEntries.length === 1 ? "" : "s"}` })
       ]);
       section.appendChild(summaryRow);
+      // Save on click as well as toggle. <details> toggle is queued by the
+      // browser, so relying on it alone can lose the last click if the Options
+      // page is closed immediately afterwards.
+      summaryRow.addEventListener("click", () => {
+        groupOpenState[groupName] = !section.open;
+        saveFeatureIndexGroupState(groupOpenState);
+      });
+      section.addEventListener("toggle", () => {
+        groupOpenState[groupName] = !!section.open;
+        saveFeatureIndexGroupState(groupOpenState);
+      });
       const description = groupDescriptions[groupName];
       if (description) section.appendChild(makeElement("p", { className: "feature-index-group-description hint", text: description }));
       const list = makeElement("div", { className: "feature-index-group-list" });
@@ -15866,8 +19668,11 @@ function setupFeaturesIndex() {
     if (event.target?.matches?.("input[type='checkbox'], input[type='radio'], select")) render();
   });
 
+  window.addEventListener("pagehide", () => rememberRenderedFeatureGroups({ persist: true }), { once: true });
+
   DS_FEATURE_INDEX_REFRESH = render;
   render();
+  if (!featureGroupStateHydrated) hydrateFeatureIndexGroupState();
 }
 
 let DS_FEATURE_INDEX_REFRESH = null;
@@ -15903,7 +19708,7 @@ async function refreshPersonalUsageSummary() {
 const SETTING_DEPENDENCY_GROUPS = [
   { parent: "autoAfkEnabled", name: "Inactive tab cleanup (Auto-AFK)", children: ["autoAfkChats", "autoAfkHome", "autoAfkProfiles", "autoAfkProtectActive", "autoAfkResetOnActivate"] },
   { parent: "duplicateTabGuardEnabled", name: "Duplicate SpicyChat Tab Guard", children: ["duplicateTabChats", "duplicateTabHome", "duplicateTabProfiles", "duplicateTabFocusExisting"] },
-  { parent: "showQuickPanel", name: "Mini Panel", children: ["quickPanelDraggable", "quickPanelDefaultClosed", "quickPanelEnabledByDefaultInTab", "quickPanelAutoCollapseOverlap", "quickPanelShowStatus", "quickPanelStatusShowOpened", "quickPanelStatusShowBlocked", "quickPanelShowFeatureSummary", "quickPanelShowOptions", "quickPanelShowFillNow", "quickPanelShowSmartFilterPins", "quickPanelShowChatSearch", "quickPanelShowChatSort", "quickPanelShowScanVisible", "quickPanelShowLoadAll", "quickPanelShowOoc", "quickPanelShowAutoVoice", "quickPanelShowAutoAsterisk", "quickPanelShowTranslation", "quickPanelShowPersona", "quickPanelShowExport", "quickPanelShowSoundscapes"] },
+  { parent: "showQuickPanel", name: "Mini Panel", children: ["quickPanelDraggable", "quickPanelDefaultClosed", "quickPanelEnabledByDefaultInTab", "quickPanelAutoCollapseOverlap", "quickPanelShowStatus", "quickPanelShowLoadedMessageCount", "quickPanelStatusShowOpened", "quickPanelStatusShowBlocked", "quickPanelShowFeatureSummary", "quickPanelShowOptions", "quickPanelShowFillNow", "quickPanelShowSmartFilterPins", "quickPanelShowChatSearch", "quickPanelShowChatSort", "quickPanelShowScanVisible", "quickPanelShowLoadAll", "quickPanelShowOoc", "quickPanelShowAutoVoice", "quickPanelShowAutoAsterisk", "quickPanelShowTranslation", "quickPanelShowPersona", "quickPanelShowExport", "quickPanelShowSoundscapes"] },
   { parent: "showCardGreetingTokenInfo", name: "Bot card token info", children: ["cardTokenShowGreeting", "cardTokenShowPersonality", "cardTokenShowScenario", "cardTokenShowExamples"] },
   { parent: "replaceCardProfileWithBlockButton", name: "QoL card block button", children: ["quickDislikeOnBlock", "showBlockButtonOnMyCreations"] },
   { parent: "enableBulkCardBlocking", name: "Bulk card selection", children: ["bulkCardBlockingSidebarLauncher"] },
@@ -16019,16 +19824,42 @@ function healthResultItem(kind, title, detail, targetId = "", action = null) {
   return item;
 }
 
+
+const SETTINGS_NO_DIRECT_CONTROL_KEYS = new Set([
+  "autoAfkAction", "botEditorSnippets", "blockedBotIds", "blockedBotNames",
+  "cardTokenShowDescription", "cardTokenShowCombined", "allowedLanguages",
+  "showListingRefillButton", "quickPanelCustomX", "quickPanelCustomY",
+  "showBlockCurrentBotButton", "quickDislikeIdleEnabled", "chatListSearchMode",
+  "autoLoadAllOpenedChats", "deepImportMaxPages", "chatExportLoadPreviousMessages",
+  "chatExportHistoryMode", "oocTemplates", "replyInstructionBotOverrides",
+  "chatBubblePreserveActionColors", "hideSidebarSocialLinks", "hideSidebarFooterLinks",
+  "hideSidebarAppDownload", "enableMainFooterManagement", "hideMainFooterEntirely",
+  "hideMainFooterCompany", "hideMainFooterResources", "hideMainFooterCommunity",
+  "hideMainFooterJoinUs", "hideMainFooterAppDownload", "hideMainFooter2257"
+]);
+
+const SETTINGS_RUNTIME_REQUIRED_KEYS = new Set(["stackChatMessages"]);
+
 async function runSettingsHealthCheck() {
   const host = $("settingsHealthResults");
   if (!host) return;
   host.replaceChildren(makeElement("span", { className: "hint", text: "Checking configuration..." }));
 
-  const result = await storageGet(["settings", DEEPL_API_KEY, PERSONAS_KEY, LEGACY_PERSONAS_KEY, CHAT_BACKGROUNDS_KEY, QUICK_DISLIKE_BULK_STATE_KEY, BLOCKED_BOTS_KEY, NOT_INTERESTED_KEY, OPENED_KEY]);
+  const result = await storageGet(["settings", DEEPL_API_KEY, PERSONAS_KEY, LEGACY_PERSONAS_KEY, CHAT_BACKGROUNDS_KEY, QUICK_DISLIKE_BULK_STATE_KEY, QUICK_LESS_LIKE_BULK_STATE_KEY, BLOCKED_BOTS_KEY, NOT_INTERESTED_KEY, OPENED_KEY]);
   const savedSettings = result.settings && typeof result.settings === "object" ? result.settings : {};
   const current = { ...DEFAULT_SETTINGS, ...savedSettings, ...readSettingsFromPage() };
   const warnings = [];
   const notices = [];
+
+  const missingControls = Object.keys(DEFAULT_SETTINGS).filter(key => !SETTINGS_NO_DIRECT_CONTROL_KEYS.has(key) && !document.getElementById(key));
+  const requiredMissing = [...SETTINGS_RUNTIME_REQUIRED_KEYS].filter(key => !(key in DEFAULT_SETTINGS) || !document.getElementById(key));
+  const missing = uniqueClean([...missingControls, ...requiredMissing]);
+  if (missing.length) {
+    warnings.push({
+      title: `${missing.length} registered setting${missing.length === 1 ? " is" : "s are"} missing a Settings control`,
+      detail: `Developer self-check: ${missing.slice(0, 18).join(", ")}${missing.length > 18 ? ` +${missing.length - 18} more` : ""}. This usually means a feature was wired in code but its Settings UI was not shipped.`
+    });
+  }
   if (current.enableTranslation && !String(result[DEEPL_API_KEY] || "").trim()) {
     warnings.push({ title: "DeepL translation is enabled without an API key", detail: "Translation cannot run until a DeepL API key is saved and tested.", target: "deeplApiKey" });
   }
@@ -16087,6 +19918,25 @@ async function runSettingsHealthCheck() {
     });
   }
 
+  const lessLikeBulkState = normalizeQuickLessLikeBulkState(result[QUICK_LESS_LIKE_BULK_STATE_KEY]);
+  const unfinishedLessLikeIds = uniqueClean([lessLikeBulkState.currentId, ...(lessLikeBulkState.pendingIds || [])]).filter(id => blockedIdSetForBulk.has(id));
+  const failedLessLikeIds = uniqueClean(lessLikeBulkState.failedIds || []).filter(id => blockedIdSetForBulk.has(id));
+  const staleLessLikeRunning = lessLikeBulkState.status === "running" && lessLikeBulkState.updatedAt && Date.now() - lessLikeBulkState.updatedAt > 15000;
+  if ((staleLessLikeRunning || lessLikeBulkState.status === "paused") && unfinishedLessLikeIds.length) {
+    notices.push({
+      title: "Blocked Bot Stop recommending has an unfinished run",
+      detail: `${unfinishedLessLikeIds.length} bot${unfinishedLessLikeIds.length === 1 ? "" : "s"} are still queued. Open Blocked Bots to resume or start a fresh remaining-bots pass.`,
+      target: "bulkLessLikeBlockedBots"
+    });
+  }
+  if (failedLessLikeIds.length) {
+    notices.push({
+      title: `${failedLessLikeIds.length} Stop recommending action${failedLessLikeIds.length === 1 ? "" : "s"} failed on the last run`,
+      detail: "Failures stay eligible. The Blocked Bots manager can retry only those failures without repeating successful Less Like feedback.",
+      target: "retryFailedBlockedLessLikes"
+    });
+  }
+
   const rawBlockedIds = Array.isArray(rawBlocked.ids) ? rawBlocked.ids : [];
   const normalizedBlocked = normalizedBlockedForBulk;
   const rawNotInterested = result[NOT_INTERESTED_KEY] && typeof result[NOT_INTERESTED_KEY] === "object" ? result[NOT_INTERESTED_KEY] : {};
@@ -16127,8 +19977,8 @@ async function runSettingsHealthCheck() {
 
 const CHAT_BUBBLE_DEFAULTS = { ...CHAT_BUBBLE_TEXT_DEFAULTS, ...CHAT_BUBBLE_PRESETS.default, chatBubblePreserveActionColors: true };
 const CHAT_BUBBLE_FIELD_IDS = [
-  "chatBubbleAiBackground", "chatBubbleAiTextMode", "chatBubbleAiText", "chatBubbleAiActionMode", "chatBubbleAiActionText", "chatBubbleAiDialogueMode", "chatBubbleAiDialogueText", "chatBubbleAiBorder", "chatBubbleAiBorderWidth", "chatBubbleAiBorderStyle", "chatBubbleAiBorderOpacity", "chatBubbleAiOpacity", "chatBubbleAiRadius", "chatBubbleAiShape", "chatBubbleAiDecorationMode", "chatBubbleAiDecorationColor", "chatBubbleAiCatEarLayout", "chatBubbleAiShadow",
-  "chatBubbleUserBackground", "chatBubbleUserTextMode", "chatBubbleUserText", "chatBubbleUserActionMode", "chatBubbleUserActionText", "chatBubbleUserDialogueMode", "chatBubbleUserDialogueText", "chatBubbleUserBorder", "chatBubbleUserBorderWidth", "chatBubbleUserBorderStyle", "chatBubbleUserBorderOpacity", "chatBubbleUserOpacity", "chatBubbleUserRadius", "chatBubbleUserShape", "chatBubbleUserDecorationMode", "chatBubbleUserDecorationColor", "chatBubbleUserCatEarLayout", "chatBubbleUserShadow"
+  "chatBubbleAiBackground", "chatBubbleAiTextMode", "chatBubbleAiText", "chatBubbleAiFont", "chatBubbleAiActionMode", "chatBubbleAiActionText", "chatBubbleAiActionFont", "chatBubbleAiDialogueMode", "chatBubbleAiDialogueText", "chatBubbleAiDialogueFont", "chatBubbleAiBorder", "chatBubbleAiBorderWidth", "chatBubbleAiBorderStyle", "chatBubbleAiBorderOpacity", "chatBubbleAiOpacity", "chatBubbleAiRadius", "chatBubbleAiShape", "chatBubbleAiDecorationMode", "chatBubbleAiDecorationColor", "chatBubbleAiCatEarLayout", "chatBubbleAiShadow",
+  "chatBubbleUserBackground", "chatBubbleUserTextMode", "chatBubbleUserText", "chatBubbleUserFont", "chatBubbleUserActionMode", "chatBubbleUserActionText", "chatBubbleUserActionFont", "chatBubbleUserDialogueMode", "chatBubbleUserDialogueText", "chatBubbleUserDialogueFont", "chatBubbleUserBorder", "chatBubbleUserBorderWidth", "chatBubbleUserBorderStyle", "chatBubbleUserBorderOpacity", "chatBubbleUserOpacity", "chatBubbleUserRadius", "chatBubbleUserShape", "chatBubbleUserDecorationMode", "chatBubbleUserDecorationColor", "chatBubbleUserCatEarLayout", "chatBubbleUserShadow"
 ];
 
 function setControlValue(id, next) {
@@ -16629,6 +20479,29 @@ function refreshSavedManagersFromStorageChange(kinds = []) {
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
+
+  // Bot Status / unavailable-cleanup writes originate from this Options page,
+  // whose in-memory stores are already current. Re-normalizing every large
+  // changed value and immediately rebuilding all Saved managers was causing a
+  // second wave of short UI hangs after the actual storage commit.
+  if (Date.now() < Number(botStatusStorageSelfWriteUntil || 0)) {
+    const selfWriteKeys = new Set([
+      "settings",
+      BLOCKED_BOTS_KEY, NOT_INTERESTED_KEY, FAVORITE_BOTS_KEY, LATER_BOTS_KEY,
+      OPENED_KEY, OPENED_META_KEY, RECENTLY_SEEN_BOTS_KEY, BOT_ORGANIZER_KEY,
+      CREATOR_BOT_WATCH_KEY, QUICK_DISLIKE_BULK_STATE_KEY, QUICK_LESS_LIKE_BULK_STATE_KEY,
+      BOT_AVAILABILITY_KEY, BOT_ARCHIVE_KEY, BOT_UNAVAILABLE_RECOVERY_KEY
+    ]);
+    const keys = Object.keys(changes || {});
+    if (keys.length && keys.every(key => selfWriteKeys.has(key))) {
+      if (changes.settings?.newValue) {
+        loadedSettingsSnapshot = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
+      }
+      if (changes[BOT_ARCHIVE_KEY]) creatorBackupManagerLoaded = false;
+      return;
+    }
+  }
+
   if (changes[PENDING_OPTIONS_NAV_KEY]?.newValue && optionsDataLoaded) {
     applyPendingOptionsNavigation(changes[PENDING_OPTIONS_NAV_KEY].newValue).catch(() => {});
   }
@@ -16643,6 +20516,16 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes[QUICK_DISLIKE_BULK_STATE_KEY]) {
     quickDislikeBulkState = normalizeQuickDislikeBulkState(changes[QUICK_DISLIKE_BULK_STATE_KEY].newValue);
     updateBlockedBulkResumeControls();
+  }
+
+  if (changes[QUICK_LESS_LIKE_HISTORY_KEY]) {
+    quickLessLikeHistoryState = normalizeQuickLessLikeHistory(changes[QUICK_LESS_LIKE_HISTORY_KEY].newValue);
+    refreshBlocked = true;
+  }
+
+  if (changes[QUICK_LESS_LIKE_BULK_STATE_KEY]) {
+    quickLessLikeBulkState = normalizeQuickLessLikeBulkState(changes[QUICK_LESS_LIKE_BULK_STATE_KEY].newValue);
+    updateBlockedLessLikeResumeControls();
   }
 
   if (changes[BLOCKED_BOTS_KEY] && blockingDataLoaded) {
@@ -16753,6 +20636,11 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
   if (changes[BOT_AVAILABILITY_KEY] && savedListsDataLoaded) {
     botAvailabilityState = normalizeBotAvailability(changes[BOT_AVAILABILITY_KEY].newValue);
+    savedRefreshKinds.add("availability");
+  }
+
+  if (changes[BOT_UNAVAILABLE_RECOVERY_KEY] && savedListsDataLoaded) {
+    botUnavailableRecoveryState = normalizeBotUnavailableRecovery(changes[BOT_UNAVAILABLE_RECOVERY_KEY].newValue);
     savedRefreshKinds.add("availability");
   }
 
