@@ -4095,35 +4095,66 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       return;
     }
 
+    // Active chats are intentionally protected from destructive watchdog
+    // recovery. Android keyboard/viewport changes, a busy renderer, or a
+    // temporarily unanswered JS probe must never recreate a usable chat.
+    var chatRoute = _isChatUrl(_lastKnownUrl);
+
     if (_isLoading) {
       final startedAt = _loadStartedAt;
-      if (startedAt == null ||
-          DateTime.now().difference(startedAt) < const Duration(seconds: 15)) {
+      final grace = chatRoute
+          ? const Duration(seconds: 30)
+          : const Duration(seconds: 15);
+      if (startedAt == null || DateTime.now().difference(startedAt) < grace) {
         return;
       }
-      // A load that never reaches onLoadStop used to disable the watchdog
-      // forever. After 15 seconds, probe it like any other page.
+      // A load that never reaches onLoadStop can still be probed after the
+      // grace period. Chat routes remain non-destructive below.
     }
 
     try {
       final current = await controller.getUrl();
-      if (current != null && !_isSpicyChat(current)) {
-        _blankHealthFailures = 0;
-        return;
+      if (current != null) {
+        if (!_isSpicyChat(current)) {
+          _blankHealthFailures = 0;
+          return;
+        }
+
+        final currentText = current.toString();
+        if (currentText.isNotEmpty) {
+          _lastKnownUrl = currentText;
+          chatRoute = _isChatUrl(currentText);
+        }
       }
     } catch (_) {
-      // A broken renderer may not answer getUrl().
+      // A busy renderer can briefly fail getUrl(). Do not interpret that as a
+      // dead active chat; the JS probe below may still answer normally.
     }
 
     final stoppedAt = _lastLoadStopAt;
+    final postLoadGrace = chatRoute
+        ? const Duration(seconds: 10)
+        : const Duration(seconds: 5);
     if (stoppedAt != null &&
-        DateTime.now().difference(stoppedAt) < const Duration(seconds: 4)) {
+        DateTime.now().difference(stoppedAt) < postLoadGrace) {
       return;
     }
 
     try {
       final probe = await _probeWebView();
       if (probe == null) {
+        if (chatRoute) {
+          _blankHealthFailures = 0;
+          unawaited(
+            _appLog.log(
+              'Health',
+              'Chat health probe returned no data ($trigger); destructive recovery suppressed for $_lastKnownUrl',
+              level: 'WARN',
+            ),
+          );
+          return;
+        }
+
         _blankHealthFailures++;
         unawaited(
           _appLog.log(
@@ -4134,7 +4165,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         );
       } else {
         final href = (probe['href'] ?? '').toString();
-        if (href.isNotEmpty) _lastKnownUrl = href;
+        if (href.isNotEmpty) {
+          _lastKnownUrl = href;
+          chatRoute = _isChatUrl(href);
+        }
 
         final meaningful = probe['meaningful'] == true;
         final hidden = probe['display'] == 'none' ||
@@ -4147,6 +4181,18 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         final blank = !meaningful || hidden || tinyDocument;
 
         if (blank) {
+          if (chatRoute) {
+            _blankHealthFailures = 0;
+            unawaited(
+              _appLog.log(
+                'Health',
+                'Possible blank active chat ($trigger); automatic WebView recreation suppressed, probe=${jsonEncode(probe)}',
+                level: 'WARN',
+              ),
+            );
+            return;
+          }
+
           _blankHealthFailures++;
           unawaited(
             _appLog.log(
@@ -4168,6 +4214,20 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         }
       }
     } catch (e, stackTrace) {
+      if (chatRoute) {
+        _blankHealthFailures = 0;
+        unawaited(
+          _appLog.log(
+            'Health',
+            'Chat health probe threw ($trigger); destructive recovery suppressed',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+        return;
+      }
+
       _blankHealthFailures++;
       unawaited(
         _appLog.log(
@@ -4180,7 +4240,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       );
     }
 
-    if (_blankHealthFailures >= 2) {
+    // Non-chat pages still retain automatic blank-screen recovery, but require
+    // three consecutive failures instead of two.
+    if (_blankHealthFailures >= 3) {
       await _recoverWebView(reason: 'automatic blank-screen watchdog ($trigger)');
     }
   }
