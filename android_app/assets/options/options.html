@@ -7,6 +7,7 @@
 <title>SpicyChat QoL</title>
 <link href="options.css" rel="stylesheet"/>
 <link href="options-overhaul.css" rel="stylesheet"/>
+<link href="platform-capabilities.css" rel="stylesheet"/>
 </head>
 <body>
 <main>
@@ -25,6 +26,10 @@
 <button id="startFirstRunSetup" type="button">Start configuring</button>
 <button id="dismissFirstRunNotice" type="button">Dismiss</button>
 </div>
+</section>
+<section class="platform-compatibility-notice" hidden id="platformCompatibilityNotice">
+<strong>Device compatibility</strong>
+<span id="platformCompatibilityNoticeText">Desktop-only controls stay saved but inactive on Android.</span>
 </section>
 <section aria-label="Search settings" class="settings-search-card is-collapsed" id="settingsSearchCard">
 <button class="settings-search-toggle" id="settingsSearchToggle" type="button" aria-expanded="false" aria-controls="settingsSearchBody">
@@ -67,6 +72,7 @@
 </div></div>
 <div class="tab-group" data-tab-group="data"><span class="tab-group-label">Data &amp; advanced</span><div class="tab-group-buttons">
 <button class="tab-button" data-tab="data" type="button">Data &amp; Backup</button>
+<button class="tab-button" data-tab="account" type="button">Account &amp; Sync</button>
 <button class="tab-button" data-tab="advanced" type="button">Advanced / Compatibility</button>
 </div></div>
 <div class="tab-group" data-tab-group="about"><span class="tab-group-label">Project</span><div class="tab-group-buttons">
@@ -329,6 +335,7 @@
 </select>
 </label>
 <label>Status<select id="featureIndexStatus"><option value="all">All statuses</option><option value="on">On</option><option value="off">Off</option><option value="built-in">Built in</option><option value="planned">Planned</option></select></label>
+<label>Device<select id="featureIndexPlatform"><option value="all">All devices</option><option value="here">Works on this device</option><option value="desktop-only">Desktop only</option><option value="android">Android supported</option><option value="unavailable">Unavailable here</option></select></label>
 <label>Order<select id="featureIndexSort"><option value="oldest">Oldest features first</option><option value="newest">Newest features first</option><option value="name">Name A-Z</option></select></label></div>
 <div class="hint" id="featureIndexSummary"></div>
 <div class="feature-index-list" id="featureIndexList"></div>
@@ -537,8 +544,8 @@ Testing"></textarea></label>
 <p class="hint">Live availability results for all tracked bots. Available bots belong here; only confirmed deleted/unavailable recovery copies appear in the separate section below.</p>
 <div class="bot-manager-list" id="botAvailabilityManager"></div>
 <div class="bot-manager-pager">
-<button id="botAvailabilityShowMore" type="button">Show 20 more</button>
-<button id="botAvailabilityShowLess" type="button">Show first 20</button>
+<button id="botAvailabilityShowMore" type="button">Show 10 more</button>
+<button id="botAvailabilityShowLess" type="button">Show first 10</button>
 <button id="botAvailabilityCollapse" type="button">Show 100</button>
 </div>
 </fieldset>
@@ -575,15 +582,15 @@ Testing"></textarea></label>
 </fieldset>
 <fieldset id="deletedSavedBotsCard">
 <legend>Deleted / Unavailable Saved Bots</legend>
-<p class="hint">Confirmed deleted/unavailable bots that still have a local recovery copy. Currently blocked bots stay hidden here. Active-list cleanup never removes recovery copies. Open an old chat when one is still available, or use the saved fields to rebuild the bot later.</p>
+<p class="hint">Confirmed deleted/unavailable bots that still have a local recovery copy. Recovery copies stay visible even if the bot is still present in Blocked or another local list. Active-list cleanup never removes recovery copies. Open an old chat when one is still available, or use the saved fields to rebuild the bot later.</p>
 <div class="bot-manager-toolbar">
 <input id="deletedSavedBotSearch" placeholder="Search deleted saved bots, creators or IDs" type="search"/>
 <span class="manager-count" id="deletedSavedBotSummary">0 recoverable deleted bots</span>
 </div>
 <div class="bot-manager-list" id="deletedSavedBotManager"></div>
 <div class="bot-manager-pager">
-<button id="deletedSavedBotShowMore" type="button">Show 20 more</button>
-<button id="deletedSavedBotShowLess" type="button">Show first 20</button>
+<button id="deletedSavedBotShowMore" type="button">Show 10 more</button>
+<button id="deletedSavedBotShowLess" type="button">Show first 10</button>
 <button id="deletedSavedBotCollapse" type="button">Show 100</button>
 </div>
 </fieldset>
@@ -2390,7 +2397,8 @@ NTR"></textarea></label>
 <p class="hint">Can load extra listing pages in a temporary inactive SpicyChat helper tab (or use Load More on older layouts) after QoL hides cards so the page has enough visible results. Disabled on phone/mobile for now.</p>
 <label class="row"><input id="autoFillListings" type="checkbox"/><span>Enable Listing Refill</span></label>
 <label class="row"><input id="paginationTopJumpBox" type="checkbox"/><span>Show a page-number box above chatbot listings</span></label>
-<p class="hint">The page box accepts pages 1–20,000 and uses the same navigation as the bottom pagination jump control.</p>
+<label class="row"><input id="paginationQuickJumpMenu" type="checkbox"/><span>Show a quick page-jump dropdown beside bottom pagination</span></label>
+<p class="hint">The three-dots controls in bottom pagination are editable page-number boxes (1–20,000). QoL also expands the native page window and adds an estimated last-page shortcut when the listing exposes a result count. The optional dropdown adds Random page plus useful page landmarks.</p>
 <label>Target visible cards<input id="autoFillTargetCards" max="200" min="1" step="1" type="number"/></label>
 <label>Max extra pages / Load More attempts per listing<input id="autoFillMaxClicks" max="30" min="1" step="1" type="number"/></label>
 <p class="hint">Default target is 50 visible cards; you can raise it up to 200. On current paginated listings QoL briefly opens later pages in an inactive helper tab, copies only candidates that pass the current filters back into your listing, skips duplicate bots, and closes/reuses the helper automatically. Listing filter statistics are configured separately under Bot Blocking &amp; Dislikes.</p>
@@ -2478,6 +2486,54 @@ myth => Fantasy | ✨"></textarea></label>
 <label class="row"><input id="neverHideFavorites" type="checkbox"/><span>Never hide anything on the Favorites page</span></label>
 <label class="row"><input id="protectFavoritesFromBlocking" type="checkbox"/><span>Do not block favorites from card buttons</span></label>
 </section></div>
+
+
+<div class="tab-page" data-page="account"><p class="page-intro">Link this browser to a simple QoL account and keep compatible settings in sync across devices. Sync starts automatically after linking.</p>
+<section class="card" id="accountSyncCard">
+<h2>QoL Account &amp; Sync</h2>
+<p class="hint">0.2.25 uses the QoL Cloudflare sync service at <strong id="accountSyncApiBase">https://syncqol.drache.uk</strong>. Device credentials stay local and are not included in normal QoL backups.</p>
+<div class="account-sync-grid" id="accountSyncSummary">
+<div class="account-sync-stat"><strong id="accountSyncLinkState">Not linked</strong><span>Account</span></div>
+<div class="account-sync-stat"><strong id="accountSyncAutoState">Starts after linking</strong><span>Settings sync</span></div>
+<div class="account-sync-stat"><strong id="accountSyncSettingCount">0 settings</strong><span>Sync-ready preferences</span></div>
+<div class="account-sync-stat"><strong id="accountSyncDormantCount">0 inactive here</strong><span>Preserved device-incompatible preferences</span></div>
+</div>
+<div class="sub-card">
+<h3>This device</h3>
+<p class="account-sync-status-line"><strong id="accountSyncDeviceLabel">Detecting…</strong><span class="hint" id="accountSyncCapabilitySummary"></span></p>
+<p class="hint">Device ID: <span class="account-sync-device-id" id="accountSyncDeviceId">Preparing…</span></p>
+<div class="button-row"><button id="copyAccountSyncDeviceId" type="button">Copy device ID</button><button id="resetAccountSyncDeviceId" type="button">Reset local device identity</button></div>
+</div>
+<div class="sub-card" id="accountSyncSetup">
+<h3>Set up sync</h3>
+<p class="hint">Create a new QoL account on this device, or enter a one-use code generated by a device that is already linked. No password is required.</p>
+<div class="button-row"><button id="accountSyncCreate" type="button">Create QoL account</button></div>
+<div class="account-sync-link-row"><input id="accountSyncLinkCode" type="text" autocomplete="off" spellcheck="false" maxlength="16" placeholder="ABCD-1234"/><button id="accountSyncLink" type="button">Link existing account</button></div>
+</div>
+<div class="sub-card" id="accountSyncLinked" hidden>
+<h3>Automatic sync</h3>
+<div class="account-sync-grid account-sync-grid-small">
+<div class="account-sync-stat"><strong id="accountSyncRevision">0</strong><span>Cloud revision</span></div>
+<div class="account-sync-stat"><strong id="accountSyncLastSync">Never</strong><span>Last successful sync</span></div>
+</div>
+<div class="button-row"><button id="accountSyncNow" type="button">Sync now</button><button id="accountSyncPause" type="button">Pause sync</button><button id="accountSyncCreateLinkCode" type="button">Link another device</button></div>
+<div class="account-sync-code-box" id="accountSyncGeneratedCodeBox" hidden><div><strong id="accountSyncGeneratedCode" class="account-sync-link-code"></strong><span class="hint" id="accountSyncGeneratedCodeExpiry"></span></div><button id="accountSyncCopyLinkCode" type="button">Copy code</button></div>
+</div>
+<div class="sub-card" id="accountSyncDevicesCard">
+<div class="account-sync-section-head"><div><h3>Linked devices</h3><p class="hint">Other linked devices can be revoked here. The current browser can be disconnected locally without deleting its settings.</p></div><button id="accountSyncRefreshDevices" type="button">Refresh</button></div>
+<div id="accountSyncDevices"><p class="hint">Link an account to see devices.</p></div>
+<div class="button-row"><button id="accountSyncDisconnectLocal" type="button">Disconnect this browser</button></div>
+</div>
+<div class="sub-card">
+<h3>How compatibility-aware sync works</h3>
+<p class="hint">QoL sync stores the setting you actually chose. Each device separately decides whether it can run that setting. A desktop-only bulk/helper-tab option can stay ON in your account while Android keeps it inactive, so Android never syncs a fake OFF value back to desktop.</p>
+<p class="hint">Styles, visual changes, editing/creator tools, chat appearance, presets and normal current-page controls remain Android-capable unless a feature has a real technical blocker.</p>
+</div>
+<p class="hint" id="accountSyncBackendStatus">Checking sync service…</p>
+<p class="hint account-sync-error" id="accountSyncError" hidden></p>
+<p class="hint" id="accountSyncActionStatus"></p>
+</section>
+</div>
 
 <div class="tab-page" data-page="data"><p class="page-intro">Back up, restore, inspect, and clean data stored by QoL in this browser.</p>
 <section class="card" id="backupRestoreCard">
@@ -2777,7 +2833,7 @@ myth => Fantasy | ✨"></textarea></label>
 </section>
 </div>
 <footer id="settingsFooter">
-<button id="save" type="button">Save settings</button>
+<button id="save" type="button">Save now</button>
 <span id="status"></span>
 </footer>
 </main>
@@ -2785,7 +2841,7 @@ myth => Fantasy | ✨"></textarea></label>
 <span id="settingsToastText"></span>
 <button id="settingsToastUndo" type="button">Undo</button>
 </div>
-<script src="feature-registry.js"></script><script src="options-bridge.js"></script>
+<script src="platform-capabilities.js"></script><script src="feature-registry.js"></script><script src="options-bridge.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

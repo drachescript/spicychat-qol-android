@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 import 'qol_update_service.dart';
 
 class JsBundleService extends ChangeNotifier {
-  static const bundledExtensionVersion = '0.2.24';
+  static const bundledExtensionVersion = '0.2.27';
 
   final QolUpdateService qolUpdates;
 
@@ -29,6 +29,7 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/card-token-auth-loader.js',
     'assets/js/exact-message-counts-loader.js',
     'assets/js/build-profile.js',
+    'assets/js/platform-capabilities.js',
     'assets/js/core.js',
     'assets/js/compatibility.js',
     'assets/js/auto-afk.js',
@@ -38,16 +39,16 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/diagnostic-protocol.js',
     'assets/js/tab-diagnostics.js',
     'assets/js/quick-panel.js',
-    'assets/js/qol23-ui-fixes.js',
+    'assets/js/ui-layout-fixes.js',
     'assets/js/accessibility.js',
     'assets/js/command-palette.js',
     'assets/js/tag-aliases.js',
-    'assets/js/rc87-panel-position.js',
+    'assets/js/listing-panel-position.js',
     'assets/js/soundscapes.js',
     'assets/js/opened-chats.js',
     'assets/js/tags-nsfw.js',
     'assets/js/premium-notifications.js',
-    'assets/js/rc83-ui.js',
+    'assets/js/interface-runtime-tools.js',
     'assets/js/top-bar.js',
     'assets/js/chat-topbar.js',
     'assets/js/model-selector.js',
@@ -80,8 +81,9 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/creation-audit.js',
     'assets/js/creator-writing-assistant.js',
     'assets/js/animation-control.js',
-    'assets/js/rc86-bulk-block.js',
+    'assets/js/bulk-blocking.js',
     'assets/js/bot-blocking.js',
+    'assets/js/runtime-improvements.js',
     'assets/js/bot-organizer.js',
     'assets/js/card-workflow.js',
     'assets/js/chat-tags.js',
@@ -115,7 +117,7 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/text-replacements.js',
     'assets/js/translation.js',
     'assets/js/composer-control.js',
-    'assets/js/rc88-chat-stability.js',
+    'assets/js/chat-stability.js',
     'assets/js/delete-guard.js',
     'assets/js/failed-message-helper.js',
     'assets/js/performance-mode.js',
@@ -125,8 +127,9 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/chat-list.js',
     'assets/js/chat-organizer.js',
     'assets/js/saved-chat-actions.js',
+    'assets/js/pagination-tools.js',
     'assets/js/list-fill.js',
-    'assets/js/rc87-fixes.js',
+    'assets/js/my-creations-auto-load.js',
     'assets/js/personas.js',
     'assets/js/persona-organizer.js',
     'assets/js/lorebook-entries.js',

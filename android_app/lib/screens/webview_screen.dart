@@ -4243,7 +4243,14 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     // Non-chat pages still retain automatic blank-screen recovery, but require
     // three consecutive failures instead of two.
     if (_blankHealthFailures >= 3) {
-      await _recoverWebView(reason: 'automatic blank-screen watchdog ($trigger)');
+      _blankHealthFailures = 0;
+      unawaited(
+        _appLog.log(
+          'Health',
+          'Automatic blank-screen recovery suppressed; trigger=$trigger; url=$_lastKnownUrl',
+          level: 'WARN',
+        ),
+      );
     }
   }
 

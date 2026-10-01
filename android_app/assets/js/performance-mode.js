@@ -536,7 +536,11 @@
     const s = settings();
     applyListingPaintGuard();
     const active = isActiveChatPerformance();
-    const hiddenPaused = !!(s.enabled && s.pauseQolInHiddenTabs && document.hidden);
+    const dedicatedWorker = !!(
+      DS.state?.qolBackgroundWorker ||
+      document.documentElement?.getAttribute?.("data-ds-qol-background-worker")
+    );
+    const hiddenPaused = !!(s.enabled && s.pauseQolInHiddenTabs && document.hidden && !dedicatedWorker);
 
     DS.setClassState?.(document.documentElement, "ds-qol-hidden-tab-paused", hiddenPaused);
 

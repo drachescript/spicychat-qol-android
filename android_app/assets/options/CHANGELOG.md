@@ -1,5 +1,43 @@
+## 0.2.27
+- Removed automatic performance-emergency page reloads. Severe lag can escalate QoL to Maximum rendering, but reload/navigation remains user initiated.
+- Added a short chat-startup quiet window so initial history rendering can settle before nonessential QoL message decoration and reconciliation resumes.
+- Reset recent Long Task pressure when changing chats so startup lag from one route cannot immediately trigger performance escalation on the next.
+- Dedicated QoL background workers are no longer paused by the normal hidden-tab pause preference.
+- Bot Status pacing now waits through the extension background process instead of relying on a hidden Options-page timer, reducing Chromium background timer throttling during long scans.
+- Bot Status worker liveness now uses request/result activity as well as heartbeat state, with a longer hidden/throttled grace period before a helper is considered dead.
+
+## 0.2.26
+- Improved bot-name cleanup so generic labels and decorative wrapper text are less likely to replace a real character name in saved/discovered metadata.
+- Added a bounded browsed/discovered-bot index that can feed Bot Status Center from normal browsing without storing chat history.
+- Added an opt-in desktop-only **Less Like This after block** action, kept separate from the existing Dislike-on-block option.
+- Added adaptive large-chat performance escalation using mounted-message count, DOM size, heap usage when available, and recent Long Tasks so very heavy chats can move into the strongest performance tier sooner.
+- Changed large Settings/backup manager paging to start at 10 items at a time, with clearer Show more / first / all controls where applicable.
+- Added per-device Account Sync rules: two-way, upload/source-only, download/cloud-only, or manual, plus category/key selection and explicit Upload Settings / Download Settings actions.
+- New QoL accounts default to source/upload-only while newly linked devices default to cloud/download-only, reducing the chance that a fresh device overwrites existing cloud settings before its sync rules are chosen.
+- Strengthened Account Sync conflict handling, including revision observation before retrying and merge-aware handling for set-like block/filter lists.
+
+## 0.2.25
+- Added a shared device-capability registry for desktop browsers and the Android/WebView app so QoL can distinguish normal current-page tools from features that require real browser tabs, helper tabs, bulk operations or desktop background automation.
+- Android now treats second/helper-tab workflows and bulk tools as unavailable at runtime while preserving the user's actual saved preference. A desktop-only option can remain ON for desktop without Android syncing or saving a fake OFF value over it.
+- Kept styles, chat appearance, editing/creator tools, presets and normal current-page controls Android-capable by default; only features with a real platform requirement are made dormant.
+- Added Android Settings compatibility hints: unsupported controls stay visible but are dimmed/disabled with a Desktop only explanation, making it clear that the saved value is being preserved rather than deleted.
+- Added device filters and compatibility badges to the Features catalogue, including Works on this device, Desktop only, Android supported and Unavailable here views plus Partial on Android states for mixed features.
+- Connected the Account & Sync page to the live Cloudflare/D1 service at `syncqol.drache.uk`: create a QoL account, link another device with a one-use 10-minute code, sync automatically after linking, sync on demand, pause/resume, list devices and revoke other linked devices.
+- Device credentials stay local in a separate non-backup storage record; Cloudflare stores only the server-side token hash. Normal QoL backups continue to exclude account/device credentials.
+- Automatic sync sends only logical setting keys that changed instead of rebuilding/uploading the full settings document after every edit. Periodic/startup pulls use revisions so other devices' changes arrive without Android switching unsupported desktop preferences off.
+- Backup metadata now records the compatibility schema and source platform without including the local device/account identity, and diagnostics report the current platform plus how many saved preferences are dormant on this device.
+- Registered the new shared platform capability runtime in both the manifest and full-build module metadata so release verification includes it.
+- Made **Automatically use stronger performance mode on very large chats** default ON for new/unsaved settings.
+- Shrunk the floating large-chat folded-message control into a much lighter utility strip with smaller text, buttons, padding and shadow.
+
 ## 0.2.24
-- Feature catalogue categories now remember whether you left each group expanded or collapsed when reopening Settings. The state is mirrored synchronously and stored in extension storage, survives immediate Settings closes, and is preserved across search/filter/sort rerenders; new categories still default to expanded.
+- Renamed the old version-scoped `content/qol23-ui-fixes.js` runtime file to the permanent `content/ui-layout-fixes.js` name and updated build metadata so future releases do not carry a stale 0.2.23 filename.
+- Fixed stacked chat centering so the native composer bubble measures the current message lane and follows the same horizontal center/width instead of being pushed right by left-side composer controls; mobile keeps the native compact layout.
+- Settings now autosave by default: toggles/selects save almost immediately, text and number fields debounce briefly, pending edits flush on blur/page close, and **Save now** remains as an explicit force-and-verify safety action.
+- Live settings storage is now granular (`dsSettingV1:*`) instead of rewriting one large `settings` object for every option change. Normal autosave only serializes the setting(s) that changed; the full logical settings object is assembled only when existing backup/export/import/runtime code actually asks for it.
+- Added a tiny last-batch safety record for autosave and kept the old monolithic settings object as a migration fallback rather than destructively deleting it during the v0.2.24 transition.
+- Feature-catalogue collapsed categories are now a normal backed-up QoL preference using stable category IDs, so backup/export/import restores the layout and category label wording can change without losing the remembered state.
+- Feature catalogue categories remember whether you left each group expanded or collapsed, save through the same granular autosave path, survive immediate Settings closes, and are preserved across search/filter/sort rerenders; new categories still default to expanded.
 - Strengthened long-chat Performance Mode with safe DOM windowing: older message cards stay in SpicyChat's DOM but are folded out of layout/paint once a chat becomes large, while the newest 40-70 messages remain active depending on performance mode.
 - Added a small large-chat performance bar with Show older / Show all / Fold old controls so hidden history can be revealed in chunks without deleting or rewriting any messages.
 - Added a manual Refresh chat performance action that snapshots the current composer text to QoL-only session storage, reloads the chat, restores the draft only when the native composer is empty, and returns to the bottom. It refuses to refresh while a generation is still running.

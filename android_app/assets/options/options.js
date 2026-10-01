@@ -50,6 +50,14 @@ const QUICK_DISLIKE_HISTORY_KEY = "quickDislikeHistoryV1";
 const QUICK_DISLIKE_BULK_STATE_KEY = "quickDislikeBulkStateV1";
 const QUICK_LESS_LIKE_HISTORY_KEY = "quickLessLikeHistoryV1";
 const QUICK_LESS_LIKE_BULK_STATE_KEY = "quickLessLikeBulkStateV1";
+const GRANULAR_SETTING_PREFIX = "dsSettingV1:";
+const GRANULAR_SETTINGS_INDEX_KEY = "dsSettingsIndexV1";
+const GRANULAR_SETTINGS_MIGRATION_KEY = "dsGranularSettingsV1";
+const GRANULAR_SETTINGS_REVISION_KEY = "dsSettingsRevisionV1";
+const GRANULAR_SETTINGS_LAST_BATCH_KEY = "dsSettingsLastBatchV1";
+const QOL_SYNC_STATE_KEY = "qolSyncStateV1";
+const QOL_SYNC_DEVICE_SCHEMA_VERSION = 1;
+const PLATFORM_API = window.SpicyChatQoLPlatform || null;
 const BULK_DISLIKE_FAILURE_PAUSE_THRESHOLD = 3;
 const BULK_DISLIKE_RETRY_LIMIT = 2;
 const BULK_DISLIKE_RETRY_BASE_MS = 1200;
@@ -453,6 +461,7 @@ const DEFAULT_SETTINGS = {
   showBotCreationDates: false,
   expandBotNamesOnHover: false,
   paginationTopJumpBox: false,
+  paginationQuickJumpMenu: false,
   cardTokenShowGreeting: true,
   cardTokenShowDescription: false,
   cardTokenShowPersonality: false,
@@ -773,7 +782,7 @@ const DEFAULT_SETTINGS = {
   runtimePerformanceMode: "adaptive",
   desktopAppPerformanceGuard: true,
   pauseQolInHiddenTabs: false,
-  autoPerformanceLargeChats: false,
+  autoPerformanceLargeChats: true,
   largeChatPerformanceThreshold: 500,
   deferQolWhileTyping: false,
   pauseQolWhileMessageEditing: true,
@@ -783,6 +792,7 @@ const DEFAULT_SETTINGS = {
   settingsContentLayout: "single",
   settingsPageWidth: "comfortable",
   collapseSettingsSectionsByDefault: false,
+  featureIndexCollapsedCategories: [],
   enableCommandPalette: false,
   commandPaletteShortcut: "ctrl-k",
   commandPaletteShowSavedItems: true,
@@ -911,6 +921,15 @@ let savedListsDataLoaded = false;
 let blockingDataLoadPromise = null;
 let savedListsDataLoadPromise = null;
 let loadedSettingsSnapshot = { ...DEFAULT_SETTINGS };
+let granularSettingsIndexCache = new Set();
+let granularSettingsMigrationSeen = false;
+let settingsAutosaveReady = false;
+let settingsAutosaveTimer = 0;
+let settingsAutosaveFlushPromise = null;
+const settingsAutosavePending = new Map();
+const settingsAutosavePrevious = new Map();
+let auxiliaryOptionsSaveTimer = 0;
+let auxiliaryOptionsSavePending = new Set();
 
 const BLOCKING_DATA_KEYS = [BLOCKED_BOTS_KEY, NOT_INTERESTED_KEY, QUICK_DISLIKE_HISTORY_KEY, QUICK_DISLIKE_BULK_STATE_KEY, QUICK_LESS_LIKE_HISTORY_KEY, QUICK_LESS_LIKE_BULK_STATE_KEY];
 const SAVED_LIST_DATA_KEYS = [
@@ -956,6 +975,7 @@ const SETTINGS_SECTION_COLLAPSE_EXCLUDED_TABS = new Set(["features", "changelog"
 const SETTINGS_PINNED_SECTIONS_KEY = "dsSettingsPinnedSectionsV1";
 const SETTINGS_RECENT_SECTIONS_KEY = "dsSettingsRecentSectionsV1";
 const SETTINGS_ENABLED_ONLY_KEY = "dsSettingsEnabledOnlyV1";
+const SETTINGS_SECTION_STATE_KEY = "dsSettingsSectionStateV1";
 let settingsSectionDefaultsApplied = false;
 let settingsShowEnabledOnly = false;
 
@@ -1162,7 +1182,7 @@ function applySettingsEnabledOnlyFilter() {
 function resetSettingsSection(card) {
   const info = settingsCardInfo(card);
   if (!card || !info) return;
-  if (!confirm(`Reset “${info.heading}” to its default settings? Nothing is saved until you press Save settings.`)) return;
+  if (!confirm(`Reset “${info.heading}” to its default settings? Changes save automatically; Save now is only a force-and-verify fallback.`)) return;
 
   let changed = 0;
   for (const [key, defaultValue] of Object.entries(DEFAULT_SETTINGS)) {
@@ -1190,7 +1210,7 @@ function resetSettingsSection(card) {
   updateSettingDependencies?.();
   applySettingsEnabledOnlyFilter();
   showSettingsToast(changed
-    ? `Reset ${info.heading}. Press Save settings to apply it.`
+    ? `Reset ${info.heading}. Changes save automatically.`
     : `There are no normal Settings values to reset in ${info.heading}.`);
 }
 
@@ -1225,7 +1245,52 @@ function setupSettingsSectionNavigation() {
   applySettingsEnabledOnlyFilter();
 }
 
-function setSettingsCardCollapsed(card, collapsed) {
+function readSettingsSectionState() {
+  const raw = readLocalJson(SETTINGS_SECTION_STATE_KEY, {});
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const state = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!key || typeof value !== "boolean") continue;
+    state[key] = value;
+  }
+  return state;
+}
+
+function writeSettingsSectionState(state) {
+  const next = {};
+  for (const [key, value] of Object.entries(state || {})) {
+    if (!key || typeof value !== "boolean") continue;
+    next[key] = value;
+  }
+  writeLocalJson(SETTINGS_SECTION_STATE_KEY, next);
+}
+
+function persistSettingsCardCollapsed(card, collapsed) {
+  const info = settingsCardInfo(card);
+  if (!info?.key || SETTINGS_SECTION_COLLAPSE_EXCLUDED_TABS.has(info.tabName)) return;
+  const state = readSettingsSectionState();
+  state[info.key] = !!collapsed;
+  writeSettingsSectionState(state);
+}
+
+function persistAllSettingsSectionStates() {
+  const state = readSettingsSectionState();
+  const liveKeys = new Set();
+  document.querySelectorAll(".tab-page > section.card.ds-settings-card-collapsible").forEach(card => {
+    const info = settingsCardInfo(card);
+    if (!info?.key || SETTINGS_SECTION_COLLAPSE_EXCLUDED_TABS.has(info.tabName)) return;
+    liveKeys.add(info.key);
+    state[info.key] = card.classList.contains("ds-settings-card-collapsed");
+  });
+  // Drop entries for Settings sections that no longer exist, while keeping the
+  // state object small and resilient across renamed/removed cards.
+  for (const key of Object.keys(state)) {
+    if (!liveKeys.has(key)) delete state[key];
+  }
+  writeSettingsSectionState(state);
+}
+
+function setSettingsCardCollapsed(card, collapsed, { persist = false } = {}) {
   if (!card?.classList?.contains("ds-settings-card-collapsible")) return;
   const body = card.querySelector(":scope > .settings-card-body");
   const toggle = card.querySelector(":scope > h2 .settings-card-toggle");
@@ -1234,6 +1299,7 @@ function setSettingsCardCollapsed(card, collapsed) {
   card.classList.toggle("ds-settings-card-collapsed", next);
   body.hidden = next;
   toggle.setAttribute("aria-expanded", next ? "false" : "true");
+  if (persist) persistSettingsCardCollapsed(card, next);
 }
 
 function setSettingsTabCollapsed(tabName, collapsed) {
@@ -1281,7 +1347,7 @@ function setupCollapsibleSettingsCards() {
       toggle.setAttribute("aria-expanded", "true");
       toggle.title = "Open or close this Settings section";
       toggle.addEventListener("click", () => {
-        setSettingsCardCollapsed(card, !card.classList.contains("ds-settings-card-collapsed"));
+        setSettingsCardCollapsed(card, !card.classList.contains("ds-settings-card-collapsed"), { persist: true });
         recordRecentSettingsCard(card);
       });
 
@@ -1332,8 +1398,24 @@ function setupCollapsibleSettingsCards() {
 function applySettingsSectionDefault(settings = {}) {
   if (settingsSectionDefaultsApplied) return;
   settingsSectionDefaultsApplied = true;
-  if (!settings.collapseSettingsSectionsByDefault) return;
-  setAllSettingsSectionsCollapsed(true);
+
+  const savedState = readSettingsSectionState();
+  const defaultCollapsed = !!settings.collapseSettingsSectionsByDefault;
+  const normalizedState = {};
+
+  document.querySelectorAll(".tab-page > section.card.ds-settings-card-collapsible").forEach(card => {
+    const info = settingsCardInfo(card);
+    if (!info?.key || SETTINGS_SECTION_COLLAPSE_EXCLUDED_TABS.has(info.tabName)) return;
+    const hasSavedState = Object.prototype.hasOwnProperty.call(savedState, info.key);
+    const collapsed = hasSavedState ? !!savedState[info.key] : defaultCollapsed;
+    setSettingsCardCollapsed(card, collapsed);
+    normalizedState[info.key] = collapsed;
+  });
+
+  // Seed any cards that did not have a remembered value yet. From this point
+  // on, each Settings section remembers its own open/closed state across page
+  // reloads and extension restarts instead of resetting to one global default.
+  writeSettingsSectionState(normalizedState);
 }
 
 function invalidateHeavyTab(tabName) {
@@ -1396,7 +1478,7 @@ const botManagerBulkSelection = {
 const botAvailabilityUiState = {
   query: "",
   status: "all",
-  visible: 20,
+  visible: 10,
   collapsed: true
 };
 
@@ -1412,17 +1494,97 @@ const followedCreatorUiState = {
   collapsed: true
 };
 
+function granularSettingStorageKey(name) {
+  return `${GRANULAR_SETTING_PREFIX}${String(name || "").trim()}`;
+}
+
+function granularSettingName(storageKey) {
+  const key = String(storageKey || "");
+  return key.startsWith(GRANULAR_SETTING_PREFIX) ? key.slice(GRANULAR_SETTING_PREFIX.length) : "";
+}
+
+function normalizeGranularSettingsIndex(value) {
+  return [...new Set((Array.isArray(value) ? value : []).map(name => String(name || "").trim()).filter(Boolean))].sort();
+}
+
+function storageRequestIncludes(keys, wanted) {
+  if (keys == null) return true;
+  if (typeof keys === "string") return keys === wanted;
+  if (Array.isArray(keys)) return keys.includes(wanted);
+  if (keys && typeof keys === "object") return Object.prototype.hasOwnProperty.call(keys, wanted);
+  return false;
+}
+
+function storageRequestedKeyList(keys) {
+  if (keys == null) return null;
+  if (typeof keys === "string") return [keys];
+  if (Array.isArray(keys)) return [...keys];
+  if (keys && typeof keys === "object") return Object.keys(keys);
+  return [];
+}
+
 function storageGetChecked(keys) {
   const started = typeof performance !== "undefined" ? performance.now() : 0;
   return new Promise(resolve => {
     const finish = value => { const elapsed = optionsPerfFinish("read", started); recordSlowStorageRead(keys, elapsed); resolve(value); };
     try {
-      chrome.storage.local.get(keys, result => {
+      const wantsSettings = storageRequestIncludes(keys, "settings");
+      const requested = storageRequestedKeyList(keys);
+      const firstKeys = requested === null
+        ? null
+        : [...new Set([...(requested || []), ...(wantsSettings ? [GRANULAR_SETTINGS_INDEX_KEY, GRANULAR_SETTINGS_MIGRATION_KEY] : [])])];
+      chrome.storage.local.get(firstKeys, first => {
         if (chrome.runtime.lastError) {
           finish({ ok: false, data: {}, error: chrome.runtime.lastError.message || "Browser storage read failed" });
           return;
         }
-        finish({ ok: true, data: result || {}, error: "" });
+        const data = first || {};
+        const shouldSynthesize = wantsSettings || requested === null;
+        if (!shouldSynthesize) {
+          finish({ ok: true, data, error: "" });
+          return;
+        }
+
+        const index = normalizeGranularSettingsIndex(data[GRANULAR_SETTINGS_INDEX_KEY]);
+        granularSettingsIndexCache = new Set(index);
+        granularSettingsMigrationSeen = data[GRANULAR_SETTINGS_MIGRATION_KEY] === true;
+        const granularKeys = index.map(granularSettingStorageKey);
+        const synthesize = granular => {
+          const hadLegacy = Object.prototype.hasOwnProperty.call(data, "settings") && data.settings && typeof data.settings === "object";
+          const merged = hadLegacy ? { ...(data.settings || {}) } : {};
+          let granularFound = false;
+          for (const name of index) {
+            const key = granularSettingStorageKey(name);
+            if (!Object.prototype.hasOwnProperty.call(granular || {}, key)) continue;
+            merged[name] = granular[key];
+            granularFound = true;
+          }
+          if (hadLegacy || granularFound) data.settings = merged;
+          else delete data.settings;
+
+          // Internal granular records are an implementation detail. Existing
+          // backup/data code continues to see the stable logical `settings`
+          // object rather than hundreds of storage records.
+          for (const name of index) delete data[granularSettingStorageKey(name)];
+          if (!storageRequestIncludes(keys, GRANULAR_SETTINGS_INDEX_KEY)) delete data[GRANULAR_SETTINGS_INDEX_KEY];
+          if (!storageRequestIncludes(keys, GRANULAR_SETTINGS_MIGRATION_KEY)) delete data[GRANULAR_SETTINGS_MIGRATION_KEY];
+          if (!storageRequestIncludes(keys, GRANULAR_SETTINGS_REVISION_KEY)) delete data[GRANULAR_SETTINGS_REVISION_KEY];
+          if (!storageRequestIncludes(keys, GRANULAR_SETTINGS_LAST_BATCH_KEY)) delete data[GRANULAR_SETTINGS_LAST_BATCH_KEY];
+          finish({ ok: true, data, error: "" });
+        };
+
+        if (!granularKeys.length || requested === null) {
+          // A null/all read already contains the granular keys.
+          synthesize(data);
+          return;
+        }
+        chrome.storage.local.get(granularKeys, granular => {
+          if (chrome.runtime.lastError) {
+            finish({ ok: false, data: {}, error: chrome.runtime.lastError.message || "Browser settings read failed" });
+            return;
+          }
+          synthesize(granular || {});
+        });
       });
     } catch (error) {
       finish({ ok: false, data: {}, error: error?.message || String(error || "Browser storage read failed") });
@@ -1435,7 +1597,7 @@ async function storageGet(keys) {
   return result.data;
 }
 
-function storageSet(obj) {
+function rawStorageSet(obj) {
   const started = typeof performance !== "undefined" ? performance.now() : 0;
   return new Promise(resolve => {
     const finish = value => { optionsPerfFinish("write", started); resolve(value); };
@@ -1445,12 +1607,81 @@ function storageSet(obj) {
   });
 }
 
-function storageRemove(keys) {
+function expandSettingsStoragePayload(obj) {
+  const payload = obj && typeof obj === "object" && !Array.isArray(obj) ? { ...obj } : {};
+  const settings = payload.settings;
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return payload;
+  delete payload.settings;
+
+  let indexChanged = false;
+  for (const [name, value] of Object.entries(settings)) {
+    if (!String(name || "").trim()) continue;
+    payload[granularSettingStorageKey(name)] = value;
+    if (!granularSettingsIndexCache.has(name)) {
+      granularSettingsIndexCache.add(name);
+      indexChanged = true;
+    }
+  }
+  if (indexChanged || !granularSettingsMigrationSeen) {
+    payload[GRANULAR_SETTINGS_INDEX_KEY] = [...granularSettingsIndexCache].sort();
+  }
+  payload[GRANULAR_SETTINGS_MIGRATION_KEY] = true;
+  payload[GRANULAR_SETTINGS_REVISION_KEY] = Date.now();
+  granularSettingsMigrationSeen = true;
+  return payload;
+}
+
+function storageSet(obj) {
+  return rawStorageSet(expandSettingsStoragePayload(obj));
+}
+
+async function storageRemove(keys) {
+  const list = storageRequestedKeyList(keys) ?? [];
+  let expanded = [...list];
+  if (list.includes("settings")) {
+    if (!granularSettingsIndexCache.size) {
+      try {
+        const current = await new Promise(resolve => chrome.storage.local.get([GRANULAR_SETTINGS_INDEX_KEY], resolve));
+        granularSettingsIndexCache = new Set(normalizeGranularSettingsIndex(current?.[GRANULAR_SETTINGS_INDEX_KEY]));
+      } catch {}
+    }
+    expanded = [...new Set([
+      ...expanded,
+      ...[...granularSettingsIndexCache].map(granularSettingStorageKey),
+      GRANULAR_SETTINGS_INDEX_KEY,
+      GRANULAR_SETTINGS_MIGRATION_KEY,
+      GRANULAR_SETTINGS_REVISION_KEY,
+      GRANULAR_SETTINGS_LAST_BATCH_KEY
+    ])];
+  }
   return new Promise(resolve => {
     try {
-      chrome.storage.local.remove(keys, () => resolve(!chrome.runtime.lastError));
+      chrome.storage.local.remove(expanded, () => {
+        const ok = !chrome.runtime.lastError;
+        if (ok && list.includes("settings")) {
+          granularSettingsIndexCache.clear();
+          granularSettingsMigrationSeen = false;
+        }
+        resolve(ok);
+      });
     } catch { resolve(false); }
   });
+}
+
+async function ensureGranularSettingsMigration(rawSettings) {
+  if (granularSettingsMigrationSeen) return true;
+  const source = rawSettings && typeof rawSettings === "object" && !Array.isArray(rawSettings) ? rawSettings : {};
+  const payload = {};
+  for (const [name, value] of Object.entries(source)) {
+    payload[granularSettingStorageKey(name)] = value;
+    granularSettingsIndexCache.add(name);
+  }
+  payload[GRANULAR_SETTINGS_INDEX_KEY] = [...granularSettingsIndexCache].sort();
+  payload[GRANULAR_SETTINGS_MIGRATION_KEY] = true;
+  payload[GRANULAR_SETTINGS_REVISION_KEY] = Date.now();
+  const ok = await rawStorageSet(payload);
+  if (ok) granularSettingsMigrationSeen = true;
+  return ok;
 }
 
 function storageValueMatches(actual, expected) {
@@ -2291,7 +2522,7 @@ async function runAutoAfkCheckNow() {
 
   try {
     // Save the controls first so the check uses exactly what is visible here.
-    await storageSet({ settings: readSettingsFromPage() });
+    await flushSettingsAutosave({ force: true });
     const response = await runtimeMessage({ type: "DS_AUTO_AFK_RUN_NOW" });
 
     if (response?.ok) {
@@ -2350,7 +2581,7 @@ async function runDuplicateTabCheckNow() {
   if (button) button.disabled = true;
 
   try {
-    await storageSet({ settings: readSettingsFromPage() });
+    await flushSettingsAutosave({ force: true });
     const response = await runtimeMessage({ type: "DS_DUPLICATE_TABS_RUN_NOW" });
     if (response?.ok) {
       renderDuplicateTabStatus(response.summary);
@@ -2596,7 +2827,7 @@ function renderTabCleanupDiagnostic(report, message = "") {
 }
 
 async function requestTabCleanupDiagnostic() {
-  await storageSet({ settings: readSettingsFromPage() });
+  await flushSettingsAutosave({ force: true });
   const response = await runtimeMessage({ type: "DS_TAB_DIAGNOSTIC_COLLECT" });
   if (!response?.ok || !response.report) throw new Error(response?.error || "Could not collect tab diagnostic");
   response.report.analysis = buildTabCleanupAnalysis(response.report);
@@ -3615,7 +3846,7 @@ async function persistSoundscapeScenes({ rerender = false } = {}) {
   if (soundscapeScenePersistTimer) { clearTimeout(soundscapeScenePersistTimer); soundscapeScenePersistTimer = 0; }
   soundscapeSceneState = normalizeSoundscapeScenes(soundscapeSceneState);
   const ok = await storageSetVerified({ [SOUNDSCAPES_KEY]: soundscapeSceneState });
-  if (!ok) showSettingsToast("Soundscape scene changes could not be verified in browser storage. Please try Save settings again.");
+  if (!ok) showSettingsToast("Soundscape scene changes could not be verified in browser storage. Please press Save now to retry.");
   if (rerender) renderSoundscapeScenes();
   return ok;
 }
@@ -4002,12 +4233,18 @@ function uniqueClean(values) {
 
 function setChecked(id, enabled) {
   const el = $(id);
-  if (el) el.checked = !!enabled;
+  if (el) {
+    el.checked = !!enabled;
+    if (settingsAutosaveReady) queueSettingsAutosaveForControl(el, "change");
+  }
 }
 
 function setValue(id, next) {
   const el = $(id);
-  if (el) el.value = next;
+  if (el) {
+    el.value = next;
+    if (settingsAutosaveReady) queueSettingsAutosaveForControl(el, "change");
+  }
 }
 
 function setAllowedLanguages(values) {
@@ -4499,6 +4736,7 @@ function setActiveTab(tabName) {
   if (tabName === "features") DS_FEATURE_INDEX_REFRESH?.();
   if (tabName === "bot-tools") loadCreatorBackupManager().catch(() => {});
   if (tabName === "control" && optionsDataLoaded) setupControlCenterView().catch(() => {});
+  if (tabName === "account" && optionsDataLoaded) refreshAccountSyncUi().catch(() => {});
   if (tabName === "data" && optionsDataLoaded) { refreshStorageUsage().catch(() => {}); renderLocalChangeHistory().catch(() => {}); }
   renderHeavyManagersForTab(tabName);
 }
@@ -4552,6 +4790,7 @@ function setupSettingsSearch() {
   const SEARCH_ALIASES = {
     autoFillListings: "refill fill page listing autofill hidden cards",
     paginationTopJumpBox: "page number jump go top chatbot listing pagination 20000",
+    paginationQuickJumpMenu: "pagination page jump dropdown random page quick menu ellipsis dots 20000",
     expandBotNamesOnHover: "bot name title expander full name hover tap cut off",
     showListingRefillButton: "refill fill now manual listing",
     showListingFilterStats: "bot blocking filters blocked filtered bots result count stats results found listing statistics",
@@ -4655,13 +4894,46 @@ function setupSettingsSearch() {
     return found;
   }
 
+  function labelPrimaryText(label) {
+    if (!label) return "";
+    const directSpan = label.querySelector(":scope > span");
+    if (directSpan) return cleanSearchText(directSpan.textContent);
+
+    // Do not let select options, dependency helper buttons, validation text,
+    // or dynamic counters become the visible search-result label.
+    const clone = label.cloneNode(true);
+    clone.querySelectorAll("input, select, textarea, button, small, .hint, .setting-dependency-note").forEach(node => node.remove());
+    return cleanSearchText(clone.textContent);
+  }
+
   function targetLabel(target) {
     if (!target) return "Setting";
-    if (target.matches("label")) return cleanSearchText(target.textContent);
+    if (target.matches("label")) return labelPrimaryText(target);
     if (target.matches("button")) return cleanSearchText(target.textContent || target.getAttribute("aria-label"));
     const label = target.closest("label");
-    if (label) return cleanSearchText(label.textContent);
+    if (label) return labelPrimaryText(label);
     return cleanSearchText(target.textContent || target.getAttribute?.("aria-label")) || "Setting";
+  }
+
+  function isSearchNoiseButton(button) {
+    if (!button) return true;
+    if (button.closest([
+      ".settings-search-results",
+      ".bot-manager-list",
+      ".bot-manager-pager",
+      ".bot-manager-bulkbar",
+      ".bot-availability-list",
+      ".tab-cleanup-session-list",
+      ".tab-cleanup-topic-list",
+      ".tab-cleanup-review-list",
+      ".creator-relation-list",
+      ".control-health-results",
+      ".control-storage-grid"
+    ].join(","))) return true;
+    if (button.matches(".settings-card-toggle, .settings-card-pin, .settings-card-reset")) return true;
+
+    const text = cleanSearchText(button.textContent || button.getAttribute("aria-label"));
+    return /^(?:show\s+(?:\d+\s+more|first\s+\d+|\d+)|load\s+more|open\s+profile|open\s+chat|copy\s+link|select|remove|recheck)$/i.test(text);
   }
 
   const items = [];
@@ -4734,14 +5006,18 @@ function setupSettingsSearch() {
     // only knowing which large card contains the words.
     card.querySelectorAll("label").forEach(label => addItem(label, "setting"));
     card.querySelectorAll("button").forEach(button => {
-      if (button.closest("label, .settings-search-results")) return;
+      if (button.closest("label") || isSearchNoiseButton(button)) return;
       const text = cleanSearchText(button.textContent || button.getAttribute("aria-label"));
       if (!text) return;
       addItem(button, "action");
     });
 
-    // Keep one card-level fallback so searches for explanatory hint text still
-    // work even when that wording is not part of a specific control label.
+    // Keep a card-level fallback, but index only the static card heading/hints.
+    // Indexing card.textContent also pulled thousands of rendered bot rows and
+    // pager labels ("Show 20 more", etc.) into Settings search.
+    const staticHintText = cleanSearchText(
+      [...card.querySelectorAll(":scope > p.hint, :scope > .hint")].map(node => node.textContent).join(" ")
+    );
     items.push({
       index: itemIndex++,
       target: card,
@@ -4753,7 +5029,7 @@ function setupSettingsSearch() {
       subheading: "",
       label: cardHeading,
       kind: "card",
-      searchText: cleanSearchText([cardSearchText(card), registrySearchTextFor("", card.id, card.id), GENERIC_SEARCH_TERMS].join(" ")).toLowerCase(),
+      searchText: cleanSearchText([cardHeading, staticHintText, registrySearchTextFor("", card.id, card.id), GENERIC_SEARCH_TERMS].join(" ")).toLowerCase(),
       targetText: cardHeading.toLowerCase()
     });
   });
@@ -4869,7 +5145,7 @@ function setupSettingsSearch() {
         if (genericOnly) return a.item.index - b.item.index;
         return b.score - a.score || a.item.label.length - b.item.label.length;
       })
-      .slice(0, 30);
+      .slice(0, 50);
 
     lastMatches = matches;
     host.hidden = false;
@@ -6178,7 +6454,7 @@ function collectTrackedAvailabilityBots(scope = "all") {
 
   return [...byId.values()].map(entry => ({
     ...entry,
-    name: entry.name || entry.id
+    name: cleanAuthoritativeBotName(entry.name, entry.id) || ""
   }));
 }
 
@@ -6503,6 +6779,21 @@ function compareBotSnapshots(baselineValue, currentValue) {
 function reconcileBotUpdate(previousValue, checkedValue) {
   const previous = previousValue && typeof previousValue === "object" ? previousValue : null;
   const checked = { ...checkedValue };
+  const id = String(checked.id || previous?.id || "").trim();
+  const archive = id ? (botArchiveState?.meta?.[id] || null) : null;
+  const archiveFields = archive?.fields || {};
+  const preservedName = [
+    cleanAuthoritativeBotName(checked.name, id),
+    cleanAuthoritativeBotName(previous?.name, id),
+    cleanAuthoritativeBotName(archiveFields.name, id),
+    cleanAuthoritativeBotName(archive?.name, id),
+    ...localBotNameCandidates(id)
+  ].find(Boolean) || "";
+  checked.name = preservedName;
+  checked.image = checked.image || previous?.image || archive?.image || archiveFields.image || "";
+  checked.creator = checked.creator || previous?.creator || archive?.creator || archiveFields.creator || "";
+  checked.profileUrl = checked.profileUrl || previous?.profileUrl || archive?.profileUrl || (id ? `https://spicychat.ai/chatbot/${id}` : "");
+  checked.chatUrl = checked.chatUrl || previous?.chatUrl || archive?.chatUrls?.[0] || (id ? `https://spicychat.ai/chat/${id}` : "");
   const oldBaseline = previous?.baseline ? normalizeBotSnapshot(previous.baseline) : null;
   const snapshot = checked.snapshot && snapshotHasSignal(checked.snapshot) ? normalizeBotSnapshot(checked.snapshot) : null;
 
@@ -6938,8 +7229,8 @@ function botStatusCenterBaseEntries(scope = "all") {
     byId.set(entry.id, {
       ...trackedEntry,
       ...entry,
-      name: entry.name || trackedEntry.name || entry.id,
-      image: entry.image || trackedEntry.image || "",
+      name: cleanAuthoritativeBotName(entry.name, entry.id) || cleanAuthoritativeBotName(archives[entry.id]?.fields?.name, entry.id) || cleanAuthoritativeBotName(archives[entry.id]?.name, entry.id) || cleanAuthoritativeBotName(trackedEntry.name, entry.id) || bestKnownBotName(entry.id, ""),
+      image: entry.image || trackedEntry.image || archives[entry.id]?.image || archives[entry.id]?.fields?.image || "",
       creator: entry.creator || trackedEntry.creator || "",
       sources: uniqueClean([...(trackedEntry.sources || []), ...(entry.sources || [])]),
       archive: archives[entry.id] || trackedEntry.archive || null
@@ -6952,7 +7243,7 @@ function botStatusCenterBaseEntries(scope = "all") {
     byId.set(id, {
       id,
       ...current,
-      name: current.name || archive.name || archive.fields?.name || id,
+      name: cleanAuthoritativeBotName(current.name, id) || cleanAuthoritativeBotName(archive.fields?.name, id) || cleanAuthoritativeBotName(archive.name, id) || bestKnownBotName(id, ""),
       image: current.image || archive.image || archive.fields?.image || "",
       creator: current.creator || archive.creator || archive.fields?.creator || "",
       profileUrl: current.profileUrl || archive.profileUrl || `https://spicychat.ai/chatbot/${id}`,
@@ -8646,7 +8937,7 @@ function renderBotAvailability(renderOptions = {}) {
   const staleDays = Math.max(1, Number(value("botStatusStaleDays", "7")) || 7);
   const staleCutoff = Date.now() - staleDays * 24 * 60 * 60 * 1000;
   const staleCount = base.filter(entry => Number(entry.checkedAt || 0) > 0 && Number(entry.checkedAt || 0) <= staleCutoff).length;
-  let limit = Math.max(20, Number(botAvailabilityUiState.visible || 20) || 20);
+  let limit = Math.max(10, Number(botAvailabilityUiState.visible || 10) || 10);
   const shown = entries.slice(0, limit);
 
   const summary = $("botAvailabilitySummary");
@@ -8678,12 +8969,12 @@ function renderBotAvailability(renderOptions = {}) {
   const collapse = $("botAvailabilityCollapse");
   if (showMore) {
     showMore.style.display = entries.length > shown.length ? "" : "none";
-    showMore.textContent = `Show 20 more (${Math.max(0, entries.length - shown.length)} left)`;
+    showMore.textContent = `Show 10 more (${Math.max(0, entries.length - shown.length)} left)`;
   }
-  if (showLess) showLess.style.display = shown.length > 20 || !botAvailabilityUiState.collapsed ? "" : "none";
+  if (showLess) showLess.style.display = shown.length > 10 || !botAvailabilityUiState.collapsed ? "" : "none";
   if (collapse) {
-    collapse.style.display = entries.length > 20 ? "" : "none";
-    collapse.textContent = limit <= 20 ? "Show 100" : "Collapse to 20";
+    collapse.style.display = entries.length > 10 ? "" : "none";
+    collapse.textContent = limit <= 10 ? "Show 100" : "Collapse to 10";
   }
 
   if (!base.length) {
@@ -8840,6 +9131,20 @@ function botStatusScanDelayMs() {
   return Number(BOT_STATUS_SCAN_SPEED_DELAYS[speed] || BOT_STATUS_SCAN_SPEED_DELAYS.safe);
 }
 
+async function waitForBotStatusPace(delayMs) {
+  const waitMs = Math.max(0, Math.min(10000, Math.round(Number(delayMs || 0))));
+  if (!waitMs) return true;
+  try {
+    const response = await runtimeMessage({ type: "DS_BOT_STATUS_PACE_WAIT", delayMs: waitMs });
+    if (response?.ok) return true;
+  } catch {}
+  // Old/background-mismatched builds still get a safe fallback. The normal
+  // v0.2.27 path is owned by the extension service worker so hidden Options
+  // timer throttling cannot stretch a ~1s scan delay into multi-minute gaps.
+  await new Promise(resolve => setTimeout(resolve, waitMs));
+  return false;
+}
+
 function sortBotStatusRefreshQueue(entries, availability, archives) {
   return [...entries].sort((a, b) => {
     const av = availability[a.id] || {};
@@ -8974,7 +9279,7 @@ async function runBotAvailabilityScan(options = {}) {
         const transientServerFailure = http === 429 || http >= 500;
         if (transientServerFailure) adaptiveDelay = Math.min(8000, Math.max(1500, adaptiveDelay * 2));
         else adaptiveDelay = Math.max(botStatusScanDelayMs(), Math.round(adaptiveDelay * 0.85));
-        await new Promise(resolve => setTimeout(resolve, adaptiveDelay));
+        await waitForBotStatusPace(adaptiveDelay);
       }
     }
   } finally {
@@ -9553,7 +9858,7 @@ function renderSavedBotInfo() {
   if (showLess) showLess.style.display = shown.length > 20 || !savedBotInfoUiState.collapsed ? "" : "none";
   if (collapse) {
     collapse.style.display = items.length > 20 ? "" : "none";
-    collapse.textContent = limit <= 20 ? "Show 100" : "Collapse to 20";
+    collapse.textContent = limit <= 10 ? "Show 100" : "Collapse to 10";
   }
   if (!items.length) {
     setEmptyState(host, query ? "No saved recovery copies match that search." : "No saved bot recovery copies yet. Run Bot Status Center on saved bots or enable archive capture to build them.");
@@ -9613,25 +9918,25 @@ function renderSavedBotInfo() {
 }
 
 
-const deletedSavedBotsUiState = { query: "", visible: 20, collapsed: true };
+const deletedSavedBotsUiState = { query: "", visible: 10, collapsed: true };
 
 function isConfirmedUnavailableBotStatus(entry) {
-  if (!entry || String(entry.status || "") !== "unavailable") return false;
-  const httpStatus = Number(entry.httpStatus || 0);
-  if (httpStatus === 404 || httpStatus === 410) return true;
-  const reason = String(entry.reason || "").toLowerCase();
-  return /(?:character api|profile).*(?:not found|unavailable|deleted)|(?:http\s*)?(?:404|410)|page says .*?(?:not found|unavailable|deleted)/i.test(reason);
+  // Availability classification is authoritative here. First/temporary empty
+  // responses stay "unknown"; only confirmed deletion/unavailability is
+  // normalized to "unavailable". Re-checking a second evidence predicate in
+  // the recovery renderer caused confirmed cards to disappear from the deleted
+  // section even while Bot Status already labelled them unavailable.
+  return !!entry && String(entry.status || "") === "unavailable";
 }
 
 function deletedSavedBotEntries() {
   const availability = normalizeBotAvailability(botAvailabilityState).meta;
   const archives = normalizeBotArchive(botArchiveState).meta;
-  const blockedIds = new Set(normalizeBotStore(blockedState).ids);
   const query = String($("deletedSavedBotSearch")?.value || deletedSavedBotsUiState.query || "")
     .toLowerCase().replace(/\s+/g, " ").trim();
   deletedSavedBotsUiState.query = query;
   return Object.values(availability)
-    .filter(entry => isConfirmedUnavailableBotStatus(entry) && archives[entry.id] && !blockedIds.has(entry.id))
+    .filter(entry => isConfirmedUnavailableBotStatus(entry) && archives[entry.id])
     .map(entry => ({ ...entry, archive: archives[entry.id] }))
     .filter(entry => {
       if (!query) return true;
@@ -9650,7 +9955,8 @@ function deletedSavedBotCard(entry) {
   else card.appendChild(makeElement("div", { className: "bot-manager-placeholder", text: "?" }));
 
   const main = makeElement("div", { className: "bot-manager-main" });
-  main.appendChild(makeElement("div", { className: "bot-manager-title", text: displayNormalizedSavedText(archive?.name || fields.name || entry.name || entry.id) }));
+  const recoveryName = cleanAuthoritativeBotName(fields.name, entry.id) || cleanAuthoritativeBotName(archive?.name, entry.id) || cleanAuthoritativeBotName(entry.name, entry.id) || bestKnownBotName(entry.id, "") || "Unknown bot";
+  main.appendChild(makeElement("div", { className: "bot-manager-title", text: displayNormalizedSavedText(recoveryName) }));
   const creator = archive?.creator || fields.creator || entry.creator || "";
   if (creator) main.appendChild(makeElement("div", { className: "bot-manager-creator", text: displayNormalizedSavedText(creator) }));
   main.appendChild(makeElement("div", { className: "bot-manager-id", text: entry.id }));
@@ -9700,10 +10006,9 @@ function renderDeletedSavedBots() {
   if (!host) return;
   const all = deletedSavedBotEntries();
   const archives = normalizeBotArchive(botArchiveState).meta;
-  const blockedIds = new Set(normalizeBotStore(blockedState).ids);
   const totalRecoverable = Object.values(normalizeBotAvailability(botAvailabilityState).meta)
-    .filter(entry => isConfirmedUnavailableBotStatus(entry) && archives[entry.id] && !blockedIds.has(entry.id)).length;
-  const limit = Math.max(20, Number(deletedSavedBotsUiState.visible || 20) || 20);
+    .filter(entry => isConfirmedUnavailableBotStatus(entry) && archives[entry.id]).length;
+  const limit = Math.max(10, Number(deletedSavedBotsUiState.visible || 10) || 10);
   const shown = all.slice(0, limit);
   if ($("deletedSavedBotSummary")) {
     $("deletedSavedBotSummary").textContent = `${totalRecoverable} recoverable deleted bot${totalRecoverable === 1 ? "" : "s"}${deletedSavedBotsUiState.query ? ` · ${all.length} matching` : ""}`;
@@ -9713,11 +10018,11 @@ function renderDeletedSavedBots() {
   const collapse = $("deletedSavedBotCollapse");
   if (showMore) {
     showMore.style.display = all.length > shown.length ? "" : "none";
-    showMore.textContent = `Show 20 more (${Math.max(0, all.length - shown.length)} left)`;
+    showMore.textContent = `Show 10 more (${Math.max(0, all.length - shown.length)} left)`;
   }
-  if (showLess) showLess.style.display = shown.length > 20 || !deletedSavedBotsUiState.collapsed ? "" : "none";
+  if (showLess) showLess.style.display = shown.length > 10 || !deletedSavedBotsUiState.collapsed ? "" : "none";
   if (collapse) {
-    collapse.style.display = all.length > 20 ? "" : "none";
+    collapse.style.display = all.length > 10 ? "" : "none";
     collapse.textContent = limit <= 20 ? "Show 100" : "Collapse to 20";
   }
   if (!all.length) {
@@ -9832,26 +10137,26 @@ function setupBotAvailabilityControls() {
     renderSavedBotInfo();
   });
   $("deletedSavedBotSearch")?.addEventListener("input", () => {
-    deletedSavedBotsUiState.visible = 20;
+    deletedSavedBotsUiState.visible = 10;
     deletedSavedBotsUiState.collapsed = true;
     renderDeletedSavedBots();
   });
   $("deletedSavedBotShowMore")?.addEventListener("click", () => {
-    deletedSavedBotsUiState.visible = Math.min(5000, Number(deletedSavedBotsUiState.visible || 20) + 20);
+    deletedSavedBotsUiState.visible = Math.min(5000, Number(deletedSavedBotsUiState.visible || 10) + 10);
     deletedSavedBotsUiState.collapsed = true;
     renderDeletedSavedBots();
   });
   $("deletedSavedBotShowLess")?.addEventListener("click", () => {
-    deletedSavedBotsUiState.visible = 20;
+    deletedSavedBotsUiState.visible = 10;
     deletedSavedBotsUiState.collapsed = true;
     renderDeletedSavedBots();
   });
   $("deletedSavedBotCollapse")?.addEventListener("click", () => {
-    if (Number(deletedSavedBotsUiState.visible || 20) <= 20) {
+    if (Number(deletedSavedBotsUiState.visible || 10) <= 10) {
       deletedSavedBotsUiState.visible = Math.min(100, deletedSavedBotEntries().length);
       deletedSavedBotsUiState.collapsed = false;
     } else {
-      deletedSavedBotsUiState.visible = 20;
+      deletedSavedBotsUiState.visible = 10;
       deletedSavedBotsUiState.collapsed = true;
     }
     renderDeletedSavedBots();
@@ -9899,13 +10204,13 @@ function setupBotAvailabilityControls() {
   $("botStatusStaleDays")?.addEventListener("change", () => { save().catch(() => {}); renderBotAvailability(); });
   $("botAvailabilityScope")?.addEventListener("change", () => {
     invalidateDuplicateCache();
-    botAvailabilityUiState.visible = 20;
+    botAvailabilityUiState.visible = 10;
     botAvailabilityUiState.collapsed = true;
     renderBotAvailability();
   });
   $("botAvailabilityStatusFilter")?.addEventListener("change", async event => {
     botAvailabilityUiState.status = event.target.value || "all";
-    botAvailabilityUiState.visible = 20;
+    botAvailabilityUiState.visible = 10;
     botAvailabilityUiState.collapsed = true;
     if (BOT_DUPLICATE_LEVELS.has(botAvailabilityUiState.status) && !botDuplicateCacheReady) {
       const scope = String($("botAvailabilityScope")?.value || "all");
@@ -9923,29 +10228,29 @@ function setupBotAvailabilityControls() {
   });
   const renderAvailabilitySearch = debounceCallback(event => {
     botAvailabilityUiState.query = event?.target?.value || $("botAvailabilitySearch")?.value || "";
-    botAvailabilityUiState.visible = 20;
+    botAvailabilityUiState.visible = 10;
     botAvailabilityUiState.collapsed = true;
     renderBotAvailability();
   });
   $("botAvailabilitySearch")?.addEventListener("input", renderAvailabilitySearch);
   $("botAvailabilityShowMore")?.addEventListener("click", () => {
     botAvailabilityUiState.collapsed = true;
-    botAvailabilityUiState.visible = Math.min(5000, Number(botAvailabilityUiState.visible || 20) + 20);
+    botAvailabilityUiState.visible = Math.min(5000, Number(botAvailabilityUiState.visible || 10) + 10);
     renderBotAvailability();
   });
   $("botAvailabilityShowLess")?.addEventListener("click", () => {
-    botAvailabilityUiState.visible = 20;
+    botAvailabilityUiState.visible = 10;
     botAvailabilityUiState.collapsed = true;
     renderBotAvailability();
   });
   $("botAvailabilityCollapse")?.addEventListener("click", () => {
-    const current = Number(botAvailabilityUiState.visible || 20);
-    if (current <= 20) {
+    const current = Number(botAvailabilityUiState.visible || 10);
+    if (current <= 10) {
       botAvailabilityUiState.collapsed = false;
       botAvailabilityUiState.visible = Math.min(100, botStatusCenterBaseEntries(String($("botAvailabilityScope")?.value || "all")).length);
     } else {
       botAvailabilityUiState.collapsed = true;
-      botAvailabilityUiState.visible = 20;
+      botAvailabilityUiState.visible = 10;
     }
     renderBotAvailability();
   });
@@ -10616,9 +10921,12 @@ function isPlaceholderBotName(value, id = "") {
   if (id && text.toLowerCase() === String(id).toLowerCase()) return true;
   const lower = text.toLowerCase();
   return [
-    "for you", "unknown bot", "unknown", "chatbot", "spicychat", "404",
+    "for you", "recommended for you", "unknown bot", "unknown character", "unknown", "chatbot", "character", "bot", "spicychat",
+    "chatbot under review", "character under review", "under review", "private chatbot", "deleted chatbot", "deleted",
+    "unavailable", "not available", "404", "404 not found", "not found", "page not found", "error",
+    "error loading chatbot", "failed to load chatbot",
     "create personalized ai characters chatbots", "create personalized ai characters chatbot"
-  ].includes(lower) || /^create personalized ai characters chatbots?\b/i.test(text);
+  ].includes(lower) || /^(?:for you|recommended for you|chatbot under review|character under review|404(?: not found)?|not found|page not found)(?:\b|[.!…])/i.test(text) || /^create personalized ai characters chatbots?\b/i.test(text);
 }
 
 function cleanAuthoritativeBotName(value, id = "") {
@@ -10630,8 +10938,14 @@ function localBotNameCandidates(id) {
   const key = String(id || "").trim();
   if (!key) return [];
   const availability = botAvailabilityState?.meta?.[key] || {};
+  const archive = botArchiveState?.meta?.[key] || {};
+  const recovery = botUnavailableRecoveryState?.meta?.[key] || {};
   const snapshot = normalizeBotSnapshot(availability.snapshot || availability.baseline || {});
   return [
+    archive?.fields?.name,
+    archive?.name,
+    recovery?.records?.openedMeta?.name,
+    recovery?.name,
     openedChatMetaState?.[key]?.name,
     laterBotState?.meta?.[key]?.name,
     favoriteBotState?.meta?.[key]?.name,
@@ -14054,7 +14368,7 @@ async function runCreatorBotWatchNow() {
   }
   const summary = response.summary || {};
   if (summary.skipped === "disabled") {
-    showSettingsToast("The saved setting is still disabled. Press Save settings, then check again.");
+    showSettingsToast("The saved setting is still disabled. Wait for autosave to finish, then check again.");
     return;
   }
   showSettingsToast(`Creator check complete: ${Number(summary.checked || 0)} checked, ${Number(summary.newBots || 0)} new, ${Number(summary.failures || 0)} failed.`);
@@ -14108,6 +14422,7 @@ async function applyPendingOptionsNavigation(value) {
 }
 
 async function load() {
+  settingsAutosaveReady = false;
   const loadStarted = typeof performance !== "undefined" ? performance.now() : 0;
   setVersionText();
   renderedHeavyTabs.clear();
@@ -14149,6 +14464,7 @@ async function load() {
   ]);
 
   const rawSettings = result.settings || {};
+  await ensureGranularSettingsMigration(rawSettings);
   const settings = { ...DEFAULT_SETTINGS, ...rawSettings };
   loadedSettingsSnapshot = { ...settings };
   creatorBotWebhookState = normalizeCreatorBotWebhookConfig(result[CREATOR_BOT_WEBHOOK_KEY]);
@@ -14541,6 +14857,7 @@ async function load() {
   setChecked("showBotCreationDates", !!settings.showBotCreationDates);
   setChecked("expandBotNamesOnHover", !!settings.expandBotNamesOnHover);
   setChecked("paginationTopJumpBox", !!settings.paginationTopJumpBox);
+  setChecked("paginationQuickJumpMenu", !!settings.paginationQuickJumpMenu);
   setChecked("cardTokenShowGreeting", settings.cardTokenShowGreeting !== false);
   setChecked("cardTokenShowPersonality", !!settings.cardTokenShowPersonality);
   setChecked("cardTokenShowScenario", !!settings.cardTokenShowScenario);
@@ -14916,14 +15233,18 @@ async function load() {
   if ($("personaCount")) $("personaCount").textContent = `${currentPersonas.length} stored`;
 
   optionsDataLoaded = true;
+  settingsAutosaveReady = true;
   updateBlockedBulkResumeControls();
   updateSettingDependencies();
+  refreshPlatformCompatibilityUi(settings);
+  await refreshAccountSyncUi();
   DS_FEATURE_INDEX_REFRESH?.();
   await applyPendingOptionsNavigation(result[PENDING_OPTIONS_NAV_KEY]);
   const activeTab = activeOptionsTab();
   renderHeavyManagersForTab(activeTab);
   if (activeTab === "data") { refreshStorageUsage().catch(() => {}); renderLocalChangeHistory().catch(() => {}); }
   if (activeTab === "control") setupControlCenterView().catch(() => {});
+  if (activeTab === "account") refreshAccountSyncUi().catch(() => {});
   if (activeTab === "changelog") loadChangelog();
   renderMiniPanelPreview();
   applyFeatureChangeBadges(String(result[LAST_SEEN_VERSION_KEY] || ""));
@@ -14935,6 +15256,7 @@ async function load() {
   initializeExportScopeSelection().catch(() => {});
 
   dirtySavedStores.clear();
+  setAutosaveStatus("Saved automatically", "saved");
   if (loadStarted && typeof performance !== "undefined") OPTIONS_PERFORMANCE.loadMs = Math.max(0, performance.now() - loadStarted);
 }
 
@@ -15183,6 +15505,7 @@ function readSettingsFromPage() {
 
     autoFillListings: checked("autoFillListings"),
     paginationTopJumpBox: checked("paginationTopJumpBox"),
+    paginationQuickJumpMenu: checked("paginationQuickJumpMenu"),
     showListingRefillButton: checked("showListingRefillButton"),
     showListingFilterStats: checked("showListingFilterStats"),
     showListingFilterStatsDetails: checked("showListingFilterStatsDetails"),
@@ -15379,6 +15702,7 @@ function readSettingsFromPage() {
     settingsContentLayout: ["single", "adaptive"].includes(value("settingsContentLayout")) ? value("settingsContentLayout") : "single",
     settingsPageWidth: ["comfortable", "wide"].includes(value("settingsPageWidth")) ? value("settingsPageWidth") : "comfortable",
     collapseSettingsSectionsByDefault: checked("collapseSettingsSectionsByDefault"),
+    featureIndexCollapsedCategories: normalizeFeatureIndexCollapsedCategories(loadedSettingsSnapshot.featureIndexCollapsedCategories),
     enableCommandPalette: checked("enableCommandPalette", false),
     commandPaletteShortcut: ["ctrl-k", "ctrl-shift-k", "alt-k", "off"].includes(value("commandPaletteShortcut")) ? value("commandPaletteShortcut") : "ctrl-k",
     commandPaletteShowSavedItems: checked("commandPaletteShowSavedItems", true),
@@ -15561,6 +15885,864 @@ function readSettingsFromPage() {
   };
 }
 
+const SETTINGS_AUTOSAVE_MISSING = Symbol("settings-autosave-missing");
+
+function readSingleSettingFromPage(settingKey) {
+  switch (String(settingKey || "")) {
+    case "enabled": return (checked("enabled"));
+    case "saiToolkitCompatibility": return (checked("saiToolkitCompatibility", false));
+    case "globalNsfwMode": return (value("globalNsfwMode", "ignore"));
+    case "autoAfkEnabled": return (checked("autoAfkEnabled"));
+    case "autoAfkHours": return (Math.min(720, Math.max(1, Number(value("autoAfkHours", "12")) || 12)));
+    case "autoAfkChats": return (checked("autoAfkChats", true));
+    case "autoAfkHome": return (checked("autoAfkHome"));
+    case "autoAfkProfiles": return (checked("autoAfkProfiles"));
+    case "autoAfkAction": return ($("autoAfkActionClose")?.checked ? "close" : "discard");
+    case "autoAfkProtectActive": return (checked("autoAfkProtectActive", true));
+    case "autoAfkResetOnActivate": return (checked("autoAfkResetOnActivate", true));
+    case "duplicateTabGuardEnabled": return (checked("duplicateTabGuardEnabled"));
+    case "duplicateTabChats": return (checked("duplicateTabChats", true));
+    case "duplicateTabHome": return (checked("duplicateTabHome"));
+    case "duplicateTabProfiles": return (checked("duplicateTabProfiles"));
+    case "duplicateTabKeepMode": return (value("duplicateTabKeepMode") === "existing" ? "existing" : "new");
+    case "duplicateTabFocusExisting": return (checked("duplicateTabFocusExisting", true));
+    case "tabCleanupRecentHours": return (Math.min(72, Math.max(1, Number(value("tabCleanupRecentHours", "24")) || 24)));
+    case "tabCleanupRecentDays": return (Math.min(30, Math.max(1, Number(value("tabCleanupRecentDays", "3")) || 3)));
+    case "tabCleanupMediumDays": return (Math.min(90, Math.max(2, Number(value("tabCleanupMediumDays", "7")) || 7)));
+    case "tabCleanupOldDays": return (Math.min(365, Math.max(3, Number(value("tabCleanupOldDays", "14")) || 14)));
+    case "tabCleanupProtectPinnedOnClose": return (checked("tabCleanupProtectPinnedOnClose", true));
+    case "autoTags": return (checked("autoTags"));
+    case "enableTagAliases": return (checked("enableTagAliases"));
+    case "tagAliasRules": return (value("tagAliasRules"));
+    case "tagAliasShowDisplay": return (checked("tagAliasShowDisplay"));
+    case "showTagTemplateButton": return (checked("showTagTemplateButton"));
+    case "showChatTagLinks": return (checked("showChatTagLinks"));
+    case "showChatTagAddButtons": return (checked("showChatTagAddButtons"));
+    case "botEditorShowCharButton": return (checked("botEditorShowCharButton"));
+    case "botEditorShowUserButton": return (checked("botEditorShowUserButton"));
+    case "botEditorShowContinueButton": return (checked("botEditorShowContinueButton"));
+    case "botEditorShowNoControlButton": return (checked("botEditorShowNoControlButton"));
+    case "botEditorShowCustomSnippets": return (checked("botEditorShowCustomSnippets"));
+    case "botEditorAutoOpenAdvanced": return (checked("botEditorAutoOpenAdvanced"));
+    case "rememberBotImagePrompt": return (checked("rememberBotImagePrompt"));
+    case "botEditorSaveActions": return (checked("botEditorSaveActions"));
+    case "botEditorSaveChatNewTab": return (checked("botEditorSaveChatNewTab"));
+    case "enableBotEditorDraftHistory": return (checked("enableBotEditorDraftHistory"));
+    case "botEditorDraftHistoryLimit": return (Math.max(3, Math.min(20, Number(value("botEditorDraftHistoryLimit", "8")) || 8)));
+    case "enableWikiLorebookImporter": return (checked("enableWikiLorebookImporter"));
+    case "enableLorebookConsistency": return (checked("enableLorebookConsistency"));
+    case "lorebookConsistencyShowMatches": return (checked("lorebookConsistencyShowMatches", true));
+    case "lorebookConsistencyAutoQueue": return (checked("lorebookConsistencyAutoQueue", true));
+    case "lorebookConsistencyMaxEntries": return (Math.max(1, Math.min(5, Number(value("lorebookConsistencyMaxEntries", "3")) || 3)));
+    case "lorebookDefaultEntriesTab": return (checked("lorebookDefaultEntriesTab", false));
+    case "lorebookRememberEntrySort": return (checked("lorebookRememberEntrySort", false));
+    case "lorebookProtectEntryDrafts": return (checked("lorebookProtectEntryDrafts", false));
+    case "lorebookEditShortcuts": return (checked("lorebookEditShortcuts", false));
+    case "lorebookEntryManager": return (checked("lorebookEntryManager", false));
+    case "lorebookMultiEntryWorkspace": return (checked("lorebookMultiEntryWorkspace", false));
+    case "lorebookEntrySelectionCheckbox": return (checked("lorebookEntrySelectionCheckbox", true));
+    case "lorebookEntryShowTokenCount": return (checked("lorebookEntryShowTokenCount", true));
+    case "lorebookEntryShowHiddenKeywordCount": return (checked("lorebookEntryShowHiddenKeywordCount", true));
+    case "lorebookEntryShowNoKeywordsWarning": return (checked("lorebookEntryShowNoKeywordsWarning", true));
+    case "lorebookEntryShowCharacterCount": return (checked("lorebookEntryShowCharacterCount", true));
+    case "lorebookEntryRenameButton": return (checked("lorebookEntryRenameButton", true));
+    case "lorebookEntryCopyButton": return (checked("lorebookEntryCopyButton", true));
+    case "lorebookEntryDuplicateButton": return (checked("lorebookEntryDuplicateButton", true));
+    case "lorebookBulkSelectAll": return (checked("lorebookBulkSelectAll", true));
+    case "lorebookBulkClear": return (checked("lorebookBulkClear", true));
+    case "lorebookBulkAnalyze": return (checked("lorebookBulkAnalyze", true));
+    case "lorebookBulkExportSelected": return (checked("lorebookBulkExportSelected", true));
+    case "lorebookBulkCopySelected": return (checked("lorebookBulkCopySelected", true));
+    case "lorebookBulkDuplicateSelected": return (checked("lorebookBulkDuplicateSelected", true));
+    case "lorebookBulkAddKeyword": return (checked("lorebookBulkAddKeyword", true));
+    case "lorebookBulkRemoveKeyword": return (checked("lorebookBulkRemoveKeyword", true));
+    case "lorebookBulkToggleEnabled": return (checked("lorebookBulkToggleEnabled", true));
+    case "lorebookBulkDeleteSelected": return (checked("lorebookBulkDeleteSelected", true));
+    case "lorebookBulkFindKeyword": return (checked("lorebookBulkFindKeyword", true));
+    case "lorebookAutoStartNew": return (checked("lorebookAutoStartNew"));
+    case "lorebookBulkKeywordPaste": return (checked("lorebookBulkKeywordPaste"));
+    case "lorebookExpandEntryEditor": return (checked("lorebookExpandEntryEditor"));
+    case "lorebookExpandTags": return (false);
+    case "botTagBulkPaste": return (checked("botTagBulkPaste"));
+    case "showLorebookEntryExpandButtons": return (checked("showLorebookEntryExpandButtons"));
+    case "creatorModerationWarnings": return (checked("creatorModerationWarnings"));
+    case "creatorModerationWarningsChatbots": return (checked("creatorModerationWarningsChatbots"));
+    case "creatorModerationWarningMode": return (value("creatorModerationWarningMode") === "all" ? "all" : "balanced");
+    case "creatorModerationWarningIgnoredTerms": return (value("creatorModerationWarningIgnoredTerms", "").slice(0, 4000));
+    case "creatorModerationWarningCustomTerms": return (value("creatorModerationWarningCustomTerms", "").slice(0, 12000));
+    case "botEditorDefaultVisibility": return (["public", "unlisted"].includes(value("botEditorDefaultVisibility")) ? value("botEditorDefaultVisibility") : "ignore");
+    case "autoAgreeCreationGuidelines": return (checked("autoAgreeCreationGuidelines"));
+    case "botEditorSnippets": return (botEditorSnippetsFromPage());
+    case "enableGenerationProfiles": return (checked("enableGenerationProfiles"));
+    case "showGenerationMetadata": return (checked("showGenerationMetadata"));
+    case "showMessageTimestamps": return (checked("showMessageTimestamps"));
+    case "messageTimestamp24Hour": return (checked("messageTimestamp24Hour"));
+    case "messageTimestampDateFirst": return (checked("messageTimestampDateFirst"));
+    case "messageTimestampShowSeconds": return (checked("messageTimestampShowSeconds"));
+    case "showGenerationModel": return (checked("showGenerationModel"));
+    case "showGenerationElapsed": return (checked("showGenerationElapsed"));
+    case "showGenerationSettings": return (checked("showGenerationSettings"));
+    case "compactGenerationMetadata": return (checked("compactGenerationMetadata"));
+    case "enableContextWindowWarning": return (checked("enableContextWindowWarning"));
+    case "contextWarningThreshold": return (Math.min(99, Math.max(50, Number(value("contextWarningThreshold", "85")) || 85)));
+    case "contextWarningManualLimit": return (Math.max(0, Number(value("contextWarningManualLimit", "0")) || 0));
+    case "contextWarningBrowserNotifications": return (checked("contextWarningBrowserNotifications"));
+    case "includeTags": return (linesToArray(value("includeTags")));
+    case "excludeTags": return (linesToArray(value("excludeTags")));
+    case "hidePremium": return (checked("hidePremium"));
+    case "hideFloatingPremiumPopups": return (checked("hideFloatingPremiumPopups"));
+    case "hideAdvertBanners": return (checked("hideAdvertBanners"));
+    case "expandModelSelectorDescriptions": return (checked("expandModelSelectorDescriptions"));
+    case "hideModelUpgradeButtons": return (checked("hideModelUpgradeButtons"));
+    case "customizeModelQuickMenu": return (checked("customizeModelQuickMenu"));
+    case "modelQuickFavoritesOnly": return (checked("modelQuickFavoritesOnly"));
+    case "modelFavoriteNames": return (value("modelFavoriteNames", ""));
+    case "modelHiddenNames": return (value("modelHiddenNames", ""));
+    case "hideNotifications": return (checked("hideNotifications"));
+    case "hideTabNotificationBadge": return (checked("hideTabNotificationBadge"));
+    case "autoReadNotifications": return (checked("autoReadNotifications"));
+    case "hideTopBarLanguage": return (checked("hideTopBarLanguage"));
+    case "hideTopBarNotifications": return (checked("hideTopBarNotifications"));
+    case "hideTopBarTheme": return (checked("hideTopBarTheme"));
+    case "topBarProfilePillMode": return (value("topBarProfilePillMode", "normal"));
+    case "topBarProfilePillCustomText": return (value("topBarProfilePillCustomText", ""));
+    case "topBarProfilePillPersonaPrefix": return (checked("topBarProfilePillPersonaPrefix"));
+    case "showChatTopBarTools": return (checked("showChatTopBarTools"));
+    case "chatTopBarInlineCreator": return (checked("chatTopBarInlineCreator"));
+    case "chatTopBarAddLaterButton": return (checked("chatTopBarAddLaterButton"));
+    case "closeChatTabAfterSavingLater": return (checked("closeChatTabAfterSavingLater"));
+    case "showPerCharacterChatHistory": return (checked("showPerCharacterChatHistory"));
+    case "showQuickNewChatButton": return (checked("showQuickNewChatButton"));
+    case "hideChatTopBarRatingButton": return (checked("hideChatTopBarRatingButton"));
+    case "enableNativeRatingHelpers": return (checked("enableNativeRatingHelpers"));
+    case "hideChatTopBarModelButton": return (checked("hideChatTopBarModelButton"));
+    case "hideChatTopBarContextDot": return (checked("hideChatTopBarContextDot"));
+    case "hideChatDropdownVoiceUpsell": return (checked("hideChatDropdownVoiceUpsell"));
+    case "hideChatDropdownMemoryItem": return (checked("hideChatDropdownMemoryItem"));
+    case "enableBulkMemoryManager": return (checked("enableBulkMemoryManager"));
+    case "showCopyMemoryAction": return (checked("showCopyMemoryAction"));
+    case "memoryAutoLoadAll": return (checked("memoryAutoLoadAll"));
+    case "enableChatTextReplacements": return (checked("enableChatTextReplacements"));
+    case "chatTextReplacementRules": return (value("chatTextReplacementRules", ""));
+    case "chatTextReplacementScope": return (["ai", "user", "both"].includes(value("chatTextReplacementScope")) ? value("chatTextReplacementScope") : "ai");
+    case "chatTextReplacementMode": return (value("chatTextReplacementMode") === "save" ? "save" : "display");
+    case "chatTextReplacementPreview": return (checked("chatTextReplacementPreview"));
+    case "enableTranslation": return (checked("enableTranslation"));
+    case "translationShowMessageButtons": return (checked("translationShowMessageButtons"));
+    case "translationAutoAi": return (checked("translationAutoAi"));
+    case "translationAutoUser": return (checked("translationAutoUser"));
+    case "translationTargetLanguage": return (value("translationTargetLanguage", "EN-US"));
+    case "translationUnderstoodLanguages": return (value("translationUnderstoodLanguages", "EN"));
+    case "translationProtectedTerms": return (value("translationProtectedTerms", ""));
+    case "showChatListTools": return (checked("showChatListTools"));
+    case "enableChatOrganizer": return (checked("enableChatOrganizer"));
+    case "chatCollections": return (value("chatCollections", ""));
+    case "showSavedChatQuickActions": return (checked("showSavedChatQuickActions"));
+    case "showRandomChatButton": return (checked("showRandomChatButton"));
+    case "randomChatUseLastHomeFilters": return (checked("randomChatUseLastHomeFilters"));
+    case "randomChatIncludeOpened": return (checked("randomChatIncludeOpened"));
+    case "randomChatIncludeLater": return (checked("randomChatIncludeLater"));
+    case "randomChatIncludeFavorites": return (checked("randomChatIncludeFavorites"));
+    case "chatListSortMode": return (value("chatListSortMode", "default"));
+    case "chatListSearchMode": return ("all");
+    case "chatListOpenedFilter": return (["all", "opened", "unopened"].includes(value("chatListOpenedFilter")) ? value("chatListOpenedFilter") : "all");
+    case "chatListMessageFilter": return (["all", "0", "1-9", "10-49", "50-99", "100-499", "500+", "unknown"].includes(value("chatListMessageFilter")) ? value("chatListMessageFilter") : "all");
+    case "chatListSavedFilter": return (["all", "favorite", "later", "both", "saved", "neither"].includes(value("chatListSavedFilter")) ? value("chatListSavedFilter") : "all");
+    case "chatListBlockedFilter": return (["all", "blocked", "unblocked"].includes(value("chatListBlockedFilter")) ? value("chatListBlockedFilter") : "all");
+    case "trackOpenedChats": return (checked("trackOpenedChats"));
+    case "botStatusScanSpeed": return (Object.prototype.hasOwnProperty.call(BOT_STATUS_SCAN_SPEED_DELAYS, value("botStatusScanSpeed", "safe")) ? value("botStatusScanSpeed", "safe") : "safe");
+    case "botStatusStaleDays": return ([1, 7, 14, 30].includes(Number(value("botStatusStaleDays", "7"))) ? Number(value("botStatusStaleDays", "7")) : 7);
+    case "importOpenedFromChatsPage": return (checked("importOpenedFromChatsPage"));
+    case "hideOpenedChats": return (checked("hideOpenedChats"));
+    case "openedBotSortMode": return (value("openedBotSortMode", "newest"));
+    case "qolInterfaceScale": return ([100, 110, 125, 150].includes(Number(value("qolInterfaceScale", "100"))) ? Number(value("qolInterfaceScale", "100")) : 100);
+    case "chatTextScale": return ([100, 110, 125, 150].includes(Number(value("chatTextScale", "100"))) ? Number(value("chatTextScale", "100")) : 100);
+    case "chatLineSpacing": return (["native", "comfortable", "spacious"].includes(value("chatLineSpacing", "native")) ? value("chatLineSpacing", "native") : "native");
+    case "showQuickPanel": return (checked("showQuickPanel"));
+    case "quickPanelPlacement": return (value("quickPanelPlacement", "bottom-right") || "bottom-right");
+    case "quickPanelDraggable": return (checked("quickPanelDraggable"));
+    case "quickPanelDefaultClosed": return (checked("quickPanelDefaultClosed"));
+    case "quickPanelEnabledByDefaultInTab": return (checked("quickPanelEnabledByDefaultInTab", true));
+    case "quickPanelWidth": return (Math.min(440, Math.max(200, Number(value("quickPanelWidth", "280")) || 280)));
+    case "quickPanelUiScale": return (Math.min(125, Math.max(80, Number(value("quickPanelUiScale", "100")) || 100)));
+    case "quickPanelMaxHeightPercent": return (Math.min(95, Math.max(25, Number(value("quickPanelMaxHeightPercent", "80")) || 80)));
+    case "quickPanelCustomXPercent": return (Math.min(100, Math.max(0, Number.isFinite(Number(value("quickPanelCustomXPercent", "70"))) ? Number(value("quickPanelCustomXPercent", "70")) : 70)));
+    case "quickPanelCustomYPercent": return (Math.min(100, Math.max(0, Number.isFinite(Number(value("quickPanelCustomYPercent", "12"))) ? Number(value("quickPanelCustomYPercent", "12")) : 12)));
+    case "quickPanelAutoCollapseOverlap": return (checked("quickPanelAutoCollapseOverlap", true));
+    case "quickPanelShowStatus": return (checked("quickPanelShowStatus", true));
+    case "quickPanelShowLoadedMessageCount": return (checked("quickPanelShowLoadedMessageCount"));
+    case "quickPanelStatusShowOpened": return (checked("quickPanelStatusShowOpened", true));
+    case "quickPanelStatusShowBlocked": return (checked("quickPanelStatusShowBlocked", true));
+    case "popupShowOpenedCount": return (checked("popupShowOpenedCount", false));
+    case "popupShowBlockedCount": return (checked("popupShowBlockedCount", false));
+    case "popupShowStorageDetails": return (checked("popupShowStorageDetails"));
+    case "quickPanelShowFeatureSummary": return (checked("quickPanelShowFeatureSummary"));
+    case "quickPanelShowOptions": return (checked("quickPanelShowOptions", true));
+    case "quickPanelShowFillNow": return (checked("quickPanelShowFillNow", true));
+    case "quickPanelShowSmartFilterPins": return (checked("quickPanelShowSmartFilterPins"));
+    case "quickPanelShowChatSearch": return (checked("quickPanelShowChatSearch", true));
+    case "quickPanelShowChatSort": return (checked("quickPanelShowChatSort", true));
+    case "quickPanelShowScanVisible": return (checked("quickPanelShowScanVisible", true));
+    case "quickPanelShowLoadAll": return (checked("quickPanelShowLoadAll", true));
+    case "quickPanelShowOoc": return (checked("quickPanelShowOoc", true));
+    case "quickPanelShowAutoVoice": return (checked("quickPanelShowAutoVoice", true));
+    case "quickPanelShowAutoAsterisk": return (checked("quickPanelShowAutoAsterisk", true));
+    case "quickPanelShowTranslation": return (checked("quickPanelShowTranslation"));
+    case "quickPanelShowPersona": return (checked("quickPanelShowPersona", true));
+    case "quickPanelShowExport": return (checked("quickPanelShowExport", true));
+    case "quickPanelShowSoundscapes": return (checked("quickPanelShowSoundscapes"));
+    case "compactAfterHiding": return (checked("compactAfterHiding"));
+    case "neverHideFavorites": return (checked("neverHideFavorites"));
+    case "protectFavoritesFromBlocking": return (checked("protectFavoritesFromBlocking"));
+    case "showCreatorFavoriteButtons": return (checked("showCreatorFavoriteButtons"));
+    case "protectFavoriteCreatorsFromFiltering": return (checked("protectFavoriteCreatorsFromFiltering"));
+    case "showFollowCreatorButtons": return (checked("showFollowCreatorButtons"));
+    case "enableCreatorBotNotifications": return (checked("enableCreatorBotNotifications"));
+    case "creatorBotCheckMinutes": return (CREATOR_BOT_WATCH_INTERVALS.includes(Number(value("creatorBotCheckMinutes", "60"))) ? Number(value("creatorBotCheckMinutes", "60")) : 60);
+    case "creatorBotBrowserNotifications": return (checked("creatorBotBrowserNotifications"));
+    case "trackFavoriteBots": return (checked("trackFavoriteBots"));
+    case "showFavoriteHistoryButton": return (checked("showFavoriteHistoryButton"));
+    case "favoriteBotSortMode": return (value("favoriteBotSortMode", "newest"));
+    case "favoriteBotRelationFilter": return (value("favoriteBotRelationFilter", "all"));
+    case "favoriteBotFolderFilter": return (value("favoriteBotFolderFilter", "all"));
+    case "favoriteBotCreatorFilter": return (value("favoriteBotCreatorFilter", ""));
+    case "favoriteBotStateFilter": return (value("favoriteBotStateFilter", "all"));
+    case "showLaterBotButtons": return (checked("showLaterBotButtons"));
+    case "enableSavedListsOverlay": return (checked("enableSavedListsOverlay"));
+    case "protectLaterBotsFromFiltering": return (checked("protectLaterBotsFromFiltering"));
+    case "hideLaterBotsFromListings": return (checked("hideLaterBotsFromListings"));
+    case "laterBotSortMode": return (value("laterBotSortMode", "newest"));
+    case "laterBotRelationFilter": return (value("laterBotRelationFilter", "all"));
+    case "laterBotFolderFilter": return (value("laterBotFolderFilter", "all"));
+    case "laterBotCreatorFilter": return (value("laterBotCreatorFilter", ""));
+    case "laterBotStateFilter": return (value("laterBotStateFilter", "all"));
+    case "enableBotOrganizer": return (checked("enableBotOrganizer"));
+    case "botCollections": return (value("botCollections", ""));
+    case "botOrganizerShowCardMeta": return (checked("botOrganizerShowCardMeta", true));
+    case "botOrganizerBulkTools": return (checked("botOrganizerBulkTools", true));
+    case "autoFillListings": return (checked("autoFillListings"));
+    case "paginationTopJumpBox": return (checked("paginationTopJumpBox"));
+    case "showListingRefillButton": return (checked("showListingRefillButton"));
+    case "showListingFilterStats": return (checked("showListingFilterStats"));
+    case "showListingFilterStatsDetails": return (checked("showListingFilterStatsDetails"));
+    case "autoFillTargetCards": return (Math.max(1, Math.min(200, Number(value("autoFillTargetCards", "50")) || 50)));
+    case "autoFillMaxClicks": return (Math.max(1, Math.min(30, Number(value("autoFillMaxClicks", "8")) || 8)));
+    case "hideChatPlusButton": return (checked("hideChatPlusButton"));
+    case "hideChatImageButton": return (checked("hideChatImageButton"));
+    case "replaceChatImageWithOocButton": return (checked("replaceChatImageWithOocButton"));
+    case "showAsteriskButton": return (checked("showAsteriskButton"));
+    case "composerShortcutPlacement": return (["inside-right", "outside-left", "outside-right"].includes(value("composerShortcutPlacement")) ? value("composerShortcutPlacement") : "inside-right");
+    case "autoPairAsterisks": return (checked("autoPairAsterisks"));
+    case "showFormattingToolbar": return (checked("showFormattingToolbar"));
+    case "formatToolbarAsterisk": return (checked("formatToolbarAsterisk", true));
+    case "formatToolbarBold": return (checked("formatToolbarBold", true));
+    case "formatToolbarBoldItalic": return (checked("formatToolbarBoldItalic"));
+    case "formatToolbarStrike": return (checked("formatToolbarStrike"));
+    case "formatToolbarParens": return (checked("formatToolbarParens", true));
+    case "formatToolbarQuotes": return (checked("formatToolbarQuotes", true));
+    case "formatToolbarBackticks": return (checked("formatToolbarBackticks"));
+    case "formatToolbarBrackets": return (checked("formatToolbarBrackets"));
+    case "formatToolbarBraces": return (checked("formatToolbarBraces"));
+    case "formatToolbarCustomWrappers": return (value("formatToolbarCustomWrappers", ""));
+    case "styleAlternateDialogue": return (checked("styleAlternateDialogue"));
+    case "alternateDialogueScope": return (["ai", "user", "both"].includes(value("alternateDialogueScope")) ? value("alternateDialogueScope") : "ai");
+    case "alternateDialogueStyle": return (value("alternateDialogueStyle", "dialogue"));
+    case "alternateDialogueCustomColors": return (checked("alternateDialogueCustomColors"));
+    case "alternateDialogueTextColor": return (value("alternateDialogueTextColor", "#f4d35e"));
+    case "alternateDialogueBackgroundColor": return (value("alternateDialogueBackgroundColor", "#1f2430"));
+    case "alternateDialogueBorderColor": return (value("alternateDialogueBorderColor", "#596273"));
+    case "enableReplyInstructions": return (checked("enableReplyInstructions"));
+    case "replyInstructionText": return (value("replyInstructionText", "").trim().slice(0, 2000));
+    case "replyInstructionSendMode": return (["every", "session", "manual"].includes(value("replyInstructionSendMode")) ? value("replyInstructionSendMode") : "session");
+    case "replyInstructionOocWrapper": return (checked("replyInstructionOocWrapper", true));
+    case "replyInstructionShowChatButton": return (checked("replyInstructionShowChatButton", true));
+    case "replyInstructionBotOverrides": return (normalizeReplyInstructionOverrides(loadedSettingsSnapshot.replyInstructionBotOverrides));
+    case "enableGlobalMemory": return (checked("enableGlobalMemory"));
+    case "globalMemoryText": return (value("globalMemoryText", "").trim().slice(0, 4000));
+    case "globalMemorySendMode": return (["every", "session", "manual"].includes(value("globalMemorySendMode")) ? value("globalMemorySendMode") : "session");
+    case "globalMemoryOocWrapper": return (checked("globalMemoryOocWrapper", true));
+    case "globalMemoryShowChatButton": return (checked("globalMemoryShowChatButton", true));
+    case "enableRpFormatRepair": return (checked("enableRpFormatRepair"));
+    case "enableCharacterQolProfiles": return (checked("enableCharacterQolProfiles"));
+    case "rpFormatRepairAuto": return (checked("rpFormatRepairAuto", true));
+    case "rpFormatStyle": return (["clean", "quoted"].includes(value("rpFormatStyle")) ? value("rpFormatStyle") : "clean");
+    case "rpFormatDetection": return (["conservative", "balanced", "aggressive"].includes(value("rpFormatDetection")) ? value("rpFormatDetection") : "balanced");
+    case "rpFormatConvertBoldActions": return (checked("rpFormatConvertBoldActions", true));
+    case "rpFormatRemoveActionParens": return (checked("rpFormatRemoveActionParens", true));
+    case "rpFormatPreserveInlineEmphasis": return (checked("rpFormatPreserveInlineEmphasis", true));
+    case "rpFormatPreserveSemanticQuotes": return (checked("rpFormatPreserveSemanticQuotes", true));
+    case "rpFormatPreserveBackticks": return (checked("rpFormatPreserveBackticks", true));
+    case "rpFormatShowMessageButtons": return (checked("rpFormatShowMessageButtons", true));
+    case "enableChatBackgrounds": return (checked("enableChatBackgrounds"));
+    case "chatBackgroundDim": return (Math.min(90, Math.max(0, Number(value("chatBackgroundDim", "45")) || 0)));
+    case "chatBackgroundBlur": return (Math.min(30, Math.max(0, Number(value("chatBackgroundBlur", "0")) || 0)));
+    case "chatBackgroundFit": return (["cover", "contain", "tile"].includes(value("chatBackgroundFit", "cover")) ? value("chatBackgroundFit", "cover") : "cover");
+    case "chatBackgroundPosition": return (["center", "top", "bottom", "left", "right"].includes(value("chatBackgroundPosition", "center")) ? value("chatBackgroundPosition", "center") : "center");
+    case "enableChatBubbleCustomization": return (checked("enableChatBubbleCustomization"));
+    case "persistSpicyChatUserAppearance": return (checked("persistSpicyChatUserAppearance"));
+    case "chatBubbleAiBackground": return (value("chatBubbleAiBackground", "#27282d"));
+    case "chatBubbleAiTextMode": return (["native", "custom"].includes(value("chatBubbleAiTextMode")) ? value("chatBubbleAiTextMode") : "custom");
+    case "chatBubbleAiText": return (value("chatBubbleAiText", "#f2f2f2"));
+    case "chatBubbleAiActionMode": return (["native", "base", "custom"].includes(value("chatBubbleAiActionMode")) ? value("chatBubbleAiActionMode") : "native");
+    case "chatBubbleAiActionText": return (value("chatBubbleAiActionText", "#79c8f5"));
+    case "chatBubbleAiDialogueMode": return (["native", "base", "custom"].includes(value("chatBubbleAiDialogueMode")) ? value("chatBubbleAiDialogueMode") : "base");
+    case "chatBubbleAiDialogueText": return (value("chatBubbleAiDialogueText", "#f2f2f2"));
+    case "chatBubbleAiFont": return (value("chatBubbleAiFont", "inherit"));
+    case "chatBubbleAiActionFont": return (value("chatBubbleAiActionFont", "inherit"));
+    case "chatBubbleAiDialogueFont": return (value("chatBubbleAiDialogueFont", "inherit"));
+    case "chatBubbleAiBorder": return (value("chatBubbleAiBorder", "#555861"));
+    case "chatBubbleAiBorderWidth": return (Math.min(12, Math.max(0, Number(value("chatBubbleAiBorderWidth", "0")) || 0)));
+    case "chatBubbleAiBorderStyle": return (["solid", "dashed", "dotted", "double"].includes(value("chatBubbleAiBorderStyle")) ? value("chatBubbleAiBorderStyle") : "solid");
+    case "chatBubbleAiBorderOpacity": return (Math.min(100, Math.max(0, Number(value("chatBubbleAiBorderOpacity", "100")) || 0)));
+    case "chatBubbleAiOpacity": return (Math.min(100, Math.max(30, Number(value("chatBubbleAiOpacity", "100")) || 100)));
+    case "chatBubbleAiRadius": return (Math.min(40, Math.max(4, Number(value("chatBubbleAiRadius", "20")) || 20)));
+    case "chatBubbleAiShape": return (["native", "rounded", "square", "speech", "cat", "cloud"].includes(value("chatBubbleAiShape")) ? value("chatBubbleAiShape") : "native");
+    case "chatBubbleAiDecorationMode": return (["bubble", "custom"].includes(value("chatBubbleAiDecorationMode")) ? value("chatBubbleAiDecorationMode") : "bubble");
+    case "chatBubbleAiDecorationColor": return (value("chatBubbleAiDecorationColor", "#27282d"));
+    case "chatBubbleAiCatEarLayout": return (["auto", "left", "right", "split"].includes(value("chatBubbleAiCatEarLayout")) ? value("chatBubbleAiCatEarLayout") : "auto");
+    case "chatBubbleAiShadow": return (checked("chatBubbleAiShadow"));
+    case "chatBubbleUserBackground": return (value("chatBubbleUserBackground", "#253f52"));
+    case "chatBubbleUserTextMode": return (["native", "custom"].includes(value("chatBubbleUserTextMode")) ? value("chatBubbleUserTextMode") : "custom");
+    case "chatBubbleUserText": return (value("chatBubbleUserText", "#f5f5f5"));
+    case "chatBubbleUserActionMode": return (["native", "base", "custom"].includes(value("chatBubbleUserActionMode")) ? value("chatBubbleUserActionMode") : "native");
+    case "chatBubbleUserActionText": return (value("chatBubbleUserActionText", "#79c8f5"));
+    case "chatBubbleUserDialogueMode": return (["native", "base", "custom"].includes(value("chatBubbleUserDialogueMode")) ? value("chatBubbleUserDialogueMode") : "base");
+    case "chatBubbleUserDialogueText": return (value("chatBubbleUserDialogueText", "#f5f5f5"));
+    case "chatBubbleUserFont": return (value("chatBubbleUserFont", "inherit"));
+    case "chatBubbleUserActionFont": return (value("chatBubbleUserActionFont", "inherit"));
+    case "chatBubbleUserDialogueFont": return (value("chatBubbleUserDialogueFont", "inherit"));
+    case "chatBubbleUserBorder": return (value("chatBubbleUserBorder", "#52718a"));
+    case "chatBubbleUserBorderWidth": return (Math.min(12, Math.max(0, Number(value("chatBubbleUserBorderWidth", "0")) || 0)));
+    case "chatBubbleUserBorderStyle": return (["solid", "dashed", "dotted", "double"].includes(value("chatBubbleUserBorderStyle")) ? value("chatBubbleUserBorderStyle") : "solid");
+    case "chatBubbleUserBorderOpacity": return (Math.min(100, Math.max(0, Number(value("chatBubbleUserBorderOpacity", "100")) || 0)));
+    case "chatBubbleUserOpacity": return (Math.min(100, Math.max(30, Number(value("chatBubbleUserOpacity", "100")) || 100)));
+    case "chatBubbleUserRadius": return (Math.min(40, Math.max(4, Number(value("chatBubbleUserRadius", "20")) || 20)));
+    case "chatBubbleUserShape": return (["native", "rounded", "square", "speech", "cat", "cloud"].includes(value("chatBubbleUserShape")) ? value("chatBubbleUserShape") : "native");
+    case "chatBubbleUserDecorationMode": return (["bubble", "custom"].includes(value("chatBubbleUserDecorationMode")) ? value("chatBubbleUserDecorationMode") : "bubble");
+    case "chatBubbleUserDecorationColor": return (value("chatBubbleUserDecorationColor", "#253f52"));
+    case "chatBubbleUserCatEarLayout": return (["auto", "left", "right", "split"].includes(value("chatBubbleUserCatEarLayout")) ? value("chatBubbleUserCatEarLayout") : "auto");
+    case "chatBubbleUserShadow": return (checked("chatBubbleUserShadow"));
+    case "chatBubblePreserveActionColors": return (value("chatBubbleAiActionMode", "native") !== "base" || value("chatBubbleUserActionMode", "native") !== "base");
+    case "hideChatVoiceButton": return (checked("hideChatVoiceButton"));
+    case "hideUnlockCustomVoices": return (checked("hideUnlockCustomVoices"));
+    case "stackChatMessages": return (checked("stackChatMessages"));
+    case "showMessageQuickActions": return (checked("showMessageQuickActions"));
+    case "showChatSearch": return (checked("showChatSearch"));
+    case "chatSearchShowPanel": return (checked("chatSearchShowPanel", true));
+    case "chatSearchShowFindButton": return (checked("chatSearchShowFindButton"));
+    case "chatSearchExactPhrase": return (checked("chatSearchExactPhrase"));
+    case "chatSearchCaseSensitive": return (checked("chatSearchCaseSensitive"));
+    case "chatSearchWholeWord": return (checked("chatSearchWholeWord"));
+    case "chatSearchRegex": return (checked("chatSearchRegex"));
+    case "chatSearchLoadUntilMatch": return (checked("chatSearchLoadUntilMatch"));
+    case "enableMessageBookmarks": return (checked("enableMessageBookmarks"));
+    case "messageBookmarkButtons": return (checked("messageBookmarkButtons", true));
+    case "enableFocusMode": return (checked("enableFocusMode"));
+    case "focusHideSidebar": return (checked("focusHideSidebar", true));
+    case "focusHideTopBar": return (checked("focusHideTopBar", true));
+    case "focusHideChatHeader": return (checked("focusHideChatHeader", true));
+    case "focusHideQolPanel": return (checked("focusHideQolPanel", true));
+    case "enableSavedTextSnippets": return (checked("enableSavedTextSnippets"));
+    case "enableContextKeeper": return (checked("enableContextKeeper"));
+    case "contextKeeperAutoCapture": return (checked("contextKeeperAutoCapture", true));
+    case "contextKeeperAutoSensitivity": return (["strict", "balanced", "broad"].includes(value("contextKeeperAutoSensitivity")) ? value("contextKeeperAutoSensitivity") : "balanced");
+    case "contextKeeperAutoEveryMessages": return (Math.max(1, Math.min(20, Number(value("contextKeeperAutoEveryMessages", "4")) || 4)));
+    case "contextKeeperAutoMaxDetails": return (Math.max(20, Math.min(300, Number(value("contextKeeperAutoMaxDetails", "120")) || 120)));
+    case "contextKeeperMessageButtons": return (checked("contextKeeperMessageButtons"));
+    case "enableSelectionRemember": return (checked("enableSelectionRemember"));
+    case "contextKeeperRecapSize": return (["compact", "balanced", "full"].includes(value("contextKeeperRecapSize")) ? value("contextKeeperRecapSize") : "balanced");
+    case "enableStoryDayTracker": return (checked("enableStoryDayTracker"));
+    case "storyDayTrackerMode": return (["manual", "conservative", "assisted"].includes(value("storyDayTrackerMode")) ? value("storyDayTrackerMode") : "conservative");
+    case "storyDayTrackerIncludeInContext": return (checked("storyDayTrackerIncludeInContext", true));
+    case "storyDayTrackerShowQuickPanel": return (checked("storyDayTrackerShowQuickPanel", true));
+    case "enableRpStateTracker": return (checked("enableRpStateTracker"));
+    case "rpStateTrackerMode": return (["manual", "conservative", "assisted"].includes(value("rpStateTrackerMode")) ? value("rpStateTrackerMode") : "conservative");
+    case "rpStateInjectMode": return (["manual", "changed", "every"].includes(value("rpStateInjectMode")) ? value("rpStateInjectMode") : "changed");
+    case "rpStateMaxContextChars": return (Math.max(300, Math.min(3000, Number(value("rpStateMaxContextChars", "1200")) || 1200)));
+    case "rpStateShowQuickPanel": return (checked("rpStateShowQuickPanel", true));
+    case "enableChatNudges": return (checked("enableChatNudges"));
+    case "chatNudgeDefaultHours": return ([5, 8, 24, 48, 168].includes(Number(value("chatNudgeDefaultHours", "24"))) ? Number(value("chatNudgeDefaultHours", "24")) : 24);
+    case "chatNudgeBrowserNotifications": return (checked("chatNudgeBrowserNotifications", true));
+    case "enableSoundscapes": return (checked("enableSoundscapes"));
+    case "soundscapeShowChatControl": return (checked("soundscapeShowChatControl", true));
+    case "soundscapeMasterVolume": return (Number.isFinite(Number(value("soundscapeMasterVolume", "65"))) ? Math.min(100, Math.max(0, Number(value("soundscapeMasterVolume", "65")))) : 65);
+    case "soundscapeOnChat": return (checked("soundscapeOnChat", true));
+    case "soundscapeOnHome": return (checked("soundscapeOnHome"));
+    case "soundscapeOnChats": return (checked("soundscapeOnChats"));
+    case "soundscapeOnProfiles": return (checked("soundscapeOnProfiles"));
+    case "soundscapeOnOther": return (checked("soundscapeOnOther"));
+    case "messageQuickActionCopy": return (checked("messageQuickActionCopy"));
+    case "messageQuickActionEdit": return (checked("messageQuickActionEdit"));
+    case "messageQuickActionRemoveImage": return (checked("messageQuickActionRemoveImage"));
+    case "messageQuickActionResend": return (checked("messageQuickActionResend"));
+    case "messageQuickActionConfirmRemoveImage": return (checked("messageQuickActionConfirmRemoveImage"));
+    case "messageQuickActionReport": return (checked("messageQuickActionReport"));
+    case "allowTypingWhileAiResponding": return (checked("allowTypingWhileAiResponding"));
+    case "keepChatPositionWhileTyping": return (checked("keepChatPositionWhileTyping"));
+    case "showScrollToTopButton": return (checked("showScrollToTopButton"));
+    case "showScrollToBottomButton": return (checked("showScrollToBottomButton"));
+    case "scrollNavOnHome": return (checked("scrollNavOnHome", true));
+    case "scrollNavOnChats": return (checked("scrollNavOnChats", true));
+    case "scrollNavOnChat": return (checked("scrollNavOnChat", true));
+    case "scrollNavOnCreation": return (checked("scrollNavOnCreation", true));
+    case "scrollNavOnProfiles": return (checked("scrollNavOnProfiles", true));
+    case "scrollNavOnOther": return (checked("scrollNavOnOther", true));
+    case "scrollTopLoadPreviousMessages": return (checked("scrollTopLoadPreviousMessages"));
+    case "scrollTopLoadPreviousMode": return (["one", "all"].includes(value("scrollTopLoadPreviousMode")) ? value("scrollTopLoadPreviousMode") : "all");
+    case "scrollTopLoadPreviousTiming": return (["before", "background"].includes(value("scrollTopLoadPreviousTiming")) ? value("scrollTopLoadPreviousTiming") : "before");
+    case "botArchiveRememberSeenPublic": return (checked("botArchiveRememberSeenPublic"));
+    case "botBackupToolsEnabled": return (checked("botBackupToolsEnabled"));
+    case "botArchiveOwnEditorBackups": return (checked("botArchiveOwnEditorBackups"));
+    case "lorebookBackupToolsEnabled": return (checked("lorebookBackupToolsEnabled"));
+    case "lorebookBackupsEnabled": return (checked("lorebookBackupsEnabled"));
+    case "botArchiveOwnRevisionLimit": return (Math.max(1, Math.min(50, Number(value("botArchiveOwnRevisionLimit", "10")) || 10)));
+    case "botArchiveOnProfileVisit": return (checked("botArchiveOnProfileVisit"));
+    case "botArchiveOnChatOpen": return (checked("botArchiveOnChatOpen"));
+    case "botArchiveRefreshHours": return ([6, 24, 72, 168].includes(Number(value("botArchiveRefreshHours"))) ? Number(value("botArchiveRefreshHours")) : 24);
+    case "protectDraftDuringMessageRemoval": return (checked("protectDraftDuringMessageRemoval"));
+    case "failedMessageHelper": return (checked("failedMessageHelper"));
+    case "autoRetryFailedMessageSends": return (checked("autoRetryFailedMessageSends"));
+    case "chatPerformanceMode": return (checked("chatPerformanceMode"));
+    case "runtimePerformanceMode": return (["normal", "adaptive", "aggressive", "maximum"].includes(value("runtimePerformanceMode")) ? value("runtimePerformanceMode") : "adaptive");
+    case "desktopAppPerformanceGuard": return (checked("desktopAppPerformanceGuard", true));
+    case "pauseQolInHiddenTabs": return (checked("pauseQolInHiddenTabs"));
+    case "autoPerformanceLargeChats": return (checked("autoPerformanceLargeChats"));
+    case "largeChatPerformanceThreshold": return (Math.max(100, Math.min(5000, Number(value("largeChatPerformanceThreshold", "500")) || 500)));
+    case "deferQolWhileTyping": return (checked("deferQolWhileTyping"));
+    case "pauseQolWhileMessageEditing": return (checked("pauseQolWhileMessageEditing", true));
+    case "reduceQolAnimations": return (checked("reduceQolAnimations"));
+    case "reduceOptionsAnimations": return (checked("reduceOptionsAnimations"));
+    case "settingsNavigationStyle": return (["classic", "grouped"].includes(value("settingsNavigationStyle")) ? value("settingsNavigationStyle") : "classic");
+    case "settingsContentLayout": return (["single", "adaptive"].includes(value("settingsContentLayout")) ? value("settingsContentLayout") : "single");
+    case "settingsPageWidth": return (["comfortable", "wide"].includes(value("settingsPageWidth")) ? value("settingsPageWidth") : "comfortable");
+    case "collapseSettingsSectionsByDefault": return (checked("collapseSettingsSectionsByDefault"));
+    case "featureIndexCollapsedCategories": return normalizeFeatureIndexCollapsedCategories(loadedSettingsSnapshot.featureIndexCollapsedCategories);
+    case "enableCommandPalette": return (checked("enableCommandPalette", false));
+    case "commandPaletteShortcut": return (["ctrl-k", "ctrl-shift-k", "alt-k", "off"].includes(value("commandPaletteShortcut")) ? value("commandPaletteShortcut") : "ctrl-k");
+    case "commandPaletteShowSavedItems": return (checked("commandPaletteShowSavedItems", true));
+    case "deepSleepDisabledFeatures": return (checked("deepSleepDisabledFeatures", true));
+    case "performanceDiagnostics": return (checked("performanceDiagnostics"));
+    case "enableLocalChangeHistory": return (checked("enableLocalChangeHistory"));
+    case "showUpdateNotifications": return (checked("showUpdateNotifications", false));
+    case "androidAppControlsMode": return (["auto", "android", "always", "off"].includes(value("androidAppControlsMode")) ? value("androidAppControlsMode") : "auto");
+    case "androidTopBarMenu": return (checked("androidTopBarMenu"));
+    case "androidHideComposerShortcuts": return (checked("androidHideComposerShortcuts", true));
+    case "androidTopBarOoc": return (checked("androidTopBarOoc", true));
+    case "androidTopBarAsterisk": return (checked("androidTopBarAsterisk", true));
+    case "androidTopBarFormatting": return (checked("androidTopBarFormatting", true));
+    case "androidTopBarTranslation": return (checked("androidTopBarTranslation"));
+    case "androidTopBarScroll": return (checked("androidTopBarScroll", true));
+    case "androidTopBarPersona": return (checked("androidTopBarPersona", true));
+    case "androidTopBarModel": return (checked("androidTopBarModel", true));
+    case "showChatExportButton": return (checked("showChatExportButton"));
+    case "chatExportLoadPreviousMessages": return (checked("chatExportLoadPreviousMessages"));
+    case "chatExportHistoryMode": return (value("chatExportHistoryMode", "api"));
+    case "chatExportIncludeBotInfo": return (checked("chatExportIncludeBotInfo"));
+    case "chatExportIncludeOocDirectives": return (checked("chatExportIncludeOocDirectives"));
+    case "chatExportIncludeGenerationDetails": return (checked("chatExportIncludeGenerationDetails"));
+    case "chatExportNumberMessages": return (checked("chatExportNumberMessages"));
+    case "chatExportIncludeAvatars": return (checked("chatExportIncludeAvatars"));
+    case "chatExportDefaultFormat": return (value("chatExportDefaultFormat", "text"));
+    case "chatExportHtmlLayout": return (value("chatExportHtmlLayout", "bubbles"));
+    case "showOocTools": return (checked("showOocTools"));
+    case "oocTemplates": return oocTemplatesFromPage();
+    case "savePersonasFromPages": return (checked("savePersonasFromPages"));
+    case "keepLocalPersonaCopies": return (checked("keepLocalPersonaCopies"));
+    case "expandPersonaDescriptions": return (checked("expandPersonaDescriptions"));
+    case "enablePersonaOrganizer": return (checked("enablePersonaOrganizer"));
+    case "personaFolders": return (value("personaFolders", ""));
+    case "personaShowLocalMetaInPicker": return (checked("personaShowLocalMetaInPicker"));
+    case "showPersonaQuickSwitch": return (checked("showPersonaQuickSwitch"));
+    case "autoAcceptPersonaChange": return (checked("autoAcceptPersonaChange"));
+    case "personaQuickSwitchLimit": return (Math.max(1, Math.min(12, Number(value("personaQuickSwitchLimit", "6")) || 6)));
+    case "showQolSidebarButton": return (checked("showQolSidebarButton"));
+    case "qolSidebarButtonPlacement": return (value("qolSidebarButtonPlacement", "after-sai"));
+    case "hideSidebarLogo": return (checked("hideSidebarLogo"));
+    case "hideSidebarHome": return (checked("hideSidebarHome"));
+    case "hideSidebarChats": return (checked("hideSidebarChats"));
+    case "hideSidebarPersonas": return (checked("hideSidebarPersonas"));
+    case "hideSidebarCreateMenu": return (checked("hideSidebarCreateMenu"));
+    case "hideSidebarCreateChatbot": return (checked("hideSidebarCreateChatbot"));
+    case "hideSidebarCreateLorebook": return (checked("hideSidebarCreateLorebook"));
+    case "hideSidebarCreateGroup": return (checked("hideSidebarCreateGroup"));
+    case "hideSidebarCreateVoice": return (checked("hideSidebarCreateVoice"));
+    case "hideSidebarMyCreationsMenu": return (checked("hideSidebarMyCreationsMenu"));
+    case "hideSidebarMyChatbots": return (checked("hideSidebarMyChatbots"));
+    case "hideSidebarMyLorebooks": return (checked("hideSidebarMyLorebooks"));
+    case "hideSidebarMyGroups": return (checked("hideSidebarMyGroups"));
+    case "hideSidebarMyVoices": return (checked("hideSidebarMyVoices"));
+    case "hideSidebarFavorites": return (checked("hideSidebarFavorites"));
+    case "hideSidebarRecommendations": return (checked("hideSidebarRecommendations"));
+    case "hideSidebarLeaderboard": return (checked("hideSidebarLeaderboard"));
+    case "hideSidebarBlockedCreators": return (checked("hideSidebarBlockedCreators"));
+    case "hideSidebarSubscribe": return (checked("hideSidebarSubscribe"));
+    case "hideSidebarHelp": return (checked("hideSidebarHelp"));
+    case "hideSidebarSocialLinks": return (false);
+    case "hideSidebarSocialDiscord": return (checked("hideSidebarSocialDiscord"));
+    case "hideSidebarSocialX": return (checked("hideSidebarSocialX"));
+    case "hideSidebarSocialReddit": return (checked("hideSidebarSocialReddit"));
+    case "hideSidebarFooterLinks": return (false);
+    case "hideSidebarFooterTerms": return (checked("hideSidebarFooterTerms"));
+    case "hideSidebarFooterPrivacy": return (checked("hideSidebarFooterPrivacy"));
+    case "hideSidebarFooterRefunds": return (checked("hideSidebarFooterRefunds"));
+    case "hideSidebarFooterReporting": return (checked("hideSidebarFooterReporting"));
+    case "hideSidebarFooterGuidelines": return (checked("hideSidebarFooterGuidelines"));
+    case "hideSidebarFooterSupport": return (checked("hideSidebarFooterSupport"));
+    case "hideSidebarFooterAffiliates": return (checked("hideSidebarFooterAffiliates"));
+    case "hideSidebarAppDownload": return (false);
+    case "hideSidebarAppDownloadGooglePlay": return (checked("hideSidebarAppDownloadGooglePlay"));
+    case "hideSidebarAppDownloadAppStore": return (checked("hideSidebarAppDownloadAppStore"));
+    case "hideSidebarAppDownloadGeneric": return (checked("hideSidebarAppDownloadGeneric"));
+    case "hideSidebarWebVersion": return (checked("hideSidebarWebVersion"));
+    case "hideSidebarSignOut": return (checked("hideSidebarSignOut"));
+    case "enableMainFooterManagement": return (checked("enableMainFooterManagement"));
+    case "hideMainFooterEntirely": return (checked("hideMainFooterEntirely"));
+    case "hideMainFooterCompany": return (checked("hideMainFooterCompany"));
+    case "hideMainFooterResources": return (checked("hideMainFooterResources"));
+    case "hideMainFooterCommunity": return (checked("hideMainFooterCommunity"));
+    case "hideMainFooterJoinUs": return (checked("hideMainFooterJoinUs"));
+    case "hideMainFooterAppDownload": return (checked("hideMainFooterAppDownload"));
+    case "hideMainFooter2257": return (checked("hideMainFooter2257"));
+    case "blockCards": return (checked("blockCards"));
+    case "hideHomeForYouCards": return (checked("hideHomeForYouCards"));
+    case "expandLongCardDescriptions": return (checked("expandLongCardDescriptions"));
+    case "showCardGreetingTokenInfo": return (checked("showCardGreetingTokenInfo"));
+    case "showExactMessageCounts": return (checked("showExactMessageCounts"));
+    case "showBotCreationDates": return (checked("showBotCreationDates"));
+    case "expandBotNamesOnHover": return (checked("expandBotNamesOnHover"));
+    case "cardTokenShowGreeting": return (checked("cardTokenShowGreeting", true));
+    case "cardTokenShowDescription": return (false);
+    case "cardTokenShowPersonality": return (checked("cardTokenShowPersonality"));
+    case "cardTokenShowScenario": return (checked("cardTokenShowScenario"));
+    case "cardTokenShowExamples": return (checked("cardTokenShowExamples"));
+    case "cardTokenShowCombined": return (false);
+    case "hideGroupChats": return (checked("hideGroupChats"));
+    case "showLorebookFilters": return (checked("showLorebookFilters"));
+    case "enableSmartFilterPresets": return (checked("enableSmartFilterPresets"));
+    case "enableCreationAudit": return (checked("enableCreationAudit"));
+    case "creationAuditQuickStatus": return (checked("creationAuditQuickStatus"));
+    case "enableCreatorWritingAssistant": return (checked("enableCreatorWritingAssistant"));
+    case "creatorWritingUseBrowserAi": return (checked("creatorWritingUseBrowserAi"));
+    case "creatorWritingDictionary": return (value("creatorWritingDictionary"));
+    case "creatorWritingTargetLanguage": return (value("creatorWritingTargetLanguage", "English"));
+    case "enableProfileExport": return (checked("enableProfileExport"));
+    case "enableMyCreationsFilters": return (checked("enableMyCreationsFilters"));
+    case "rememberMyCreationsView": return (checked("rememberMyCreationsView"));
+    case "autoLoadMyCreations": return (checked("autoLoadMyCreations"));
+    case "myCreationsAutoLoadPages": return (Math.max(1, Math.min(30, Number(value("myCreationsAutoLoadPages", "1")) || 1)));
+    case "enableRecommendationHelpers": return (checked("enableRecommendationHelpers"));
+    case "recommendationHideLaterBots": return (checked("recommendationHideLaterBots"));
+    case "recommendationHideNotInterested": return (checked("recommendationHideNotInterested"));
+    case "recommendationPreferFavoriteCreators": return (checked("recommendationPreferFavoriteCreators"));
+    case "recommendationPreferredTags": return (value("recommendationPreferredTags"));
+    case "recommendationAvoidTags": return (value("recommendationAvoidTags"));
+    case "recommendationShowReasonBadges": return (checked("recommendationShowReasonBadges"));
+    case "recommendationHideFavoriteBots": return (checked("recommendationHideFavoriteBots"));
+    case "recommendationHideOwnBots": return (checked("recommendationHideOwnBots"));
+    case "recommendationOnlyUnopened": return (checked("recommendationOnlyUnopened"));
+    case "recommendationOnlyLorebook": return (checked("recommendationOnlyLorebook"));
+    case "recommendationSessionHideButtons": return (checked("recommendationSessionHideButtons"));
+    case "recommendationRandomButton": return (checked("recommendationRandomButton"));
+    case "cardDensityMode": return (["normal", "compact", "dense"].includes(value("cardDensityMode")) ? value("cardDensityMode") : "normal");
+    case "cardClickBehavior": return (["default", "profile"].includes(value("cardClickBehavior")) ? value("cardClickBehavior") : "default");
+    case "showCopyBotInfoButtons": return (checked("showCopyBotInfoButtons"));
+    case "trackRecentlySeenBots": return (checked("trackRecentlySeenBots"));
+    case "showRecentlySeenButton": return (checked("showRecentlySeenButton"));
+    case "recentlySeenLimit": return (Math.max(10, Math.min(250, Number(value("recentlySeenLimit", "100")) || 100)));
+    case "enableBotComparison": return (checked("enableBotComparison"));
+    case "showQuickNotInterestedButtons": return (checked("showQuickNotInterestedButtons"));
+    case "showQuickLessLikeButtons": return (checked("showQuickLessLikeButtons"));
+    case "showQuickDislikeButtons": return (checked("showQuickDislikeButtons"));
+    case "showQuickUnblockButtons": return (checked("showQuickUnblockButtons"));
+    case "reduceAnimatedBotImages": return (checked("reduceAnimatedBotImages"));
+    case "animatedImageMode": return (["freeze", "once", "hover"].includes(value("animatedImageMode")) ? value("animatedImageMode") : "freeze");
+    case "animatedImagesListings": return (checked("animatedImagesListings"));
+    case "animatedImagesChats": return (checked("animatedImagesChats"));
+    case "animatedImagesProfiles": return (checked("animatedImagesProfiles"));
+    case "animatedImagesChatMedia": return (checked("animatedImagesChatMedia"));
+    case "replaceCardProfileWithBlockButton": return (checked("replaceCardProfileWithBlockButton"));
+    case "showBlockButtonOnMyCreations": return (checked("showBlockButtonOnMyCreations"));
+    case "enableBulkCardBlocking": return (checked("enableBulkCardBlocking"));
+    case "bulkCardBlockingSidebarLauncher": return (checked("bulkCardBlockingSidebarLauncher"));
+    case "quickDislikeOnBlock": return (false);
+    case "quickDislikeIdleEnabled": return (checked("quickDislikeOnBlock"));
+    case "quickDislikeIdleMinutes": return (Math.min(60, Math.max(1, Number(value("quickDislikeIdleMinutes", "5")) || 5)));
+    case "blockedBulkDislikeDelayMs": return (Math.min(10000, Math.max(250, Number(value("blockedBulkDislikeDelayMs", "750")) || 750)));
+    case "enableLanguageFilter": return (checked("enableLanguageFilter"));
+    case "allowedLanguages": return (getAllowedLanguages());
+    case "languageSelectionMode": return (["include", "exclude"].includes(value("languageSelectionMode")) ? value("languageSelectionMode") : "include");
+    case "languageFilterMode": return ("conservative");
+    case "languageAutoDetectUntagged": return (checked("languageAutoDetectUntagged"));
+    case "languageShowDetectedBadge": return (checked("languageShowDetectedBadge"));
+    case "blockedTags": return (linesToArray(value("blockedTags")));
+    case "blockedWords": return (linesToArray(value("blockedWords")));
+    case "blockedCreators": return (linesToArray(value("blockedCreators")));
+    case "blockedBotIds": return (uniqueClean(blockingDataLoaded ? blockedState.ids : (loadedSettingsSnapshot.blockedBotIds || [])));
+    case "blockedBotNames": return (uniqueClean(blockingDataLoaded ? blockedState.names : (loadedSettingsSnapshot.blockedBotNames || [])));
+    case "blockedBotSortMode": return (getBotSortMode("blocked"));
+    case "hiddenCardMode": return (value("hiddenCardMode", "hide"));
+    case "autoLoadAllOpenedChats": return (false);
+    case "deepImportMaxPages": return (80);
+    case "showBlockCurrentBotButton": return (false);
+    case "enablePersonalUsageSummary": return (checked("enablePersonalUsageSummary"));
+    case "debug": return (checked("debug"));
+    case "textNormalizationEnabled": return (checked("textNormalizationEnabled"));
+    case "normalizeFancyUnicode": return (checked("normalizeFancyUnicode"));
+    case "normalizePunctuation": return (checked("normalizePunctuation"));
+    case "normalizeInvisibleCharacters": return (checked("normalizeInvisibleCharacters"));
+    case "normalizeDecorativeSymbols": return (checked("normalizeDecorativeSymbols"));
+    default: return SETTINGS_AUTOSAVE_MISSING;
+  }
+}
+
+function autosaveSettingKeysForControl(control) {
+  if (!(control instanceof Element)) return [];
+  if (control.classList?.contains("allowed-language")) return ["allowedLanguages"];
+  if (control.matches?.("input[name='autoAfkAction']")) return ["autoAfkAction"];
+  const id = String(control.id || "").trim();
+  if (!id) return [];
+  if (id === "quickDislikeOnBlock") return ["quickDislikeIdleEnabled"];
+  if (id === "chatBubbleAiActionMode" || id === "chatBubbleUserActionMode") return [id, "chatBubblePreserveActionColors"];
+  return readSingleSettingFromPage(id) === SETTINGS_AUTOSAVE_MISSING ? [] : [id];
+}
+
+function setAutosaveStatus(text = "", state = "") {
+  const status = $("status");
+  if (!status) return;
+  status.textContent = text;
+  if (state) status.dataset.state = state;
+  else delete status.dataset.state;
+}
+
+function autosaveDelayForControl(control, eventType = "change") {
+  if (eventType === "change") return 80;
+  if (control?.matches?.("textarea")) return 900;
+  if (control?.matches?.("input[type='text'], input[type='search'], input[type='url'], input[type='password']")) return 700;
+  if (control?.matches?.("input[type='number']")) return 450;
+  if (control?.matches?.("input[type='range']")) return 220;
+  return 350;
+}
+
+function queueSettingsAutosaveValue(settingKey, nextValue, { delay = 350 } = {}) {
+  const key = String(settingKey || "").trim();
+  if (!key || !settingsAutosaveReady) return;
+  const pendingValue = settingsAutosavePending.has(key) ? settingsAutosavePending.get(key) : loadedSettingsSnapshot[key];
+  if (storageValueMatches(pendingValue, nextValue)) return;
+  const originalValue = settingsAutosavePrevious.has(key) ? settingsAutosavePrevious.get(key) : loadedSettingsSnapshot[key];
+  if (storageValueMatches(originalValue, nextValue)) {
+    settingsAutosavePending.delete(key);
+    settingsAutosavePrevious.delete(key);
+    loadedSettingsSnapshot = { ...loadedSettingsSnapshot, [key]: nextValue };
+    if (!settingsAutosavePending.size) { clearTimeout(settingsAutosaveTimer); settingsAutosaveTimer = 0; setAutosaveStatus("Saved automatically", "saved"); }
+    return;
+  }
+  if (!settingsAutosavePrevious.has(key)) settingsAutosavePrevious.set(key, loadedSettingsSnapshot[key]);
+  settingsAutosavePending.set(key, nextValue);
+  // Optimistic in-memory update keeps dependent previews/collapse state in sync
+  // while the tiny debounced storage write is waiting to flush.
+  loadedSettingsSnapshot = { ...loadedSettingsSnapshot, [key]: nextValue };
+  clearTimeout(settingsAutosaveTimer);
+  setAutosaveStatus("Saving automatically…", "saving");
+  settingsAutosaveTimer = setTimeout(() => flushSettingsAutosave().catch(() => {}), Math.max(0, Number(delay) || 0));
+}
+
+function queueSettingsAutosaveForControl(control, eventType = "change") {
+  if (!settingsAutosaveReady) return;
+  const keys = autosaveSettingKeysForControl(control);
+  if (!keys.length) return;
+  for (const key of keys) {
+    const next = readSingleSettingFromPage(key);
+    if (next !== SETTINGS_AUTOSAVE_MISSING) queueSettingsAutosaveValue(key, next, { delay: autosaveDelayForControl(control, eventType) });
+  }
+}
+
+function queueFullSettingsDiffFromPage({ delay = 0 } = {}) {
+  const current = readSettingsFromPage();
+  for (const [key, next] of Object.entries(current)) {
+    if (storageValueMatches(loadedSettingsSnapshot[key], next)) continue;
+    queueSettingsAutosaveValue(key, next, { delay });
+  }
+}
+
+function queueSettingsDiffForContainer(container, { delay = 80 } = {}) {
+  if (!settingsAutosaveReady || !(container instanceof Element)) return;
+  const keys = new Set();
+  container.querySelectorAll("input, select, textarea").forEach(control => {
+    autosaveSettingKeysForControl(control).forEach(key => keys.add(key));
+  });
+  for (const key of keys) {
+    const next = readSingleSettingFromPage(key);
+    if (next === SETTINGS_AUTOSAVE_MISSING || storageValueMatches(loadedSettingsSnapshot[key], next)) continue;
+    queueSettingsAutosaveValue(key, next, { delay });
+  }
+}
+
+async function persistGranularSettingsPatch(patch, previous = {}, { verify = false } = {}) {
+  const entries = Object.entries(patch || {}).filter(([name]) => String(name || "").trim());
+  if (!entries.length) return true;
+  const payload = {};
+  let indexChanged = false;
+  for (const [name, next] of entries) {
+    payload[granularSettingStorageKey(name)] = next;
+    if (!granularSettingsIndexCache.has(name)) { granularSettingsIndexCache.add(name); indexChanged = true; }
+  }
+  if (indexChanged || !granularSettingsMigrationSeen) payload[GRANULAR_SETTINGS_INDEX_KEY] = [...granularSettingsIndexCache].sort();
+  payload[GRANULAR_SETTINGS_MIGRATION_KEY] = true;
+  payload[GRANULAR_SETTINGS_REVISION_KEY] = Date.now();
+  payload[GRANULAR_SETTINGS_LAST_BATCH_KEY] = {
+    at: Date.now(),
+    previous: Object.fromEntries(entries.map(([name]) => [name, previous[name]]))
+  };
+  const ok = await rawStorageSet(payload);
+  if (!ok) return false;
+  granularSettingsMigrationSeen = true;
+  if (!verify) return true;
+  const keys = entries.map(([name]) => granularSettingStorageKey(name));
+  const readback = await new Promise(resolve => {
+    try { chrome.storage.local.get(keys, result => resolve(chrome.runtime.lastError ? {} : (result || {}))); }
+    catch { resolve({}); }
+  });
+  return entries.every(([name, expected]) => storageValueMatches(readback[granularSettingStorageKey(name)], expected));
+}
+
+async function flushSettingsAutosave({ force = false } = {}) {
+  clearTimeout(settingsAutosaveTimer);
+  settingsAutosaveTimer = 0;
+  if (settingsAutosaveFlushPromise) {
+    await settingsAutosaveFlushPromise;
+    if (!settingsAutosavePending.size) return true;
+  }
+  if (!settingsAutosavePending.size) {
+    if (force) setAutosaveStatus("Saved automatically", "saved");
+    return true;
+  }
+  const patch = Object.fromEntries(settingsAutosavePending);
+  const previous = Object.fromEntries([...settingsAutosavePending.keys()].map(key => [key, settingsAutosavePrevious.get(key)]));
+  settingsAutosavePending.clear();
+  settingsAutosavePrevious.clear();
+  settingsAutosaveFlushPromise = (async () => {
+    setAutosaveStatus(force ? "Saving now…" : "Saving automatically…", "saving");
+    const ok = await persistGranularSettingsPatch(patch, previous, { verify: force });
+    if (!ok) {
+      for (const [key, value] of Object.entries(patch)) {
+        if (settingsAutosavePending.has(key)) {
+          // A newer edit arrived while this failed batch was in flight. Keep
+          // the newer value, but roll its safety baseline back to the value
+          // that was actually persisted before this failed batch.
+          settingsAutosavePrevious.set(key, previous[key]);
+          continue;
+        }
+        settingsAutosavePrevious.set(key, previous[key]);
+        settingsAutosavePending.set(key, value);
+      }
+      setAutosaveStatus("Couldn’t save — press Save now to retry", "error");
+      return false;
+    }
+    // Do not let an older in-flight batch overwrite a newer optimistic edit
+    // that was queued while this write was awaiting Chrome storage.
+    const nextSnapshot = { ...loadedSettingsSnapshot };
+    for (const [key, value] of Object.entries(patch)) {
+      if (!settingsAutosavePending.has(key)) nextSnapshot[key] = value;
+    }
+    loadedSettingsSnapshot = nextSnapshot;
+    applyOptionsPerformancePreferences(loadedSettingsSnapshot);
+    applyOptionsAccessibilityPreview(loadedSettingsSnapshot);
+    setAutosaveStatus("Saved automatically", "saved");
+    return true;
+  })();
+  const ok = await settingsAutosaveFlushPromise;
+  settingsAutosaveFlushPromise = null;
+  if (settingsAutosavePending.size && !settingsAutosaveTimer) settingsAutosaveTimer = setTimeout(() => flushSettingsAutosave().catch(() => {}), 120);
+  return ok;
+}
+
+function queueAuxiliaryOptionsSave(kind, delay = 700) {
+  if (!settingsAutosaveReady) return;
+  auxiliaryOptionsSavePending.add(kind);
+  clearTimeout(auxiliaryOptionsSaveTimer);
+  auxiliaryOptionsSaveTimer = setTimeout(() => flushAuxiliaryOptionsSave().catch(() => {}), delay);
+}
+
+async function flushAuxiliaryOptionsSave() {
+  clearTimeout(auxiliaryOptionsSaveTimer);
+  auxiliaryOptionsSaveTimer = 0;
+  if (!auxiliaryOptionsSavePending.size) return true;
+  const kinds = new Set(auxiliaryOptionsSavePending);
+  auxiliaryOptionsSavePending.clear();
+  const payload = {};
+  if (kinds.has("ooc")) payload[OOC_TEMPLATES_KEY] = oocTemplatesFromPage();
+  if (kinds.has("creatorWebhook")) {
+    creatorBotWebhookState = normalizeCreatorBotWebhookConfig({
+      enabled: checked("creatorBotDiscordWebhookEnabled"),
+      url: value("creatorBotDiscordWebhookUrl", "")
+    });
+    payload[CREATOR_BOT_WEBHOOK_KEY] = creatorBotWebhookState;
+  }
+  if (!Object.keys(payload).length) return true;
+  const ok = await rawStorageSet(payload);
+  if (!ok) setAutosaveStatus("Couldn’t save — press Save now to retry", "error");
+  return ok;
+}
+
+function setupSettingsAutosave() {
+  const saveButton = $("save");
+  if (saveButton) {
+    saveButton.textContent = "Save now";
+    saveButton.title = "Settings save automatically. Use Save now to force and verify any pending changes.";
+  }
+  document.addEventListener("input", event => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    if (target.matches?.(".ooc-template-name, .ooc-template-text")) { queueAuxiliaryOptionsSave("ooc", 900); return; }
+    if (target.id === "creatorBotDiscordWebhookUrl") { queueAuxiliaryOptionsSave("creatorWebhook", 900); return; }
+    queueSettingsAutosaveForControl(target, "input");
+  });
+  document.addEventListener("change", event => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    if (target.id === "creatorBotDiscordWebhookEnabled" || target.id === "creatorBotDiscordWebhookUrl") { queueAuxiliaryOptionsSave("creatorWebhook", 80); return; }
+    queueSettingsAutosaveForControl(target, "change");
+    // Some parent controls programmatically toggle a dependent checkbox. Recheck
+    // only this Settings card after the event instead of rescanning the page.
+    const card = target.closest?.(".card");
+    if (card) setTimeout(() => queueSettingsDiffForContainer(card, { delay: 90 }), 0);
+  });
+  document.addEventListener("click", event => {
+    const button = event.target instanceof Element ? event.target.closest?.("button") : null;
+    if (!button) return;
+    if (button.id === "addOocTemplate" || button.classList.contains("ooc-template-remove") || button.classList.contains("ooc-template-append-hard")) {
+      setTimeout(() => queueAuxiliaryOptionsSave("ooc", 80), 0);
+    }
+    if (button.matches?.("[data-chat-bubble-preset], [data-context-keeper-preset], .settings-card-reset")) {
+      const card = button.closest?.(".card");
+      setTimeout(() => card
+        ? queueSettingsDiffForContainer(card, { delay: 60 })
+        : queueFullSettingsDiffFromPage({ delay: 60 }), 0);
+      return;
+    }
+    // Button-driven helpers often update controls directly (presets, list
+    // editors, clear/ignore actions). Reconcile just their containing card so
+    // those changes autosave too without a full-page settings scan.
+    const card = button.closest?.(".card");
+    if (card && button.id !== "save") setTimeout(() => queueSettingsDiffForContainer(card, { delay: 90 }), 0);
+  });
+  window.addEventListener("pagehide", () => {
+    clearTimeout(settingsAutosaveTimer);
+    clearTimeout(auxiliaryOptionsSaveTimer);
+    if (settingsAutosavePending.size) {
+      // pagehide cannot reliably await promises, but chrome.storage.set is still
+      // issued immediately with the tiny pending patch.
+      const patch = Object.fromEntries(settingsAutosavePending);
+      const previous = Object.fromEntries([...settingsAutosavePending.keys()].map(key => [key, settingsAutosavePrevious.get(key)]));
+      persistGranularSettingsPatch(patch, previous).catch(() => {});
+      settingsAutosavePending.clear();
+      settingsAutosavePrevious.clear();
+    }
+    if (auxiliaryOptionsSavePending.size) flushAuxiliaryOptionsSave().catch(() => {});
+  });
+}
+
+
 
 function hexRgb(value) {
   const match = /^#([0-9a-f]{6})$/i.exec(String(value || "").trim());
@@ -15668,27 +16850,27 @@ function applyBubblePreset(name) {
     if (enabled) enabled.checked = false;
   }
   updateAppearanceColorControlStates();
+  if (settingsAutosaveReady) {
+    const card = $("enableChatBubbleCustomization")?.closest?.(".card");
+    if (card) queueSettingsDiffForContainer(card, { delay: 60 });
+  }
   showSettingsToast(name === "default"
-    ? "SpicyChat bubble styling restored. Press Save settings to apply it."
-    : `Chat bubble preset: ${name}. Press Save settings to apply it.`);
+    ? "SpicyChat bubble styling restored. Changes save automatically."
+    : `Chat bubble preset: ${name}. Changes save automatically.`);
 }
 
 async function save() {
   await flushSoundscapeSceneState();
-  const settings = readSettingsFromPage();
-  creatorBotWebhookState = normalizeCreatorBotWebhookConfig({
-    enabled: checked("creatorBotDiscordWebhookEnabled"),
-    url: value("creatorBotDiscordWebhookUrl", "")
-  });
-  const payload = {
-    settings,
-    [OOC_TEMPLATES_KEY]: settings.oocTemplates,
-    [CREATOR_BOT_WEBHOOK_KEY]: creatorBotWebhookState
-  };
+  // Save now is the safety/fallback path. Normal interaction never scans the
+  // entire page; this explicit button intentionally performs one full diff,
+  // then verifies only the settings that actually changed.
+  queueFullSettingsDiffFromPage({ delay: 0 });
+  const settingsOk = await flushSettingsAutosave({ force: true });
+  await flushAuxiliaryOptionsSave();
 
-  // Large saved lists can contain thousands of entries. Older builds rewrote
-  // every list and metadata map on every Settings save, even when the user
-  // only changed one checkbox. Only write managers that were actually edited.
+  const payload = {};
+  // Large saved lists can contain thousands of entries. Only write managers
+  // that were actually edited instead of rebuilding unrelated stores.
   if (dirtySavedStores.has("blocked")) payload[BLOCKED_BOTS_KEY] = blockedState;
   if (dirtySavedStores.has("notInterested")) payload[NOT_INTERESTED_KEY] = notInterestedState;
   if (dirtySavedStores.has("favoriteCreators")) payload[FAVORITE_CREATORS_KEY] = normalizeCreatorStore(favoriteCreatorState);
@@ -15701,16 +16883,13 @@ async function save() {
     payload[OPENED_META_KEY] = normalizeMetaStore(openedChatMetaState);
   }
 
-  const status = $("status");
-  if (status) status.textContent = "Saving...";
-
-  await storageSet(payload);
-  dirtySavedStores.clear();
-
-  if (status) {
-    status.textContent = "Saved.";
-    setTimeout(() => { status.textContent = ""; }, 1200);
-  }
+  let storesOk = true;
+  if (Object.keys(payload).length) storesOk = await rawStorageSet(payload);
+  if (storesOk) dirtySavedStores.clear();
+  const ok = settingsOk && storesOk;
+  setAutosaveStatus(ok ? "Saved and verified." : "Couldn’t save — try again", ok ? "saved" : "error");
+  if (ok) setTimeout(() => { if ($("status")?.textContent === "Saved and verified.") setAutosaveStatus("Saved automatically", "saved"); }, 1400);
+  return ok;
 }
 
 async function clearOpened() {
@@ -15850,7 +17029,8 @@ function buildExportPayload(scopes, result) {
     _qolBackup: {
       formatVersion: BACKUP_FORMAT_VERSION,
       extensionVersion: chrome.runtime.getManifest()?.version || "",
-      exportedAt: new Date().toISOString()
+      exportedAt: new Date().toISOString(),
+      ...(PLATFORM_API?.backupMetadata?.(PLATFORM_API.detectEnvironment?.()) || {})
     }
   };
 
@@ -16325,7 +17505,7 @@ function renderModerationTermManager() {
       const key = item.word.toLowerCase();
       if (next.has(key)) next.delete(key); else next.add(key);
       setModerationIgnoredSet(next);
-      showSettingsToast(`${item.word}: ${isIgnored ? "enabled" : "ignored locally"}. Press Save settings to apply it.`);
+      showSettingsToast(`${item.word}: ${isIgnored ? "enabled" : "ignored locally"}. Changes save automatically.`);
     });
     actions.appendChild(toggle);
     if (item.custom) {
@@ -16335,7 +17515,7 @@ function renderModerationTermManager() {
         const box = $("creatorModerationWarningCustomTerms");
         if (box) box.value = serializeCustomModerationTerms(remaining);
         renderModerationTermManager();
-        showSettingsToast(`${item.word}: custom warning removed. Press Save settings to apply it.`);
+        showSettingsToast(`${item.word}: custom warning removed. Changes save automatically.`);
       });
       actions.appendChild(remove);
     }
@@ -16352,7 +17532,7 @@ function setupModerationTermManager() {
     const box = $("creatorModerationWarningIgnoredTerms");
     if (box) box.value = "";
     renderModerationTermManager();
-    showSettingsToast("Local moderation-warning ignores cleared. Press Save settings to apply it.");
+    showSettingsToast("Local moderation-warning ignores cleared. Changes save automatically.");
   });
   $("addModerationCustomTerm")?.addEventListener("click", () => {
     const termInput = $("moderationCustomTerm");
@@ -16367,7 +17547,7 @@ function setupModerationTermManager() {
     if (box) box.value = serializeCustomModerationTerms(current);
     if (termInput) termInput.value = "";
     renderModerationTermManager();
-    showSettingsToast(`${term}: custom warning added. Press Save settings to apply it.`);
+    showSettingsToast(`${term}: custom warning added. Changes save automatically.`);
   });
   $("moderationCustomTerm")?.addEventListener("keydown", event => {
     if (event.key !== "Enter") return;
@@ -18333,7 +19513,7 @@ async function setupControlCenterView() {
 
 function setupControlCenterControls() {
   $("openCommandPaletteFromOptions")?.addEventListener("click", async () => {
-    await storageSet({ settings: readSettingsFromPage() });
+    await flushSettingsAutosave({ force: true });
     const status = $("commandPaletteStatus");
     const response = await runtimeMessage({ type: "DS_OPTIONS_OPEN_COMMAND_PALETTE" });
     if (status) status.textContent = response?.ok ? "Palette opened in the SpicyChat source tab." : (response?.error || "Open Settings from a SpicyChat tab first.");
@@ -18494,6 +19674,13 @@ async function copyDiagnostics({ returnOnly = false } = {}) {
     `S.AI compatibility enabled: ${settings.saiToolkitCompatibility ? "yes" : "no"}`,
     Number.isFinite(bytes) ? `QoL storage: ${(bytes / 1024).toFixed(1)} KB` : "QoL storage: unavailable",
     `Backup schema supported: v${BACKUP_FORMAT_VERSION}`,
+    (() => {
+      const platform = PLATFORM_API?.detectEnvironment?.() || detectSettingsEnvironment();
+      const desired = { ...DEFAULT_SETTINGS, ...(loadedSettingsSnapshot || settings) };
+      const compatibility = PLATFORM_API?.applyEffectiveSettings?.(desired, DEFAULT_SETTINGS, platform);
+      const dormantCount = Object.keys(compatibility?.dormant || {}).length;
+      return `QoL device compatibility: ${platform?.label || platform?.platform || "unknown"}; schema v${Number(PLATFORM_API?.schemaVersion || 0) || "unavailable"}; ${dormantCount} saved preference${dormantCount === 1 ? "" : "s"} inactive on this device`;
+    })(),
     (() => { const snap = normalizeRecoverySnapshot(result[RECOVERY_SNAPSHOT_KEY]); return snap ? `Recovery snapshot: yes (${snap.createdAt ? new Date(snap.createdAt).toISOString() : "unknown time"}; ${snap.reason})` : "Recovery snapshot: none"; })(),
     `Opened: ${countStoreItems(result[OPENED_KEY], "opened")}`,
     `Blocked: ${countStoreItems(result[BLOCKED_BOTS_KEY])}`,
@@ -19448,36 +20635,72 @@ function compareFeatureChronology(left, right) {
   return 0;
 }
 
-const FEATURE_INDEX_GROUP_STATE_KEY = "dsFeatureIndexGroupStateV1";
+const FEATURE_INDEX_LEGACY_GROUP_STATE_KEY = "dsFeatureIndexGroupStateV1";
+const FEATURE_INDEX_GROUP_IDS = Object.freeze({
+  "Setup & Compatibility": "setup-compatibility",
+  "Saved Lists & Bot Discovery": "saved-lists-discovery",
+  "Card & Listing Tools": "card-listing-tools",
+  "Chat Tools": "chat-tools",
+  "Creation Tools": "creation-tools",
+  "Creator Tools": "creator-tools",
+  "Interface Cleanup": "interface-cleanup",
+  "Data & Backup": "data-backup",
+  "Mobile / Android": "mobile-android",
+  "Advanced": "advanced",
+  "Planned": "planned"
+});
 
-function normalizeFeatureIndexGroupState(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  return Object.fromEntries(
-    Object.entries(value).filter(([key, state]) => String(key || "").trim() && typeof state === "boolean")
-  );
+function featureIndexGroupId(groupName) {
+  const name = String(groupName || "").trim();
+  return FEATURE_INDEX_GROUP_IDS[name] || name.toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function normalizeFeatureIndexCollapsedCategories(value) {
+  return [...new Set((Array.isArray(value) ? value : []).map(item => String(item || "").trim()).filter(Boolean))].sort();
 }
 
 function loadFeatureIndexGroupState() {
-  try {
-    return normalizeFeatureIndexGroupState(
-      JSON.parse(localStorage.getItem(FEATURE_INDEX_GROUP_STATE_KEY) || "{}")
-    );
-  } catch {
-    return {};
-  }
+  const collapsed = new Set(normalizeFeatureIndexCollapsedCategories(loadedSettingsSnapshot.featureIndexCollapsedCategories));
+  const state = {};
+  for (const [name, id] of Object.entries(FEATURE_INDEX_GROUP_IDS)) state[name] = !collapsed.has(id);
+  return state;
 }
 
 function saveFeatureIndexGroupState(state) {
-  const clean = normalizeFeatureIndexGroupState(state);
-  // Keep a synchronous mirror so a collapse survives even if Settings closes
-  // immediately after the click, while extension storage is the durable copy.
+  const collapsed = Object.entries(state || {})
+    .filter(([, open]) => open === false)
+    .map(([groupName]) => featureIndexGroupId(groupName))
+    .filter(Boolean)
+    .sort();
+  queueSettingsAutosaveValue("featureIndexCollapsedCategories", collapsed, { delay: 0 });
+}
+
+async function migrateLegacyFeatureIndexGroupState(groupOpenState) {
+  // An explicitly stored empty array means the user chose to leave every group
+  // open. Do not resurrect an older pre-v0.2.24 localStorage value over it.
+  if (granularSettingsIndexCache.has("featureIndexCollapsedCategories")) return false;
+  if (normalizeFeatureIndexCollapsedCategories(loadedSettingsSnapshot.featureIndexCollapsedCategories).length) return false;
+  let legacy = {};
   try {
-    localStorage.setItem(FEATURE_INDEX_GROUP_STATE_KEY, JSON.stringify(clean));
+    const local = JSON.parse(localStorage.getItem(FEATURE_INDEX_LEGACY_GROUP_STATE_KEY) || "{}");
+    if (local && typeof local === "object" && !Array.isArray(local)) legacy = { ...legacy, ...local };
   } catch {}
   try {
-    const pending = storageSet({ [FEATURE_INDEX_GROUP_STATE_KEY]: clean });
-    pending?.catch?.(() => {});
+    const stored = await storageGet([FEATURE_INDEX_LEGACY_GROUP_STATE_KEY]);
+    const value = stored?.[FEATURE_INDEX_LEGACY_GROUP_STATE_KEY];
+    if (value && typeof value === "object" && !Array.isArray(value)) legacy = { ...legacy, ...value };
   } catch {}
+  let changed = false;
+  for (const [name, open] of Object.entries(legacy)) {
+    if (typeof open !== "boolean") continue;
+    groupOpenState[name] = open;
+    changed = true;
+  }
+  if (!changed) return false;
+  saveFeatureIndexGroupState(groupOpenState);
+  try { localStorage.removeItem(FEATURE_INDEX_LEGACY_GROUP_STATE_KEY); } catch {}
+  storageRemove(FEATURE_INDEX_LEGACY_GROUP_STATE_KEY).catch?.(() => {});
+  return true;
 }
 
 function setupFeaturesIndex() {
@@ -19485,19 +20708,57 @@ function setupFeaturesIndex() {
   const search = $("featureIndexSearch");
   const category = $("featureIndexCategory");
   const status = $("featureIndexStatus");
+  const platformFilter = $("featureIndexPlatform");
   const sortMode = $("featureIndexSort");
   const summary = $("featureIndexSummary");
   if (!host || !search || !category || !summary) return;
 
   const clean = value => String(value || "").replace(/\s+/g, " ").trim();
   const registry = Array.isArray(window.SpicyChatQoLFeatureRegistry)
-    ? window.SpicyChatQoLFeatureRegistry.filter(entry => entry && entry.id && entry.name && entry.category)
+    ? window.SpicyChatQoLFeatureRegistry.filter(entry => entry && entry.id && entry.name && entry.category).map(entry => ({ ...entry }))
     : [];
+  if (!registry.some(entry => entry.id === "device-compatibility")) {
+    registry.push({
+      id: "device-compatibility",
+      name: "Device compatibility",
+      category: "Setup & Compatibility",
+      description: "Keeps desktop-only bulk/helper-tab preferences saved but dormant on Android while styles, editing tools and normal current-page features keep working where supported.",
+      builtIn: true,
+      target: "accountSyncCard",
+      added: "0.2.25",
+      aliases: ["android unsupported", "desktop only", "mobile compatibility", "dormant settings", "device support"]
+    });
+  }
+  if (!registry.some(entry => entry.id === "account-sync-foundation")) {
+    registry.push({
+      id: "account-sync-foundation",
+      name: "QoL Account & Sync",
+      category: "Data & Backup",
+      description: "Links this device to the QoL Cloudflare sync service, syncs logical settings automatically, supports one-use device link codes, and keeps unsupported Android preferences preserved instead of switching them off.",
+      builtIn: true,
+      target: "accountSyncCard",
+      added: "0.2.25",
+      aliases: ["account", "sync", "cloudflare", "devices", "automatic sync", "discord link"]
+    });
+  }
 
   const registryOrder = new Map(registry.map((entry, index) => [entry.id, index]));
   const categories = [...new Set(registry.map(entry => entry.category))];
   const groupOpenState = loadFeatureIndexGroupState();
-  let featureGroupStateHydrated = false;
+  let legacyFeatureGroupMigrationStarted = false;
+
+  function syncFeatureGroupStateFromSettings() {
+    const collapsed = new Set(normalizeFeatureIndexCollapsedCategories(loadedSettingsSnapshot.featureIndexCollapsedCategories));
+    for (const groupName of categories) groupOpenState[groupName] = !collapsed.has(featureIndexGroupId(groupName));
+  }
+
+  function maybeMigrateLegacyFeatureGroupState() {
+    if (!settingsAutosaveReady || legacyFeatureGroupMigrationStarted) return;
+    legacyFeatureGroupMigrationStarted = true;
+    migrateLegacyFeatureIndexGroupState(groupOpenState)
+      .then(migrated => { if (migrated) render(); })
+      .catch(() => {});
+  }
 
   function rememberRenderedFeatureGroups({ persist = false } = {}) {
     host.querySelectorAll("details.feature-index-group[data-feature-group]").forEach(section => {
@@ -19507,46 +20768,35 @@ function setupFeaturesIndex() {
     if (persist) saveFeatureIndexGroupState(groupOpenState);
   }
 
-  async function hydrateFeatureIndexGroupState() {
-    try {
-      const stored = normalizeFeatureIndexGroupState(
-        (await storageGet([FEATURE_INDEX_GROUP_STATE_KEY]))?.[FEATURE_INDEX_GROUP_STATE_KEY]
-      );
-      let changed = false;
-      for (const [groupName, open] of Object.entries(stored)) {
-        // The synchronous local mirror wins when both exist because it may
-        // contain a click made milliseconds before this async read finished.
-        if (Object.prototype.hasOwnProperty.call(groupOpenState, groupName)) continue;
-        groupOpenState[groupName] = open;
-        changed = true;
-      }
-      featureGroupStateHydrated = true;
-      if (changed) render();
-    } catch {
-      featureGroupStateHydrated = true;
-    }
-  }
-
   category.replaceChildren(
     makeElement("option", { text: "All categories", attrs: { value: "all" } }),
     ...categories.map(name => makeElement("option", { text: name, attrs: { value: name } }))
   );
 
   function featureSearchText(entry) {
-    return clean(`${entry.name} ${entry.category} ${entry.description || ""} ${(entry.aliases || []).join(" ")} ${entry.platform || ""} ${entry.maturity || ""}`).toLowerCase();
+    const compatibility = PLATFORM_API?.featureCompatibility?.(entry, PLATFORM_API.detectEnvironment?.()) || {};
+    return clean(`${entry.name} ${entry.category} ${entry.description || ""} ${(entry.aliases || []).join(" ")} ${entry.platform || ""} ${entry.maturity || ""} ${compatibility.label || ""} ${compatibility.reason || ""}`).toLowerCase();
   }
 
   function renderFeature(entry) {
     const state = featureRegistryState(entry);
-    const card = makeElement("article", { className: "feature-index-item feature-catalog-item" });
+    const compatibility = PLATFORM_API?.featureCompatibility?.(entry, PLATFORM_API.detectEnvironment?.()) || { supported: true, fullySupported: true, partial: false, label: entry.platform || "" };
+    const card = makeElement("article", { className: `feature-index-item feature-catalog-item${compatibility.fullySupported === false && !compatibility.partial ? " is-platform-unavailable" : ""}` });
     const main = makeElement("div", { className: "feature-index-main" }, [
       makeElement("div", { className: "feature-index-title", text: displayNormalizedSavedText(entry.name) }),
       makeElement("div", { className: "feature-index-description", text: entry.description || "" })
     ]);
     const badges = makeElement("div", { className: "feature-index-badges" });
-    badges.appendChild(makeElement("span", { className: `feature-index-state is-${state.key}`, text: state.label }));
+    const stateLabel = state.key === "on" && compatibility.fullySupported === false && !compatibility.partial
+      ? "On · inactive here"
+      : state.label;
+    badges.appendChild(makeElement("span", { className: `feature-index-state is-${state.key}`, text: stateLabel }));
     if (entry.maturity) badges.appendChild(makeElement("span", { className: "feature-badge feature-badge-muted", text: entry.maturity }));
-    if (entry.platform) badges.appendChild(makeElement("span", { className: "feature-badge feature-badge-muted", text: entry.platform }));
+    if (compatibility.label && compatibility.kind !== "all") {
+      const platformBadge = makeElement("span", { className: "feature-badge feature-badge-muted is-platform", text: compatibility.label });
+      if (compatibility.reason) platformBadge.title = compatibility.reason;
+      badges.appendChild(platformBadge);
+    } else if (entry.platform && compatibility.kind === "all") badges.appendChild(makeElement("span", { className: "feature-badge feature-badge-muted", text: entry.platform }));
     if (entry.updated) badges.appendChild(makeElement("span", { className: "feature-badge", text: `Updated ${displayReleaseVersion(entry.updated)}` }));
     else if (entry.added) badges.appendChild(makeElement("span", { className: "feature-badge", text: `Added ${displayReleaseVersion(entry.added)}` }));
 
@@ -19566,16 +20816,24 @@ function setupFeaturesIndex() {
 
   function render() {
     // Preserve the actual on-screen state before replacing filtered/sorted
-    // <details> nodes. This prevents unrelated setting changes from resetting
-    // a group that the user just collapsed.
+    // <details> nodes, then reconcile with the backed-up settings preference.
     rememberRenderedFeatureGroups();
+    syncFeatureGroupStateFromSettings();
+    maybeMigrateLegacyFeatureGroupState();
     const query = clean(search.value).toLowerCase();
     const wantedCategory = category.value || "all";
     const wantedStatus = status?.value || "all";
+    const wantedPlatform = platformFilter?.value || "all";
+    const platformEnvironment = PLATFORM_API?.detectEnvironment?.();
     const filtered = registry.filter(entry => {
       if (wantedCategory !== "all" && entry.category !== wantedCategory) return false;
       const state = featureRegistryState(entry);
       if (wantedStatus !== "all" && state.key !== wantedStatus) return false;
+      const compatibility = PLATFORM_API?.featureCompatibility?.(entry, platformEnvironment) || { fullySupported: true, partial: false, kind: "all", androidSupported: true };
+      if (wantedPlatform === "here" && compatibility.fullySupported === false && !compatibility.partial) return false;
+      if (wantedPlatform === "desktop-only" && compatibility.kind !== "desktop-only") return false;
+      if (wantedPlatform === "android" && compatibility.androidSupported !== true) return false;
+      if (wantedPlatform === "unavailable" && (compatibility.fullySupported !== false || compatibility.partial)) return false;
       if (query && !featureSearchText(entry).includes(query)) return false;
       return true;
     });
@@ -19591,7 +20849,13 @@ function setupFeaturesIndex() {
     const optional = registry.filter(entry => !entry.planned && !entry.builtIn && (entry.setting || entry.settings));
     const enabled = optional.filter(entry => featureRegistryState(entry).key === "on").length;
     const planned = registry.filter(entry => entry.planned).length;
-    summary.textContent = `${filtered.length} shown · ${enabled}/${optional.length} optional features on · ${planned} planned`;
+    const unavailableHere = PLATFORM_API
+      ? registry.filter(entry => {
+          const compatibility = PLATFORM_API.featureCompatibility?.(entry, PLATFORM_API.detectEnvironment?.()) || {};
+          return compatibility.fullySupported === false && !compatibility.partial;
+        }).length
+      : 0;
+    summary.textContent = `${filtered.length} shown · ${enabled}/${optional.length} optional features on · ${unavailableHere} unavailable here · ${planned} planned`;
 
     if (!filtered.length) {
       host.replaceChildren(makeElement("div", { className: "feature-index-empty", text: "No features match this filter." }));
@@ -19663,6 +20927,7 @@ function setupFeaturesIndex() {
   search.addEventListener("input", renderFeatureIndexDebounced);
   category.addEventListener("change", render);
   status?.addEventListener("change", render);
+  platformFilter?.addEventListener("change", render);
   sortMode?.addEventListener("change", render);
   document.addEventListener("change", event => {
     if (event.target?.matches?.("input[type='checkbox'], input[type='radio'], select")) render();
@@ -19672,7 +20937,6 @@ function setupFeaturesIndex() {
 
   DS_FEATURE_INDEX_REFRESH = render;
   render();
-  if (!featureGroupStateHydrated) hydrateFeatureIndexGroupState();
 }
 
 let DS_FEATURE_INDEX_REFRESH = null;
@@ -19779,7 +21043,7 @@ function updateSettingDependencies() {
           parent.dispatchEvent(new Event("change", { bubbles: true }));
           updateSettingDependencies();
           DS_FEATURE_INDEX_REFRESH?.();
-          showSettingsToast(`${group.name} enabled on this page. Press Save settings to keep the change.`);
+          showSettingsToast(`${group.name} enabled on this page. The change saves automatically.`);
         });
         const open = makeElement("button", { className: "setting-dependency-action", text: "Open parent", attrs: { type: "button" } });
         open.addEventListener("click", event => {
@@ -19986,13 +21250,14 @@ function setControlValue(id, next) {
   if (!el) return;
   if (el.type === "checkbox") el.checked = !!next;
   else el.value = String(next);
+  if (settingsAutosaveReady) queueSettingsAutosaveForControl(el, "change");
 }
 
 function resetBubbleField(id) {
   if (!(id in CHAT_BUBBLE_DEFAULTS)) return;
   setControlValue(id, CHAT_BUBBLE_DEFAULTS[id]);
   updateAppearanceColorControlStates();
-  showSettingsToast(`Reset ${id.replace(/^chatBubble/, "bubble ")} to default. Press Save settings to apply it.`);
+  showSettingsToast(`Reset ${id.replace(/^chatBubble/, "bubble ")} to default. Changes save automatically.`);
 }
 
 function setupBubbleResetControls() {
@@ -20002,7 +21267,7 @@ function setupBubbleResetControls() {
       CHAT_BUBBLE_FIELD_IDS.filter(id => group === "ai" ? id.startsWith("chatBubbleAi") : id.startsWith("chatBubbleUser"))
         .forEach(id => setControlValue(id, CHAT_BUBBLE_DEFAULTS[id]));
       updateAppearanceColorControlStates();
-      showSettingsToast(`Reset ${group === "ai" ? "AI" : "User"} bubble settings. Press Save settings to apply them.`);
+      showSettingsToast(`Reset ${group === "ai" ? "AI" : "User"} bubble settings. Changes save automatically.`);
     });
   });
 
@@ -20077,9 +21342,10 @@ function updateAppearanceColorControlStates() {
 }
 
 function detectSettingsEnvironment() {
+  const shared = PLATFORM_API?.detectEnvironment?.();
   const ua = navigator.userAgent || "";
-  const android = /Android/i.test(ua);
-  const webview = android && (/;\s*wv\)/i.test(ua) || /Version\/4\.0.*Chrome\/\d+.*Mobile Safari/i.test(ua));
+  const android = shared ? !!shared.android : /Android/i.test(ua);
+  const webview = shared ? !!shared.webview : (android && (/;\s*wv\)/i.test(ua) || /Version\/4\.0.*Chrome\/\d+.*Mobile Safari/i.test(ua)));
   let displayMode = "browser";
   try {
     if (window.matchMedia?.("(display-mode: window-controls-overlay)")?.matches) displayMode = "window-controls-overlay";
@@ -20087,12 +21353,25 @@ function detectSettingsEnvironment() {
     else if (window.matchMedia?.("(display-mode: minimal-ui)")?.matches) displayMode = "minimal-ui";
     else if (window.matchMedia?.("(display-mode: fullscreen)")?.matches) displayMode = "fullscreen";
   } catch {}
-  const installedApp = displayMode !== "browser" || navigator.standalone === true;
+  const installedApp = displayMode !== "browser" || navigator.standalone === true || !!window.__spicyChatQolAndroidApp;
   const firefox = /Firefox\/|FxiOS\//i.test(ua);
   const waterfox = /Waterfox/i.test(ua);
   const opera = /\bOPR\//i.test(ua);
   const chromium = /Chrome\//i.test(ua) && !firefox && !waterfox;
-  return { android, webview, installedApp, displayMode, firefox, waterfox, opera, chromium, ua };
+  return {
+    android,
+    webview,
+    installedApp,
+    displayMode,
+    firefox,
+    waterfox,
+    opera,
+    chromium,
+    ua,
+    platform: shared?.platform || (android ? "android" : "desktop"),
+    capabilities: shared?.capabilities || {},
+    label: shared?.label || (android ? "Android" : "Desktop browser")
+  };
 }
 
 function refreshAndroidSettingsVisibility(forceShow = false) {
@@ -20133,7 +21412,7 @@ function applyAndroidRecommendedUi() {
   setControlValue("chatPerformanceMode", true);
   setControlValue("pauseQolInHiddenTabs", true);
   refreshAndroidSettingsVisibility(true);
-  showSettingsToast("Mobile Recommended applied. Press Save settings to apply it.");
+  showSettingsToast("Mobile Recommended applied. Changes save automatically.");
 }
 
 function setupAndroidSettings() {
@@ -20154,6 +21433,460 @@ function setupAndroidSettings() {
   $("applyAndroidRecommended")?.addEventListener("click", applyAndroidRecommendedUi);
   $("androidTopBarMenu")?.addEventListener("change", () => refreshAndroidSettingsVisibility(true));
   $("androidAppControlsMode")?.addEventListener("change", () => refreshAndroidSettingsVisibility(true));
+}
+
+
+function settingIsCustomizedForPlatform(name, settings = loadedSettingsSnapshot) {
+  if (!name || !settings || typeof settings !== "object") return false;
+  const desired = settings[name];
+  const fallback = DEFAULT_SETTINGS[name];
+  return !storageValueMatches(desired, fallback);
+}
+
+function platformCompatibilityForControl(control) {
+  if (!control?.id || !PLATFORM_API) return { supported: true, requires: [], reason: "" };
+  if (Object.prototype.hasOwnProperty.call(DEFAULT_SETTINGS, control.id)) {
+    return PLATFORM_API.settingCompatibility?.(control.id, PLATFORM_API.detectEnvironment?.()) || { supported: true, requires: [], reason: "" };
+  }
+  return PLATFORM_API.actionCompatibility?.(control, PLATFORM_API.detectEnvironment?.()) || { supported: true, requires: [], reason: "" };
+}
+
+function platformBadgeHost(control) {
+  if (!control) return null;
+  const label = control.closest?.("label");
+  if (label) return label.querySelector("span") || label;
+  return null;
+}
+
+function markPlatformUnsupportedControl(control, compatibility, settings = loadedSettingsSnapshot) {
+  if (!control || compatibility?.supported !== false) return;
+  if (control.dataset.dsPlatformOriginalDisabled === undefined) {
+    control.dataset.dsPlatformOriginalDisabled = control.disabled ? "1" : "0";
+  }
+  control.dataset.dsPlatformUnsupported = "1";
+  control.disabled = true;
+  control.setAttribute("aria-disabled", "true");
+  if (compatibility.reason) control.title = compatibility.reason;
+
+  const row = control.closest?.("label, .button-row, .sub-card");
+  if (row) row.classList.add("ds-platform-unsupported-row");
+
+  const isSetting = Object.prototype.hasOwnProperty.call(DEFAULT_SETTINGS, control.id);
+  if (!isSetting) return;
+  const host = platformBadgeHost(control);
+  if (!host) return;
+  let badge = [...(host.querySelectorAll?.(".ds-platform-badge") || [])].find(item => item.dataset.for === control.id) || null;
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.className = "ds-platform-badge";
+    badge.dataset.for = control.id;
+    host.appendChild(badge);
+  }
+  const desired = settings?.[control.id];
+  const saved = typeof desired === "boolean" ? desired : settingIsCustomizedForPlatform(control.id, settings);
+  badge.classList.toggle("is-inactive", saved);
+  badge.textContent = saved ? "Desktop only · saved" : "Desktop only";
+  badge.title = compatibility.reason || "Saved here but inactive on Android.";
+}
+
+function clearPlatformCompatibilityMarks() {
+  document.querySelectorAll('[data-ds-platform-unsupported="1"]').forEach(control => {
+    const original = control.dataset.dsPlatformOriginalDisabled;
+    if (original !== undefined) control.disabled = original === "1";
+    control.removeAttribute("data-ds-platform-unsupported");
+    control.removeAttribute("aria-disabled");
+    delete control.dataset.dsPlatformOriginalDisabled;
+  });
+  document.querySelectorAll(".ds-platform-unsupported-row").forEach(row => row.classList.remove("ds-platform-unsupported-row"));
+  document.querySelectorAll(".ds-platform-badge").forEach(badge => badge.remove());
+}
+
+function refreshPlatformCompatibilityUi(settings = loadedSettingsSnapshot) {
+  if (!PLATFORM_API) return;
+  const env = PLATFORM_API.detectEnvironment?.() || detectSettingsEnvironment();
+  document.documentElement.dataset.dsPlatform = env.platform || (env.android ? "android" : "desktop");
+  const notice = $("platformCompatibilityNotice");
+  const noticeText = $("platformCompatibilityNoticeText");
+  if (notice) notice.hidden = !env.android;
+  if (noticeText && env.android) {
+    noticeText.textContent = "Desktop-only bulk, helper-tab and real-browser-tab controls are dimmed here. Their saved values are kept unchanged, so syncing from Android will not switch those desktop preferences off.";
+  }
+
+  clearPlatformCompatibilityMarks();
+  if (!env.android) return;
+
+  const controls = [...document.querySelectorAll("input[id], select[id], textarea[id], button[id]")];
+  for (const control of controls) {
+    const compatibility = platformCompatibilityForControl(control);
+    if (!compatibility.supported) markPlatformUnsupportedControl(control, compatibility, settings);
+  }
+
+  // Manager bulk bars are action UI rather than persisted settings, so not all
+  // of their controls have "bulk" in the individual id. Disable the whole
+  // action surface on Android while leaving the underlying saved lists usable.
+  const bulkReason = { supported: false, reason: "Bulk operations are desktop-only in QoL for now." };
+  document.querySelectorAll(".bot-manager-bulkbar button, .bot-manager-bulkbar select, .bot-manager-bulkbar input").forEach(control => {
+    markPlatformUnsupportedControl(control, bulkReason, settings);
+  });
+}
+
+function setupPlatformCompatibility() {
+  refreshPlatformCompatibilityUi();
+  document.addEventListener("change", event => {
+    if (!(event.target instanceof Element)) return;
+    window.setTimeout(() => refreshPlatformCompatibilityUi(), 0);
+  }, true);
+}
+
+function randomSyncDeviceId() {
+  try {
+    if (crypto?.randomUUID) return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  } catch {
+    return `device-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+function normalizeQolSyncState(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    schemaVersion: QOL_SYNC_DEVICE_SCHEMA_VERSION,
+    deviceId: String(source.deviceId || "").trim(),
+    deviceCreatedAt: Number(source.deviceCreatedAt || 0),
+    accountId: String(source.accountId || "").trim(),
+    linkedAt: Number(source.linkedAt || 0),
+    automatic: source.automatic !== false,
+    paused: source.paused === true,
+    lastRevision: Math.max(0, Number(source.lastRevision || 0)),
+    lastSyncAt: Math.max(0, Number(source.lastSyncAt || 0)),
+    lastSyncAttemptAt: Math.max(0, Number(source.lastSyncAttemptAt || 0)),
+    lastLocalStorageRevision: Math.max(0, Number(source.lastLocalStorageRevision || 0)),
+    lastError: String(source.lastError || ""),
+    lastErrorAt: Math.max(0, Number(source.lastErrorAt || 0)),
+    lastStatus: String(source.lastStatus || "")
+  };
+}
+
+async function ensureQolSyncState({ resetDevice = false } = {}) {
+  const data = await storageGet([QOL_SYNC_STATE_KEY]);
+  const state = normalizeQolSyncState(data[QOL_SYNC_STATE_KEY]);
+  if (resetDevice || !state.deviceId) {
+    state.deviceId = randomSyncDeviceId();
+    state.deviceCreatedAt = Date.now();
+    state.accountId = resetDevice ? "" : state.accountId;
+    state.linkedAt = resetDevice ? 0 : state.linkedAt;
+    state.lastRevision = resetDevice ? 0 : state.lastRevision;
+    state.lastSyncAt = resetDevice ? 0 : state.lastSyncAt;
+    state.lastSyncAttemptAt = resetDevice ? 0 : state.lastSyncAttemptAt;
+    state.lastLocalStorageRevision = resetDevice ? 0 : state.lastLocalStorageRevision;
+    state.lastError = resetDevice ? "" : state.lastError;
+    state.lastErrorAt = resetDevice ? 0 : state.lastErrorAt;
+    state.lastStatus = resetDevice ? "Not linked" : state.lastStatus;
+    await storageSet({ [QOL_SYNC_STATE_KEY]: state });
+  }
+  return state;
+}
+
+function browserLabelForSync(env) {
+  const ua = String(navigator.userAgent || "");
+  let browser = "Browser";
+  if (/Firefox\//i.test(ua)) browser = "Firefox";
+  else if (/Edg\//i.test(ua)) browser = "Edge";
+  else if (/OPR\//i.test(ua)) browser = "Opera";
+  else if (/Chrome\//i.test(ua)) browser = "Chrome / Chromium";
+  return env.android ? env.label : `${browser} · Desktop`;
+}
+
+function syncDeviceMeta() {
+  const env = PLATFORM_API?.detectEnvironment?.() || detectSettingsEnvironment();
+  let clientVersion = "0.2.25";
+  try { clientVersion = chrome.runtime.getManifest?.().version || clientVersion; } catch {}
+  return {
+    deviceName: browserLabelForSync(env),
+    platform: env.android ? "android" : "desktop",
+    clientVersion
+  };
+}
+
+function formatSyncTime(value) {
+  const time = Number(value || 0);
+  if (!time) return "Never";
+  try { return new Date(time).toLocaleString(); }
+  catch { return "Unknown"; }
+}
+
+let accountSyncDevicesCache = [];
+let accountSyncLastLinkCode = null;
+let accountSyncBusy = false;
+
+function setAccountSyncBusy(busy, status = "") {
+  accountSyncBusy = !!busy;
+  document.querySelectorAll("#accountSyncCard button, #accountSyncCard input").forEach(control => {
+    if (control.id === "accountSyncLinkCode") return;
+    control.disabled = accountSyncBusy;
+  });
+  const node = $("accountSyncActionStatus");
+  if (node && status) node.textContent = status;
+}
+
+function renderAccountSyncDevices(devices = [], currentDeviceId = "") {
+  const host = $("accountSyncDevices");
+  if (!host) return;
+  host.replaceChildren();
+  const list = Array.isArray(devices) ? devices : [];
+  if (!list.length) {
+    host.append(makeElement("p", { className: "hint", text: "No linked devices were returned yet." }));
+    return;
+  }
+  for (const device of list) {
+    const row = makeElement("div", { className: "account-sync-device-row" });
+    const text = makeElement("div", { className: "account-sync-device-copy" });
+    const title = `${device.name || device.platform || "QoL device"}${device.current || device.id === currentDeviceId ? " · This device" : ""}`;
+    text.append(
+      makeElement("strong", { text: title }),
+      makeElement("span", { className: "hint", text: `${device.platform || "unknown"}${device.clientVersion ? ` · v${device.clientVersion}` : ""} · last seen ${formatSyncTime(device.lastSeenAt)}` })
+    );
+    row.append(text);
+    if (!(device.current || device.id === currentDeviceId)) {
+      const remove = makeElement("button", { text: "Unlink", attrs: { type: "button" } });
+      remove.addEventListener("click", async () => {
+        if (!confirm(`Unlink ${device.name || "this device"} from the QoL account?`)) return;
+        setAccountSyncBusy(true, "Unlinking device…");
+        const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_REVOKE_DEVICE", deviceId: device.id }, 18000);
+        setAccountSyncBusy(false);
+        if (!result?.ok) {
+          $("accountSyncActionStatus").textContent = result?.message || "Could not unlink that device.";
+          return;
+        }
+        showSettingsToast("Device unlinked.");
+        await refreshAccountSyncUi({ refreshDevices: true });
+      });
+      row.append(remove);
+    }
+    host.append(row);
+  }
+}
+
+function renderAccountSyncLinkCode() {
+  const box = $("accountSyncGeneratedCodeBox");
+  const code = $("accountSyncGeneratedCode");
+  const expiry = $("accountSyncGeneratedCodeExpiry");
+  if (!box || !code || !expiry) return;
+  const value = accountSyncLastLinkCode;
+  const valid = !!(value?.code && Number(value.expiresAt || 0) > Date.now());
+  box.hidden = !valid;
+  if (!valid) return;
+  code.textContent = value.code;
+  expiry.textContent = `Expires ${formatSyncTime(value.expiresAt)} · one use only`;
+}
+
+async function refreshAccountSyncUi({ refreshDevices = false } = {}) {
+  const card = $("accountSyncCard");
+  if (!card || !PLATFORM_API) return;
+  const env = PLATFORM_API.detectEnvironment?.() || detectSettingsEnvironment();
+  const localState = await ensureQolSyncState();
+  const response = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_STATUS" }, 8000);
+  const state = normalizeQolSyncState(response?.state || localState);
+  const linked = !!response?.linked;
+  const desired = { ...DEFAULT_SETTINGS, ...(loadedSettingsSnapshot || {}) };
+  const effective = PLATFORM_API.applyEffectiveSettings?.(desired, DEFAULT_SETTINGS, env) || { dormant: {} };
+  const dormantCount = Object.keys(effective.dormant || {}).length;
+  const syncDocument = PLATFORM_API.syncableSettingsDocument?.(desired, { revision: state.lastRevision }) || { settings: desired };
+  const settingCount = Object.keys(syncDocument.settings || {}).length;
+
+  if ($("accountSyncLinkState")) $("accountSyncLinkState").textContent = linked ? "Linked" : "Not linked";
+  if ($("accountSyncAutoState")) $("accountSyncAutoState").textContent = linked ? (state.paused ? "Paused" : "Automatic") : "Starts after linking";
+  if ($("accountSyncSettingCount")) $("accountSyncSettingCount").textContent = `${settingCount} setting${settingCount === 1 ? "" : "s"}`;
+  if ($("accountSyncDormantCount")) $("accountSyncDormantCount").textContent = `${dormantCount} inactive here`;
+  if ($("accountSyncDeviceLabel")) $("accountSyncDeviceLabel").textContent = browserLabelForSync(env);
+  if ($("accountSyncDeviceId")) $("accountSyncDeviceId").textContent = state.deviceId || "Preparing…";
+  if ($("accountSyncRevision")) $("accountSyncRevision").textContent = String(state.lastRevision || 0);
+  if ($("accountSyncLastSync")) $("accountSyncLastSync").textContent = formatSyncTime(state.lastSyncAt);
+  if ($("accountSyncApiBase")) $("accountSyncApiBase").textContent = response?.apiBase || "https://syncqol.drache.uk";
+
+  const caps = env.capabilities || {};
+  const supported = [];
+  if (caps.styling) supported.push("styles");
+  if (caps.editing) supported.push("editing");
+  if (caps.helperTabs) supported.push("helper tabs");
+  if (caps.bulkOperations) supported.push("bulk");
+  if ($("accountSyncCapabilitySummary")) {
+    $("accountSyncCapabilitySummary").textContent = `Works here: ${supported.join(", ") || "current-page tools"}.`;
+  }
+
+  const setup = $("accountSyncSetup");
+  const linkedArea = $("accountSyncLinked");
+  const devicesCard = $("accountSyncDevicesCard");
+  if (setup) setup.hidden = linked;
+  if (linkedArea) linkedArea.hidden = !linked;
+  if (devicesCard) devicesCard.hidden = !linked;
+
+  const backendStatus = $("accountSyncBackendStatus");
+  if (backendStatus) {
+    backendStatus.textContent = linked
+      ? `Connected to ${response?.apiBase || "https://syncqol.drache.uk"}. ${state.lastStatus || "Automatic sync is active."}`
+      : `Cloudflare sync is ready at ${response?.apiBase || "https://syncqol.drache.uk"}. Create a QoL account here or enter a one-use code from another linked device.`;
+  }
+  const error = $("accountSyncError");
+  if (error) {
+    error.hidden = !state.lastError;
+    error.textContent = state.lastError ? `Last sync error: ${state.lastError}` : "";
+  }
+  const pause = $("accountSyncPause");
+  if (pause) pause.textContent = state.paused ? "Resume sync" : "Pause sync";
+
+  if (linked && (refreshDevices || !accountSyncDevicesCache.length)) {
+    const devices = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_LIST_DEVICES" }, 12000);
+    if (devices?.ok) accountSyncDevicesCache = devices.devices || [];
+  }
+  if (linked) renderAccountSyncDevices(accountSyncDevicesCache, state.deviceId);
+  else {
+    accountSyncDevicesCache = [];
+    accountSyncLastLinkCode = null;
+    renderAccountSyncLinkCode();
+  }
+  renderAccountSyncLinkCode();
+  return { state, linked };
+}
+
+function setupAccountSyncFoundation() {
+  refreshAccountSyncUi({ refreshDevices: true }).catch(() => {});
+
+  $("copyAccountSyncDeviceId")?.addEventListener("click", async () => {
+    const state = await ensureQolSyncState();
+    try {
+      await navigator.clipboard.writeText(state.deviceId);
+      showSettingsToast("Sync device ID copied.");
+    } catch {
+      showSettingsToast("Could not copy the device ID.");
+    }
+  });
+
+  $("accountSyncCreate")?.addEventListener("click", async () => {
+    setAccountSyncBusy(true, "Creating QoL account…");
+    const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_CREATE_ACCOUNT", meta: syncDeviceMeta() }, 120000);
+    setAccountSyncBusy(false);
+    if (!result?.ok) {
+      $("accountSyncActionStatus").textContent = result?.message || "Could not create the QoL account.";
+      return;
+    }
+    if (result.initialSyncOk === false || result.sync?.ok === false) {
+      const detail = result.sync?.message ? ` ${result.sync.message}` : "";
+      $("accountSyncActionStatus").textContent = `Account created, but the first settings sync failed.${detail} Use Sync now to retry.`;
+      showSettingsToast("QoL account created; first sync needs a retry.");
+    } else {
+      $("accountSyncActionStatus").textContent = "Account created. Your current settings were uploaded and automatic sync is on.";
+      showSettingsToast("QoL sync account created.");
+    }
+    await refreshAccountSyncUi({ refreshDevices: true });
+  });
+
+  $("accountSyncLink")?.addEventListener("click", async () => {
+    const code = String($("accountSyncLinkCode")?.value || "").trim();
+    if (!code) {
+      $("accountSyncActionStatus").textContent = "Enter the one-use code from a linked device first.";
+      return;
+    }
+    setAccountSyncBusy(true, "Linking this device and downloading account settings…");
+    const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_LINK_ACCOUNT", code, meta: syncDeviceMeta() }, 120000);
+    setAccountSyncBusy(false);
+    if (!result?.ok) {
+      $("accountSyncActionStatus").textContent = result?.message || "Could not link this device.";
+      return;
+    }
+    if ($("accountSyncLinkCode")) $("accountSyncLinkCode").value = "";
+    if (result.initialSyncOk === false || result.sync?.ok === false) {
+      const detail = result.sync?.message ? ` ${result.sync.message}` : "";
+      $("accountSyncActionStatus").textContent = `Device linked, but the first settings download failed.${detail} Use Sync now to retry.`;
+      showSettingsToast("Device linked; first sync needs a retry.");
+    } else {
+      $("accountSyncActionStatus").textContent = "Linked. Account settings were downloaded and automatic sync is on.";
+      showSettingsToast("Device linked to QoL sync.");
+    }
+    await refreshAccountSyncUi({ refreshDevices: true });
+  });
+
+  $("accountSyncNow")?.addEventListener("click", async () => {
+    setAccountSyncBusy(true, "Syncing now…");
+    const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_NOW" }, 120000);
+    setAccountSyncBusy(false);
+    $("accountSyncActionStatus").textContent = result?.ok ? "Sync complete." : (result?.message || "Sync failed.");
+    if (result?.ok) showSettingsToast("QoL settings synced.");
+    await refreshAccountSyncUi({ refreshDevices: false });
+  });
+
+  $("accountSyncPause")?.addEventListener("click", async () => {
+    const current = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_STATUS" }, 8000);
+    const state = normalizeQolSyncState(current?.state);
+    setAccountSyncBusy(true, state.paused ? "Resuming sync…" : "Pausing sync…");
+    const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_SET_PAUSED", paused: !state.paused }, 30000);
+    setAccountSyncBusy(false);
+    $("accountSyncActionStatus").textContent = result?.ok ? (!state.paused ? "Automatic sync paused on this device." : "Automatic sync resumed.") : (result?.message || "Could not change sync state.");
+    await refreshAccountSyncUi({ refreshDevices: false });
+  });
+
+  $("accountSyncCreateLinkCode")?.addEventListener("click", async () => {
+    setAccountSyncBusy(true, "Creating one-use link code…");
+    const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_CREATE_LINK_CODE" }, 16000);
+    setAccountSyncBusy(false);
+    if (!result?.ok) {
+      $("accountSyncActionStatus").textContent = result?.message || "Could not create a link code.";
+      return;
+    }
+    accountSyncLastLinkCode = result;
+    renderAccountSyncLinkCode();
+    $("accountSyncActionStatus").textContent = "Link code ready. Enter it on the other device before it expires.";
+  });
+
+  $("accountSyncCopyLinkCode")?.addEventListener("click", async () => {
+    if (!accountSyncLastLinkCode?.code) return;
+    try {
+      await navigator.clipboard.writeText(accountSyncLastLinkCode.code);
+      showSettingsToast("Link code copied.");
+    } catch {
+      showSettingsToast("Could not copy the link code.");
+    }
+  });
+
+  $("accountSyncRefreshDevices")?.addEventListener("click", async () => {
+    setAccountSyncBusy(true, "Refreshing linked devices…");
+    await refreshAccountSyncUi({ refreshDevices: true });
+    setAccountSyncBusy(false);
+    $("accountSyncActionStatus").textContent = "Device list refreshed.";
+  });
+
+  $("accountSyncDisconnectLocal")?.addEventListener("click", async () => {
+    if (!confirm("Disconnect this browser from the QoL account locally? This does not delete your QoL settings. If you want to revoke the device from the account, use another linked device's Unlink button first.")) return;
+    setAccountSyncBusy(true, "Disconnecting this browser…");
+    const result = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_DISCONNECT_LOCAL" }, 12000);
+    setAccountSyncBusy(false);
+    if (!result?.ok) {
+      $("accountSyncActionStatus").textContent = result?.message || "Could not disconnect this browser.";
+      return;
+    }
+    accountSyncDevicesCache = [];
+    accountSyncLastLinkCode = null;
+    $("accountSyncActionStatus").textContent = "This browser is no longer linked. Local settings were kept.";
+    showSettingsToast("QoL account disconnected on this browser.");
+    await refreshAccountSyncUi({ refreshDevices: false });
+  });
+
+  $("resetAccountSyncDeviceId")?.addEventListener("click", async () => {
+    const status = await runtimeMessageWithTimeout({ type: "DS_QOL_SYNC_STATUS" }, 8000);
+    if (status?.linked) {
+      showSettingsToast("Disconnect this device from Account & Sync before resetting its local identity.");
+      return;
+    }
+    if (!confirm("Reset this device's local QoL sync identity? No settings are deleted.")) return;
+    await ensureQolSyncState({ resetDevice: true });
+    await refreshAccountSyncUi();
+    showSettingsToast("Local sync device identity reset. Your settings were not changed.");
+  });
 }
 
 ["chatBubbleAiBackground", "chatBubbleAiText", "chatBubbleUserBackground", "chatBubbleUserText"].forEach(id => {
@@ -20183,7 +21916,7 @@ document.querySelectorAll("[data-context-keeper-preset]").forEach(button => {
     setValue("contextKeeperAutoMaxDetails", String(values.max));
     setValue("contextKeeperRecapSize", values.recap);
     setChecked("contextKeeperAutoCapture", true);
-    showSettingsToast(`Context Keeper ${preset === "recommended" ? "Recommended" : preset[0].toUpperCase() + preset.slice(1)} preset applied. Press Save settings to apply it.`);
+    showSettingsToast(`Context Keeper ${preset === "recommended" ? "Recommended" : preset[0].toUpperCase() + preset.slice(1)} preset applied. Changes save automatically.`);
   });
 });
 
@@ -20312,8 +22045,14 @@ $("reduceOptionsAnimations")?.addEventListener("change", () => applyOptionsPerfo
   $(id)?.addEventListener("change", () => applyOptionsLayoutPreferences());
 });
 $("qolInterfaceScale")?.addEventListener("change", () => applyOptionsAccessibilityPreview({ qolInterfaceScale: Number(value("qolInterfaceScale", "100")) || 100 }));
-$("collapseAllSettingsSections")?.addEventListener("click", () => setAllSettingsSectionsCollapsed(true));
-$("expandAllSettingsSections")?.addEventListener("click", () => setAllSettingsSectionsCollapsed(false));
+$("collapseAllSettingsSections")?.addEventListener("click", () => {
+  setAllSettingsSectionsCollapsed(true);
+  persistAllSettingsSectionStates();
+});
+$("expandAllSettingsSections")?.addEventListener("click", () => {
+  setAllSettingsSectionsCollapsed(false);
+  persistAllSettingsSectionStates();
+});
 $("runSettingsHealthCheck")?.addEventListener("click", () => runSettingsHealthCheck().catch(() => showSettingsToast("Settings health check failed.")));
 $("openSaiCompatibilitySetting")?.addEventListener("click", () => revealSettingsTarget("saiToolkitCompatibility"));
 $("markUpdatesSeen")?.addEventListener("click", markUpdatesSeen);
@@ -20349,7 +22088,7 @@ $("checkDeeplUsage")?.addEventListener("click", checkDeepLUsage);
 function reorderOptionsUi() {
   const tabOrder = [
     "general", "control", "blocking", "chat-ui", "saved", "chat-list", "writing",
-    "personas-memory", "bot-tools", "appearance", "browser", "data",
+    "personas-memory", "bot-tools", "appearance", "browser", "data", "account",
     "features", "advanced", "android", "changelog", "help"
   ];
   const tabs = document.querySelector("nav.tabs");
@@ -20402,6 +22141,8 @@ setupBotAvailabilityControls();
 setupMiniPanelPreview();
 setupSettingsToast();
 setupSettingDependencies();
+setupPlatformCompatibility();
+setupAccountSyncFoundation();
 setupFeaturesIndex();
 setupMessageQuickActionGroupToggle();
 setupPageIntros();
@@ -20480,6 +22221,28 @@ function refreshSavedManagersFromStorageChange(kinds = []) {
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
 
+  const granularSettingChanges = Object.entries(changes || {})
+    .map(([key, change]) => [granularSettingName(key), change])
+    .filter(([name]) => !!name);
+  const settingsChanged = !!changes.settings || granularSettingChanges.length > 0;
+  if (changes.settings?.newValue) loadedSettingsSnapshot = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
+  if (granularSettingChanges.length) {
+    const next = { ...loadedSettingsSnapshot };
+    for (const [name, change] of granularSettingChanges) {
+      if (change?.newValue === undefined) next[name] = DEFAULT_SETTINGS[name];
+      else next[name] = change.newValue;
+    }
+    loadedSettingsSnapshot = next;
+  }
+  if (settingsChanged && optionsDataLoaded) {
+    refreshPlatformCompatibilityUi(loadedSettingsSnapshot);
+    DS_FEATURE_INDEX_REFRESH?.();
+    if (activeOptionsTab() === "account") refreshAccountSyncUi().catch(() => {});
+  }
+  if (changes[QOL_SYNC_STATE_KEY] && optionsDataLoaded && activeOptionsTab() === "account") {
+    refreshAccountSyncUi().catch(() => {});
+  }
+
   // Bot Status / unavailable-cleanup writes originate from this Options page,
   // whose in-memory stores are already current. Re-normalizing every large
   // changed value and immediately rebuilding all Saved managers was causing a
@@ -20493,10 +22256,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
       BOT_AVAILABILITY_KEY, BOT_ARCHIVE_KEY, BOT_UNAVAILABLE_RECOVERY_KEY
     ]);
     const keys = Object.keys(changes || {});
-    if (keys.length && keys.every(key => selfWriteKeys.has(key))) {
-      if (changes.settings?.newValue) {
-        loadedSettingsSnapshot = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
-      }
+    if (keys.length && keys.every(key => selfWriteKeys.has(key) || key.startsWith(GRANULAR_SETTING_PREFIX) || [GRANULAR_SETTINGS_INDEX_KEY, GRANULAR_SETTINGS_MIGRATION_KEY, GRANULAR_SETTINGS_REVISION_KEY, GRANULAR_SETTINGS_LAST_BATCH_KEY].includes(key))) {
       if (changes[BOT_ARCHIVE_KEY]) creatorBackupManagerLoaded = false;
       return;
     }
@@ -20644,7 +22404,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     savedRefreshKinds.add("availability");
   }
 
-  if (changes[BOT_ARCHIVE_KEY] || changes[LOREBOOK_BACKUPS_KEY] || changes.settings) {
+  if (changes[BOT_ARCHIVE_KEY] || changes[LOREBOOK_BACKUPS_KEY] || settingsChanged) {
     creatorBackupManagerLoaded = false;
     if (activeOptionsTab() === "bot-tools") loadCreatorBackupManager({ force: true }).catch(() => {});
   }
@@ -20666,6 +22426,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 });
 
 setupTabs();
+setupSettingsAutosave();
 load();
 
 $("refreshPersonalUsage")?.addEventListener("click", refreshPersonalUsageSummary);

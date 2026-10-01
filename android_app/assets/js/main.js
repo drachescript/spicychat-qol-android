@@ -425,10 +425,76 @@
     }, 900);
   }
 
+  function dedicatedBackgroundWorkerKind() {
+    return String(
+      DS.state?.qolBackgroundWorker ||
+      document.documentElement?.getAttribute?.("data-ds-qol-background-worker") ||
+      ""
+    ).trim();
+  }
+
   function shouldPauseHiddenTab() {
     const settings = DS.state?.settings || {};
+    // QoL-owned API/helper workers are deliberately background work. Never let
+    // the normal "pause QoL in hidden tabs" preference suspend their runtime.
+    if (dedicatedBackgroundWorkerKind()) return false;
     return !!(settings.enabled && settings.pauseQolInHiddenTabs && document.hidden);
   }
+
+  const CHAT_STARTUP_QUIET_MS = 8000;
+  const CHAT_STARTUP_SETTLE_MIN_MS = 2500;
+  const CHAT_STARTUP_SETTLED_IDLE_MS = 1800;
+
+  function startChatStartupQuietWindow(source = "route") {
+    if (!DS.isSingleChatPage?.()) return false;
+    DS.state = DS.state || {};
+    const now = Date.now();
+    DS.state.chatStartupQuietRoute = `${location.pathname || ""}${location.search || ""}`;
+    DS.state.chatStartupQuietStartedAt = now;
+    DS.state.chatStartupQuietUntil = now + CHAT_STARTUP_QUIET_MS;
+    DS.state.chatStartupLastMessageMutationAt = now;
+    DS.runtimeLog?.("info", "performance", `Chat startup quiet window started (${source})`, { quietMs: CHAT_STARTUP_QUIET_MS });
+    return true;
+  }
+
+  function chatStartupQuietActive() {
+    if (!DS.isSingleChatPage?.()) return false;
+    const now = Date.now();
+    const until = Number(DS.state?.chatStartupQuietUntil || 0);
+    if (!until || now >= until) return false;
+    const started = Number(DS.state?.chatStartupQuietStartedAt || now);
+    const lastMutation = Number(DS.state?.chatStartupLastMessageMutationAt || started);
+    if (now - started >= CHAT_STARTUP_SETTLE_MIN_MS && now - lastMutation >= CHAT_STARTUP_SETTLED_IDLE_MS) {
+      DS.state.chatStartupQuietUntil = 0;
+      DS.runtimeLog?.("info", "performance", "Chat startup quiet window ended early after message history settled", {
+        elapsedMs: now - started,
+        settledMs: now - lastMutation
+      });
+      return false;
+    }
+    return true;
+  }
+
+  function scheduleChatStartupQuietResume(source = "startup") {
+    if (!chatStartupQuietActive()) return false;
+    const now = Date.now();
+    const until = Number(DS.state.chatStartupQuietUntil || now);
+    const started = Number(DS.state.chatStartupQuietStartedAt || now);
+    const lastMutation = Number(DS.state.chatStartupLastMessageMutationAt || started);
+    const earliestSettleCheck = Math.max(started + CHAT_STARTUP_SETTLE_MIN_MS, lastMutation + CHAT_STARTUP_SETTLED_IDLE_MS);
+    const wakeAt = Math.min(until, earliestSettleCheck);
+    clearTimeout(DS.state.chatStartupQuietTimer);
+    DS.state.chatStartupQuietTimer = setTimeout(() => {
+      DS.state.chatStartupQuietTimer = 0;
+      DS.scheduleRun?.({ priority: "critical", immediate: true, source: `chat-startup-settle-${source}` });
+      DS.scheduleRun?.({ priority: "slow", source: `chat-startup-settle-${source}` });
+      DS.scheduleMessageLane?.(`chat-startup-settle-${source}`);
+    }, Math.max(80, wakeAt - now + 25));
+    return true;
+  }
+
+  DS.startChatStartupQuietWindow = startChatStartupQuietWindow;
+  DS.isChatStartupQuiet = chatStartupQuietActive;
 
   function runtimeProfile() {
     const settings = DS.state?.settings || {};
@@ -818,6 +884,12 @@
       DS.refreshMessageEnhancerConfig?.(settings);
       applyRuntimePerformancePresentation();
       if (!settings.enabled || !DS.isSingleChatPage?.() || shouldPauseHiddenTab()) return;
+      if (chatStartupQuietActive()) {
+        await runStep("performance mode", () => DS.applyPerformanceMode?.());
+        counters.chatStartupQuietMessageDeferrals = Number(counters.chatStartupQuietMessageDeferrals || 0) + 1;
+        scheduleChatStartupQuietResume("message");
+        return;
+      }
       if (settings.pauseQolWhileMessageEditing !== false && DS.hasActiveMessageEditor?.()) {
         counters.messageEditLaneSkips = Number(counters.messageEditLaneSkips || 0) + 1;
         return;
@@ -1159,6 +1231,11 @@
         }
         await runStep("performance mode", () => DS.applyPerformanceMode?.());
         await runSavedOpenedLane("critical-single-chat");
+        if (chatStartupQuietActive()) {
+          runtimeCounters().chatStartupQuietCriticalDeferrals = Number(runtimeCounters().chatStartupQuietCriticalDeferrals || 0) + 1;
+          scheduleChatStartupQuietResume("critical");
+          return;
+        }
         if (settings.pauseQolWhileMessageEditing !== false && DS.hasActiveMessageEditor?.()) {
           const counters = runtimeCounters();
           counters.messageEditCriticalSkips = Number(counters.messageEditCriticalSkips || 0) + 1;
@@ -1377,6 +1454,13 @@
       const profile = runtimeProfile();
       const listingMaintenanceInterval = profile === "maximum" ? 5200 : profile === "aggressive" ? 3600 : profile === "adaptive" ? 2200 : 1200;
       const listingCardInterval = profile === "maximum" ? 2600 : profile === "aggressive" ? 1800 : profile === "adaptive" ? 1200 : 700;
+
+      if (singleChat && chatStartupQuietActive()) {
+        runtimeCounters().chatStartupQuietSlowDeferrals = Number(runtimeCounters().chatStartupQuietSlowDeferrals || 0) + 1;
+        await runStep("performance mode", () => DS.applyPerformanceMode?.());
+        scheduleChatStartupQuietResume("slow");
+        return;
+      }
 
       await runStep("remove disabled panel", () => DS.removeQuickPanelIfDisabled?.());
       await runFeatureStep("S.AI Toolkit detection", !!settings.saiToolkitCompatibility, () => DS.startSaiToolkitDetection?.());
@@ -1869,6 +1953,14 @@
     invalidateLoadedChatMessageCount();
     DS.bumpDomRevision?.();
 
+    if (DS.isSingleChatPage?.()) startChatStartupQuietWindow("route-change");
+    else {
+      DS.state.chatStartupQuietUntil = 0;
+      DS.state.chatStartupQuietRoute = "";
+      clearTimeout(DS.state.chatStartupQuietTimer);
+      DS.state.chatStartupQuietTimer = 0;
+    }
+
     sessionStorage.removeItem("dsAutoReadNotificationsDone");
     DS.resetChatListLoaderForRoute?.();
 
@@ -2032,6 +2124,14 @@
       counters.observerBatches = Number(counters.observerBatches || 0) + 1;
       counters.mutations += mutations.length;
       if (checkRouteChange()) return;
+
+      if (DS.isSingleChatPage?.() && Number(DS.state?.chatStartupQuietUntil || 0) > Date.now()) {
+        const changedMessages = messageRootMutationSets(mutations);
+        if (changedMessages.added.size || changedMessages.removed.size) {
+          DS.state.chatStartupLastMessageMutationAt = Date.now();
+          scheduleChatStartupQuietResume("history-mutation");
+        }
+      }
 
       // Chat-list population is data/state work, not cosmetic work. Schedule its
       // tiny lane before hidden-tab/performance early returns so saved/opened
@@ -2351,8 +2451,9 @@
   try {
     if (DS.isExtensionContextValid?.()) {
       chrome.storage.onChanged.addListener(async changes => {
+        const settingsChanged = !!(DS.hasSettingStorageChanges?.(changes));
         if (
-          changes.settings ||
+          settingsChanged ||
           changes[DS.OPENED_KEY] ||
           changes[DS.OPENED_META_KEY] ||
           changes[DS.BLOCKED_BOTS_KEY] ||
@@ -2365,25 +2466,25 @@
           changes[DS.BOT_ORGANIZER_KEY] ||
           changes[DS.OOC_TEMPLATES_KEY]
         ) {
-          if (changes.settings) slowStepThrottle.clear();
+          if (settingsChanged) slowStepThrottle.clear();
           if (typeof DS.applyStorageChanges === "function") {
             DS.applyStorageChanges(changes);
           } else {
             await DS.loadState();
           }
-          if (changes.settings || changes[DS.OPENED_KEY] || changes[DS.OPENED_META_KEY]) {
+          if (settingsChanged || changes[DS.OPENED_KEY] || changes[DS.OPENED_META_KEY]) {
             DS.state.openedImportRevision = -1;
           }
-          if (changes.settings && document.hidden && DS.state?.settings?.autoReadNotifications) {
+          if (settingsChanged && document.hidden && DS.state?.settings?.autoReadNotifications) {
             setTimeout(() => DS.maybeAutoReadNotifications?.("settings-change"), 0);
           }
+          const granularEnabledChange = changes[DS.settingStorageKey?.("enabled") || ""];
           const masterWasDisabled = !!(
-            changes.settings &&
-            changes.settings.oldValue?.enabled !== false &&
-            changes.settings.newValue?.enabled === false
+            (changes.settings && changes.settings.oldValue?.enabled !== false && changes.settings.newValue?.enabled === false) ||
+            (granularEnabledChange && granularEnabledChange.oldValue !== false && granularEnabledChange.newValue === false)
           );
           if (
-            changes.settings ||
+            settingsChanged ||
             changes[DS.OPENED_KEY] ||
             changes[DS.OPENED_META_KEY] ||
             changes[DS.FAVORITE_BOTS_KEY] ||
@@ -2465,6 +2566,7 @@
     installRefreshTrackers();
     installTypingPerformanceTracker();
     applyRuntimePerformancePresentation();
+    if (DS.isSingleChatPage?.()) startChatStartupQuietWindow("startup");
     DS.observePage();
     DS.maybeAutoReadNotifications?.("startup");
 
