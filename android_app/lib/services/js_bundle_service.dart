@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 import 'qol_update_service.dart';
 
 class JsBundleService extends ChangeNotifier {
-  static const bundledExtensionVersion = '0.2.27';
+  static const bundledExtensionVersion = '0.2.29';
 
   final QolUpdateService qolUpdates;
 
@@ -22,6 +22,11 @@ class JsBundleService extends ChangeNotifier {
   String get jsBundle => _jsBundle;
   String get extensionVersion => _extensionVersion;
   String get optionsHtml => _optionsHtml;
+
+  static const _androidMainWorldBridgeFiles = [
+    'content/generation-metadata-bridge.js',
+    'content/exact-message-counts-bridge.js',
+  ];
 
   static const _bundledJsFiles = [
     'assets/js/card-token-main.js',
@@ -166,6 +171,238 @@ class JsBundleService extends ChangeNotifier {
       )
       ..writeln('// === Android native bridge (APK-owned) ===')
       ..writeln(bridge)
+      ..writeln();
+
+    // Android does not have chrome-extension:// web-accessible-resource URLs.
+    // Install the two MAIN-world network bridges directly before the normal
+    // extension loaders run. The APK-owned runtime guard below makes those
+    // loaders treat the already-installed bridge as successfully loaded, so
+    // they still send their normal enabled/disabled control state without
+    // making broken page-relative /content/*.js requests.
+    for (final relative in _androidMainWorldBridgeFiles) {
+      String? source;
+      if (remoteActive) {
+        source = await qolUpdates.readDownloadedText(relative);
+      }
+      source ??= await rootBundle.loadString(
+        'assets/js/${_baseName(relative)}',
+      );
+      buffer
+        ..writeln('// === Android MAIN-world bridge $relative ===')
+        ..writeln(source)
+        ..writeln();
+    }
+
+    // APK-owned compatibility/touch guard. Keep this inline so the normal
+    // extension-to-Android sync cannot delete it as an unlisted JS asset.
+    buffer
+      ..writeln('// === Android runtime fixes (APK-owned) ===')
+      ..writeln(r'''(() => {
+  "use strict";
+
+  if (window.__dsQolAndroidRuntimeFixesInstalled) return;
+  window.__dsQolAndroidRuntimeFixesInstalled = true;
+
+  // -------------------------------------------------------------------------
+  // Android MAIN-world bridge loader compatibility
+  // -------------------------------------------------------------------------
+  //
+  // The normal browser extension loads these files through chrome-extension://
+  // web-accessible-resource URLs. Android injects the bridge source directly
+  // before the shared extension bundle instead. When the normal loader later
+  // appends its <script src="content/...-bridge.js">, treat that exact request
+  // as already loaded so its normal load callback still sends control state.
+  // This avoids page-relative /chat/.../content/*.js requests and MIME errors.
+
+  const preinstalledBridgeMarkers = new Map([
+    ["generation-metadata-bridge.js", "__DSQ_GENERATION_METADATA_BRIDGE__"],
+    ["exact-message-counts-bridge.js", "__DSQ_EXACT_MESSAGE_COUNTS_BRIDGE__"]
+  ]);
+
+  const nativeAppendChild = Node.prototype.appendChild;
+  Node.prototype.appendChild = function dsAndroidAppendChild(child) {
+    if (child instanceof HTMLScriptElement) {
+      const raw = String(child.getAttribute("src") || child.src || "");
+      let name = "";
+      try {
+        name = new URL(raw, location.href).pathname.split("/").pop() || "";
+      } catch {
+        name = raw.split(/[/?#]/).filter(Boolean).pop() || "";
+      }
+
+      const marker = preinstalledBridgeMarkers.get(name.toLowerCase());
+      if (marker && window[marker]) {
+        queueMicrotask(() => {
+          try {
+            child.dispatchEvent(new Event("load"));
+          } catch {}
+        });
+        return child;
+      }
+    }
+
+    return nativeAppendChild.call(this, child);
+  };
+
+  // -------------------------------------------------------------------------
+  // Touch tooltip / hold timing
+  // -------------------------------------------------------------------------
+  //
+  // Android WebView can leave a CSS/React hover state active after a normal
+  // tap. On Like/Favorite controls that makes tooltips such as "Unlike" appear
+  // even though the user never deliberately held the button. Convert touch
+  // tooltips into a real hold gesture: short taps stay tooltip-free; a tooltip
+  // may become visible only after a deliberate hold.
+
+  const TOOLTIP_HOLD_MS = 850;
+  const TOOLTIP_MOVE_CANCEL_PX = 16;
+  const TOOLTIP_SUPPRESS_CLASS = "ds-android-touch-tooltip-suppress";
+  const TOOLTIP_STYLE_ID = "ds-android-touch-tooltip-guard-style";
+
+  let tooltipTouch = null;
+  let tooltipTimer = 0;
+
+  function ensureTooltipStyle() {
+    if (document.getElementById(TOOLTIP_STYLE_ID)) return;
+
+    const style = document.createElement("style");
+    style.id = TOOLTIP_STYLE_ID;
+    style.textContent = `
+      html.${TOOLTIP_SUPPRESS_CLASS} [role="tooltip"],
+      html.${TOOLTIP_SUPPRESS_CLASS} [data-radix-tooltip-content],
+      html.${TOOLTIP_SUPPRESS_CLASS} [data-slot="tooltip-content"],
+      html.${TOOLTIP_SUPPRESS_CLASS} .react-aria-Tooltip,
+      html.${TOOLTIP_SUPPRESS_CLASS} [class*="tooltip" i] {
+        opacity: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+
+      html.${TOOLTIP_SUPPRESS_CLASS} [data-tooltip-content]::before,
+      html.${TOOLTIP_SUPPRESS_CLASS} [data-tooltip-content]::after {
+        content: none !important;
+        opacity: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function suppressTouchTooltips() {
+    ensureTooltipStyle();
+    document.documentElement?.classList.add(TOOLTIP_SUPPRESS_CLASS);
+  }
+
+  function allowTouchTooltips() {
+    document.documentElement?.classList.remove(TOOLTIP_SUPPRESS_CLASS);
+  }
+
+  function tooltipHostFromTarget(target) {
+    if (!(target instanceof Element)) return null;
+
+    const interactive = target.closest(
+      "button, a, [role='button'], input, select, textarea"
+    );
+    if (!interactive) return null;
+
+    return interactive.closest?.("[data-tooltip-content]") ||
+      target.closest?.("[data-tooltip-content]") ||
+      null;
+  }
+
+  function clearTooltipTimer() {
+    if (tooltipTimer) {
+      clearTimeout(tooltipTimer);
+      tooltipTimer = 0;
+    }
+  }
+
+  function cancelTooltipHold(pointerId = null) {
+    if (
+      tooltipTouch &&
+      pointerId != null &&
+      tooltipTouch.pointerId !== pointerId
+    ) {
+      return;
+    }
+
+    clearTooltipTimer();
+    tooltipTouch = null;
+    suppressTouchTooltips();
+  }
+
+  ensureTooltipStyle();
+
+  document.addEventListener("pointerdown", event => {
+    if (event.pointerType && !["touch", "pen"].includes(event.pointerType)) {
+      return;
+    }
+
+    const host = tooltipHostFromTarget(event.target);
+    if (!host) return;
+
+    clearTooltipTimer();
+    suppressTouchTooltips();
+
+    tooltipTouch = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      host,
+      held: false
+    };
+
+    tooltipTimer = window.setTimeout(() => {
+      if (!tooltipTouch || tooltipTouch.pointerId !== event.pointerId) return;
+      tooltipTouch.held = true;
+      tooltipTimer = 0;
+      allowTouchTooltips();
+    }, TOOLTIP_HOLD_MS);
+  }, true);
+
+  document.addEventListener("pointermove", event => {
+    if (!tooltipTouch || tooltipTouch.pointerId !== event.pointerId) return;
+
+    const dx = event.clientX - tooltipTouch.startX;
+    const dy = event.clientY - tooltipTouch.startY;
+    if (Math.hypot(dx, dy) > TOOLTIP_MOVE_CANCEL_PX) {
+      cancelTooltipHold(event.pointerId);
+    }
+  }, true);
+
+  document.addEventListener("pointerup", event => {
+    if (!tooltipTouch || tooltipTouch.pointerId !== event.pointerId) return;
+
+    const wasHeld = tooltipTouch.held;
+    clearTooltipTimer();
+    tooltipTouch = null;
+
+    // Keep the short-tap state suppressed so Android's sticky touch-hover cannot
+    // make the tooltip appear a moment after the finger has already lifted.
+    if (wasHeld) {
+      setTimeout(suppressTouchTooltips, 160);
+    } else {
+      suppressTouchTooltips();
+    }
+  }, true);
+
+  document.addEventListener("pointercancel", event => {
+    cancelTooltipHold(event.pointerId);
+  }, true);
+
+  document.addEventListener("contextmenu", event => {
+    if (!tooltipTouch || tooltipTouch.held) return;
+    if (!tooltipHostFromTarget(event.target)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+
+  console.log(
+    `[DS Android] runtime fixes ready; touch tooltip hold=${TOOLTIP_HOLD_MS}ms`
+  );
+})();''')
       ..writeln();
 
     if (remoteActive) {
