@@ -1,7 +1,7 @@
 name: spicychat_qol_app
 description: "SpicyChat QOL - Android App"
 publish_to: 'none'
-version: 0.1.15+89
+version: 0.1.16+90
 environment:
   sdk: ^3.10.7
 

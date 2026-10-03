@@ -931,6 +931,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   // Enable wide viewport for better mobile experience
                   useWideViewPort: true,
                   loadWithOverviewMode: true,
+                  // The wrapper should never expose whole-page horizontal
+                  // scrolling. Internal SpicyChat carousels keep their own
+                  // overflow/scroll containers.
+                  horizontalScrollBarEnabled: false,
                   // Manual page zoom is Android-only and opt-in.
                   supportZoom: androidUi.zoomEnabled,
                   builtInZoomControls: androidUi.zoomEnabled,
@@ -950,6 +954,72 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   // Third-party cookies (needed for auth)
                   thirdPartyCookiesEnabled: true,
                 ),
+                onPermissionRequest: (controller, request) async {
+                  final origin = Uri.tryParse(request.origin.toString());
+                  if (origin == null || !_isSpicyChat(origin)) {
+                    return PermissionResponse(
+                      resources: request.resources,
+                      action: PermissionResponseAction.DENY,
+                    );
+                  }
+
+                  final wantsMicrophone = request.resources.contains(
+                    PermissionResourceType.MICROPHONE,
+                  );
+                  if (!wantsMicrophone) {
+                    return PermissionResponse(
+                      resources: request.resources,
+                      action: PermissionResponseAction.DENY,
+                    );
+                  }
+
+                  var granted = false;
+                  try {
+                    granted =
+                        await const MethodChannel(
+                          'uk.drache.spicychatqol/app_info',
+                        ).invokeMethod<bool>('requestMicrophonePermission') ??
+                        false;
+                  } catch (e, stackTrace) {
+                    if (_shouldPersistDiagnostic('microphone-permission-failed')) {
+                      unawaited(
+                        _appLog.log(
+                          'Permission',
+                          'Could not request Android microphone permission',
+                          level: 'WARN',
+                          error: e,
+                          stackTrace: stackTrace,
+                        ),
+                      );
+                    }
+                  }
+
+                  if (_shouldPersistDiagnostic(
+                    granted
+                        ? 'microphone-permission-granted'
+                        : 'microphone-permission-denied',
+                    cooldown: const Duration(minutes: 5),
+                  )) {
+                    unawaited(
+                      _appLog.log(
+                        'Permission',
+                        granted
+                            ? 'Microphone permission granted to SpicyChat WebView'
+                            : 'Microphone permission denied for SpicyChat WebView',
+                        level: granted ? 'INFO' : 'WARN',
+                      ),
+                    );
+                  }
+
+                  return PermissionResponse(
+                    resources: const <PermissionResourceType>[
+                      PermissionResourceType.MICROPHONE,
+                    ],
+                    action: granted
+                        ? PermissionResponseAction.GRANT
+                        : PermissionResponseAction.DENY,
+                  );
+                },
                 onWebViewCreated: (controller) {
                   _webController = controller;
                   _lastInjectedDocumentToken = null;
@@ -1313,6 +1383,18 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     debugPrint('[WebView Console] $level: $message');
                   }
                   final lower = level.toLowerCase();
+                  final noisySiteConsole =
+                      message.contains(
+                        'was preloaded using link preload but not used',
+                      ) ||
+                      message.contains(
+                        'cross-world service worker resource mismatch',
+                      ) ||
+                      message.contains(
+                        'logrocket-react does not work with this version of React',
+                      );
+                  if (noisySiteConsole) return;
+
                   if (lower.contains('error') ||
                       lower.contains('warning') ||
                       message.contains('DragonScript') ||
@@ -2734,14 +2816,83 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  Future<void> _installAndroidViewportWidthGuard(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+  const STYLE_ID = "ds-android-viewport-width-guard";
+
+  const ensureStyle = () => {
+    let style = document.getElementById(STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = STYLE_ID;
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    style.textContent = `
+      html, body {
+        width: 100% !important;
+        max-width: 100vw !important;
+        overflow-x: hidden !important;
+        overscroll-behavior-x: none !important;
+      }
+    `;
+  };
+
+  const clampOuterX = () => {
+    const root = document.scrollingElement || document.documentElement;
+    if (root && root.scrollLeft !== 0) root.scrollLeft = 0;
+    if (document.documentElement && document.documentElement.scrollLeft !== 0) {
+      document.documentElement.scrollLeft = 0;
+    }
+    if (document.body && document.body.scrollLeft !== 0) {
+      document.body.scrollLeft = 0;
+    }
+  };
+
+  ensureStyle();
+  clampOuterX();
+
+  if (!window.__dsAndroidViewportWidthGuardInstalled) {
+    window.__dsAndroidViewportWidthGuardInstalled = true;
+    window.addEventListener("scroll", clampOuterX, { passive: true });
+    window.addEventListener("resize", clampOuterX, { passive: true });
+    window.visualViewport?.addEventListener(
+      "resize",
+      clampOuterX,
+      { passive: true }
+    );
+  }
+})()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-viewport-width-guard')) {
+        unawaited(
+          _appLog.log(
+            'AndroidLayout',
+            'Could not install Android viewport width guard',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
   Future<void> _installAndroidListingIdentityHelper(
     InAppWebViewController controller,
   ) async {
     try {
       await controller.evaluateJavascript(
         source: r'''(() => {
-  if (window.__dsAndroidListingIdentityInstalled) {
-    window.__dsAndroidListingIdentityRun?.("recheck");
+  const STATE_KEY = "__dsAndroidListingIdentityState";
+  const LINK_SELECTOR = 'a[href*="/chat/"], a[href*="/chatbot/"]';
+
+  if (window[STATE_KEY]?.fullSweep) {
+    window[STATE_KEY].fullSweep("recheck");
     return;
   }
 
@@ -2765,15 +2916,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         .map(part => decodeURIComponent(part || "").trim())
         .filter(Boolean);
 
-      if (parts[0] === "chatbot" && parts[1]) {
-        return normalizeId(parts[1]);
-      }
-
-      if (parts[0] === "chat" && parts[1]) {
-        return normalizeId(parts[1]);
-      }
+      if (parts[0] === "chatbot" && parts[1]) return normalizeId(parts[1]);
+      if (parts[0] === "chat" && parts[1]) return normalizeId(parts[1]);
     } catch {}
-
     return "";
   };
 
@@ -2797,138 +2942,233 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
 
     let node = anchor.parentElement;
-    for (
-      let depth = 0;
-      node && depth < 4;
-      depth++, node = node.parentElement
-    ) {
-      const linkCount =
-        node.querySelectorAll?.(
-          'a[href*="/chat/"], a[href*="/chatbot/"]'
-        ).length || 0;
+    for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+      const linkCount = node.querySelectorAll?.(LINK_SELECTOR).length || 0;
       const imageCount = node.querySelectorAll?.("img").length || 0;
       if (linkCount >= 1 && imageCount >= 1) return node;
     }
-
     return null;
   };
 
+  const normalizedPath = () =>
+    String(location.pathname || "/").replace(/^\/[a-z]{2}(?=\/)/i, "");
+
+  const isSingleChatRoute = () =>
+    /^\/chat\/[0-9a-f-]{20,}(?:\/|$)/i.test(normalizedPath());
+
+  const stats = {
+    fullSweeps: 0,
+    incrementalBatches: 0,
+    anchorsVisited: 0,
+    normalizedAnchors: 0,
+    normalizedRoots: 0,
+    lastReason: "",
+    lastAt: 0
+  };
+
   let scheduled = false;
-  let lastSummary = "";
+  let pendingReason = "mutation";
+  const pendingRoots = new Set();
 
-  const run = reason => {
-    scheduled = false;
+  const normalizeAnchor = anchor => {
+    if (!(anchor instanceof HTMLAnchorElement)) {
+      return { usable: false, anchorChanged: false, rootChanged: false };
+    }
 
-    const anchors = Array.from(
-      document.querySelectorAll(
-        'a[href*="/chat/"], a[href*="/chatbot/"]'
-      )
-    );
+    const id =
+      normalizeId(anchor.dataset?.chatbotId) ||
+      normalizeId(anchor.dataset?.botId) ||
+      normalizeId(anchor.getAttribute?.("data-chatbot-id")) ||
+      normalizeId(anchor.getAttribute?.("data-bot-id")) ||
+      idFromHref(anchor.href);
 
+    if (!id) {
+      return { usable: false, anchorChanged: false, rootChanged: false };
+    }
+
+    let anchorChanged = false;
+    if (!anchor.getAttribute("data-chatbot-id")) {
+      anchor.setAttribute("data-chatbot-id", id);
+      anchorChanged = true;
+    }
+    if (!anchor.getAttribute("data-bot-id")) {
+      anchor.setAttribute("data-bot-id", id);
+    }
+    if (anchor.getAttribute("data-ds-android-chatbot-id") !== id) {
+      anchor.setAttribute("data-ds-android-chatbot-id", id);
+      anchorChanged = true;
+    }
+
+    let rootChanged = false;
+    const root = likelyCardRoot(anchor);
+    if (root) {
+      const before =
+        root.getAttribute("data-chatbot-id") ||
+        root.getAttribute("data-bot-id");
+
+      if (!root.getAttribute("data-chatbot-id")) {
+        root.setAttribute("data-chatbot-id", id);
+      }
+      if (!root.getAttribute("data-bot-id")) {
+        root.setAttribute("data-bot-id", id);
+      }
+      if (root.getAttribute("data-ds-android-chatbot-id") !== id) {
+        root.setAttribute("data-ds-android-chatbot-id", id);
+      }
+      if (!before) rootChanged = true;
+    }
+
+    return { usable: true, anchorChanged, rootChanged };
+  };
+
+  const emitReady = (reason, uniqueIds) => {
+    try {
+      window.dispatchEvent(
+        new CustomEvent("spicychat-qol:android-identities-ready", {
+          detail: { reason, uniqueIds }
+        })
+      );
+    } catch {}
+  };
+
+  const processAnchors = (anchors, reason, full) => {
     let usableAnchors = 0;
     let normalizedAnchors = 0;
     let normalizedRoots = 0;
     const uniqueIds = new Set();
 
     for (const anchor of anchors) {
-      const id =
-        normalizeId(anchor.dataset?.chatbotId) ||
-        normalizeId(anchor.dataset?.botId) ||
-        normalizeId(anchor.getAttribute?.("data-chatbot-id")) ||
-        normalizeId(anchor.getAttribute?.("data-bot-id")) ||
-        idFromHref(anchor.href);
-
-      if (!id) continue;
-
+      const result = normalizeAnchor(anchor);
+      if (!result.usable) continue;
       usableAnchors++;
-      uniqueIds.add(id);
-
-      if (!anchor.getAttribute("data-chatbot-id")) {
-        anchor.setAttribute("data-chatbot-id", id);
-        normalizedAnchors++;
-      }
-      if (!anchor.getAttribute("data-bot-id")) {
-        anchor.setAttribute("data-bot-id", id);
-      }
-      anchor.setAttribute("data-ds-android-chatbot-id", id);
-
-      const root = likelyCardRoot(anchor);
-      if (root) {
-        const before =
-          root.getAttribute("data-chatbot-id") ||
-          root.getAttribute("data-bot-id");
-
-        if (!root.getAttribute("data-chatbot-id")) {
-          root.setAttribute("data-chatbot-id", id);
-        }
-        if (!root.getAttribute("data-bot-id")) {
-          root.setAttribute("data-bot-id", id);
-        }
-        root.setAttribute("data-ds-android-chatbot-id", id);
-
-        if (!before) normalizedRoots++;
-      }
+      const id =
+        normalizeId(anchor.getAttribute("data-chatbot-id")) ||
+        normalizeId(anchor.getAttribute("data-bot-id"));
+      if (id) uniqueIds.add(id);
+      if (result.anchorChanged) normalizedAnchors++;
+      if (result.rootChanged) normalizedRoots++;
     }
 
-    const summary = JSON.stringify({
-      path: location.pathname,
-      anchors: anchors.length,
-      usableAnchors,
-      uniqueIds: uniqueIds.size,
-      normalizedAnchors,
-      normalizedRoots
-    });
+    if (full) stats.fullSweeps++;
+    else stats.incrementalBatches++;
+    stats.anchorsVisited += anchors.length;
+    stats.normalizedAnchors += normalizedAnchors;
+    stats.normalizedRoots += normalizedRoots;
+    stats.lastReason = reason;
+    stats.lastAt = Date.now();
 
-    if (summary !== lastSummary) {
-      lastSummary = summary;
-      console.log("[DS Android Identity] " + summary);
-    }
+    if (normalizedAnchors || normalizedRoots) emitReady(reason, uniqueIds.size);
 
-    if (normalizedAnchors || normalizedRoots) {
-      try {
-        window.dispatchEvent(
-          new CustomEvent(
-            "spicychat-qol:android-identities-ready",
-            {
-              detail: {
-                reason,
-                uniqueIds: uniqueIds.size
-              }
-            }
-          )
-        );
-      } catch {}
+    // Full route/install checks are useful breadcrumbs. Virtualized DOM churn
+    // is intentionally silent so it does not become native log/file I/O.
+    if (full) {
+      console.log(
+        "[DS Android Identity] " +
+        JSON.stringify({
+          path: location.pathname,
+          anchors: anchors.length,
+          usableAnchors,
+          uniqueIds: uniqueIds.size,
+          normalizedAnchors,
+          normalizedRoots,
+          incrementalBatches: stats.incrementalBatches
+        })
+      );
     }
   };
 
-  const schedule = reason => {
+  const fullSweep = reason => {
+    pendingRoots.clear();
+    scheduled = false;
+    let anchors = Array.from(document.querySelectorAll(LINK_SELECTOR));
+
+    // One chat can contain dozens/hundreds of repeated bot links. Identity
+    // normalization is a listing helper, so one anchor is enough there.
+    if (isSingleChatRoute() && anchors.length > 1) anchors = anchors.slice(0, 1);
+    processAnchors(anchors, reason, true);
+  };
+
+  const collectFromRoot = (root, seen, anchors) => {
+    if (!(root instanceof Element)) return;
+    if (root.matches?.(LINK_SELECTOR) && !seen.has(root)) {
+      seen.add(root);
+      anchors.push(root);
+    }
+    root.querySelectorAll?.(LINK_SELECTOR).forEach(anchor => {
+      if (seen.has(anchor)) return;
+      seen.add(anchor);
+      anchors.push(anchor);
+    });
+  };
+
+  const flushIncremental = () => {
+    scheduled = false;
+    if (isSingleChatRoute()) {
+      pendingRoots.clear();
+      return;
+    }
+
+    const roots = Array.from(pendingRoots);
+    pendingRoots.clear();
+    if (!roots.length) return;
+
+    const seen = new Set();
+    const anchors = [];
+    for (const root of roots) collectFromRoot(root, seen, anchors);
+    if (anchors.length) processAnchors(anchors, pendingReason, false);
+  };
+
+  const schedule = (reason, root = null) => {
+    pendingReason = reason || pendingReason;
+    if (root instanceof Element) pendingRoots.add(root);
     if (scheduled) return;
     scheduled = true;
-    requestAnimationFrame(() => run(reason));
+    requestAnimationFrame(flushIncremental);
   };
 
-  window.__dsAndroidListingIdentityRun = run;
-  window.__dsAndroidListingIdentitySchedule = schedule;
+  window.__dsAndroidListingIdentityRun = fullSweep;
+  window.__dsAndroidListingIdentitySchedule = reason => {
+    if (reason === "load-stop" || reason === "spa-route" || reason === "recheck") {
+      fullSweep(reason);
+      return;
+    }
+    schedule(reason);
+  };
 
   const observer = new MutationObserver(records => {
+    if (isSingleChatRoute()) return;
+
+    let added = false;
     for (const record of records) {
       if (record.type !== "childList") continue;
-      if (
-        record.addedNodes?.length ||
-        record.removedNodes?.length
-      ) {
-        schedule("mutation");
-        break;
+      for (const node of record.addedNodes || []) {
+        if (!(node instanceof Element)) continue;
+        pendingRoots.add(node);
+        added = true;
       }
     }
+    if (added) schedule("mutation");
   });
 
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true
-  });
+  const observeRoot = document.documentElement || document.body;
+  if (observeRoot) {
+    observer.observe(observeRoot, { childList: true, subtree: true });
+  }
 
-  run("install");
+  window[STATE_KEY] = {
+    stats,
+    fullSweep,
+    disconnect() {
+      observer.disconnect();
+      pendingRoots.clear();
+      delete window[STATE_KEY];
+      delete window.__dsAndroidListingIdentityRun;
+      delete window.__dsAndroidListingIdentitySchedule;
+      delete window.__dsAndroidListingIdentityInstalled;
+    }
+  };
+
+  fullSweep("install");
 })()''',
       );
     } catch (e, stackTrace) {
@@ -2945,7 +3185,6 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       }
     }
   }
-
   Future<void> _installAndroidEditableClipboardBridge(
     InAppWebViewController controller,
   ) async {
@@ -3514,6 +3753,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         })();''',
       );
 
+      await _installAndroidViewportWidthGuard(controller);
       await _installAndroidListingIdentityHelper(controller);
 
       await controller.evaluateJavascript(

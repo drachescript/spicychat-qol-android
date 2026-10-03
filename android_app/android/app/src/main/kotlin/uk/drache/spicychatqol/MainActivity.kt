@@ -1,6 +1,8 @@
 package uk.drache.spicychatqol
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -13,6 +15,8 @@ import java.security.MessageDigest
 
 class MainActivity : FlutterActivity() {
     private val appInfoChannel = "uk.drache.spicychatqol/app_info"
+    private val microphonePermissionRequestCode = 4021
+    private var pendingMicrophonePermissionResult: MethodChannel.Result? = null
 
     @Suppress("DEPRECATION")
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -53,6 +57,32 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "hasMicrophonePermission" -> {
+                    result.success(hasMicrophonePermission())
+                }
+
+                "requestMicrophonePermission" -> {
+                    if (hasMicrophonePermission()) {
+                        result.success(true)
+                        return@setMethodCallHandler
+                    }
+
+                    if (pendingMicrophonePermissionResult != null) {
+                        result.error(
+                            "MICROPHONE_PERMISSION_BUSY",
+                            "A microphone permission request is already active.",
+                            null,
+                        )
+                        return@setMethodCallHandler
+                    }
+
+                    pendingMicrophonePermissionResult = result
+                    requestPermissions(
+                        arrayOf(Manifest.permission.RECORD_AUDIO),
+                        microphonePermissionRequestCode,
+                    )
+                }
+
                 "installApk" -> {
                     try {
                         val path = call.argument<String>("path")?.trim().orEmpty()
@@ -65,7 +95,7 @@ class MainActivity : FlutterActivity() {
                         if (path.isEmpty()) {
                             result.error(
                                 "APK_PATH_MISSING",
-                                "The downloaded APK path was missing.",
+                                "The downloaded update APK path was missing.",
                                 null,
                             )
                             return@setMethodCallHandler
@@ -153,6 +183,25 @@ class MainActivity : FlutterActivity() {
             }
         }
     }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != microphonePermissionRequestCode) return
+
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+
+        pendingMicrophonePermissionResult?.success(granted)
+        pendingMicrophonePermissionResult = null
+    }
+
+    private fun hasMicrophonePermission(): Boolean =
+        checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
