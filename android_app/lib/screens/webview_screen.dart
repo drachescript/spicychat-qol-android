@@ -1012,7 +1012,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
 
                   return PermissionResponse(
-                    resources: const <PermissionResourceType>[
+                    resources: <PermissionResourceType>[
                       PermissionResourceType.MICROPHONE,
                     ],
                     action: granted
