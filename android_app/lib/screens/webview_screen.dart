@@ -444,405 +444,39 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   Future<void> _syncAndroidChatHeaderGear() async {
     final controller = _webController;
-    if (controller == null || !mounted) return;
-
-    final androidUi = Provider.of<AndroidUiService>(
-      context,
-      listen: false,
-    );
-    final uri = Uri.tryParse(_lastKnownUrl);
-    final enabled =
-        androidUi.controlsInSpicyChatTopBar &&
-        uri != null &&
-        _isSpicyChat(uri);
+    if (controller == null) return;
 
     try {
       await controller.evaluateJavascript(
         source: r'''(() => {
-  const BUTTON_ID = "ds-android-native-header-settings";
-  const STATE_KEY = "__dsAndroidTopBarOverlayState";
-  const enabled = __ENABLED__;
+          document.getElementById("ds-android-native-header-settings")?.remove();
+          document.getElementById("ds-android-native-cog-appearance")?.remove();
 
-  const removeButton = () => {
-    document.getElementById(BUTTON_ID)?.remove();
-  };
+          for (const key of [
+            "__dsAndroidTopBarOverlayState",
+            "__dsAndroidHeaderGearState",
+            "__dsAndroidTopBarGearState"
+          ]) {
+            const state = window[key];
+            state?.observer?.disconnect?.();
+            if (state?.resizeHandler) {
+              window.removeEventListener("resize", state.resizeHandler, true);
+            }
+            if (state?.scrollHandler) {
+              window.removeEventListener("scroll", state.scrollHandler, true);
+            }
+            try { delete window[key]; } catch {}
+          }
 
-  const isVisible = element => {
-    if (!(element instanceof HTMLElement)) return false;
-    const r = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    return r.width > 0 &&
-      r.height > 0 &&
-      style.display !== "none" &&
-      style.visibility !== "hidden";
-  };
-
-  const textFor = element => [
-    element.getAttribute?.("aria-label"),
-    element.getAttribute?.("title"),
-    element.getAttribute?.("data-testid"),
-    element.textContent
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-
-  const currentKind = () => {
-    const path = location.pathname;
-    if (path === "/" || path === "/home" || path.startsWith("/home/")) {
-      return "home";
-    }
-    if (path === "/chat" || path.startsWith("/chat/")) {
-      return "chat";
-    }
-    return "other";
-  };
-
-  const topActions = () => {
-    const vw = Math.max(1, window.innerWidth || 1);
-
-    return Array.from(
-      document.querySelectorAll(
-        'button, a[role="button"], [role="button"]'
-      )
-    )
-      .filter(element => {
-        if (element.id === BUTTON_ID) return false;
-        if (!isVisible(element)) return false;
-
-        const r = element.getBoundingClientRect();
-        if (
-          r.top < 0 ||
-          r.top > 130 ||
-          r.bottom > 180 ||
-          r.left < vw * 0.40
-        ) {
-          return false;
-        }
-
-        return r.width >= 28 &&
-          r.width <= 100 &&
-          r.height >= 28 &&
-          r.height <= 100;
-      })
-      .sort(
-        (a, b) =>
-          a.getBoundingClientRect().left -
-          b.getBoundingClientRect().left
-      );
-  };
-
-  const findHomeAnchor = () => {
-    const actions = topActions();
-
-    const explicit = actions.find(element => {
-      const text = textFor(element);
-      const svg = element.querySelector?.("svg");
-      const svgClass = String(
-        svg?.getAttribute?.("class") || ""
-      ).toLowerCase();
-      const svgLabel = String(
-        svg?.getAttribute?.("aria-label") || ""
-      ).toLowerCase();
-      const shortText = String(element.textContent || "")
-        .replace(/\s+/g, "")
-        .trim();
-
-      return /language|locale|globe|translate/.test(text) ||
-        /globe|language|translate/.test(svgClass) ||
-        /globe|language/.test(svgLabel) ||
-        /^[A-Z]{2,3}$/.test(shortText);
-    });
-
-    return explicit || actions[0] || null;
-  };
-
-  const findChatAnchor = () => {
-    const actions = topActions();
-
-    const explicit = actions.find(element => {
-      const text = textFor(element);
-      const svg = element.querySelector?.("svg");
-      const svgClass = String(
-        svg?.getAttribute?.("class") || ""
-      ).toLowerCase();
-      const svgLabel = String(
-        svg?.getAttribute?.("aria-label") || ""
-      ).toLowerCase();
-
-      return /rating|rate\b|thumb|like\b/.test(text) ||
-        /thumb|like/.test(svgClass) ||
-        /thumb|like/.test(svgLabel) ||
-        !!element.querySelector?.(
-          'svg[class*="thumb"], svg[data-lucide*="thumb"], ' +
-          '[data-icon*="thumb"], [class*="thumb"]'
-        );
-    });
-
-    return explicit || actions[0] || null;
-  };
-
-  const ensureButton = reason => {
-    const kind = currentKind();
-
-    if (!enabled) {
-      removeButton();
-      return false;
-    }
-
-    const anchor =
-      kind === "chat"
-        ? findChatAnchor()
-        : findHomeAnchor();
-
-    if (!anchor) {
-      removeButton();
-      return false;
-    }
-
-    const anchorRect = anchor.getBoundingClientRect();
-    const size = 42;
-    const gap = 8;
-    const vw = Math.max(1, window.innerWidth || 1);
-
-    let left = anchorRect.left - size - gap;
-    left = Math.max(8, Math.min(left, vw - size - 8));
-
-    let top =
-      anchorRect.top +
-      ((anchorRect.height - size) / 2);
-    top = Math.max(4, top);
-
-    let button = document.getElementById(BUTTON_ID);
-
-    if (!button) {
-      button = document.createElement("button");
-      button.id = BUTTON_ID;
-      button.type = "button";
-      button.className = "ds-android-native-topbar-overlay";
-      button.setAttribute("aria-label", "Android QoL settings");
-      button.setAttribute("title", "SpicyChat QoL");
-
-      button.innerHTML = `
-        <svg xmlns="http://www.w3.org/2000/svg"
-             width="22" height="22" viewBox="0 0 24 24"
-             fill="none" stroke="currentColor" stroke-width="2"
-             stroke-linecap="round" stroke-linejoin="round"
-             aria-hidden="true">
-          <circle cx="12" cy="12" r="3"></circle>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06-2.83 2.83-.06-.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0-1 .6 1.65 1.65 0 0 0-.4 1.08V21h-4v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06-2.83-2.83.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-.6-1 1.65 1.65 0 0 0-1.08-.4H3v-4h.09A1.65 1.65 0 0 0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06 2.83-2.83.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-.6A1.65 1.65 0 0 0 10.4 2.92V3h4v.09A1.65 1.65 0 0 0 15.4 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06 2.83 2.83-.06.06A1.65 1.65 0 0 0 19.4 9c.14.38.36.72.65 1 .29.28.67.43 1.08.4H21v4h-.09A1.65 1.65 0 0 0 19.4 15Z"></path>
-        </svg>
-      `;
-
-      button.style.cssText = [
-        "position:fixed",
-        "display:flex",
-        "align-items:center",
-        "justify-content:center",
-        "width:42px",
-        "height:42px",
-        "min-width:42px",
-        "min-height:42px",
-        "padding:0",
-        "margin:0",
-        "border:1px solid rgba(255,255,255,.28)",
-        "border-radius:999px",
-        "background:#6d36d9",
-        "color:white",
-        "box-shadow:0 4px 14px rgba(0,0,0,.35)",
-        "z-index:2147483646",
-        "box-sizing:border-box",
-        "pointer-events:auto",
-        "touch-action:manipulation",
-        "user-select:none",
-        "-webkit-user-select:none",
-        "-webkit-tap-highlight-color:transparent"
-      ].join(";");
-
-      let armedPointerId = null;
-
-      const consume = event => {
-        if (event.cancelable) event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-      };
-
-      button.addEventListener("pointerdown", event => {
-        armedPointerId = event.pointerId;
-        consume(event);
-        try {
-          button.setPointerCapture?.(event.pointerId);
-        } catch {}
-      }, true);
-
-      button.addEventListener("pointerup", event => {
-        const shouldOpen =
-          armedPointerId === event.pointerId;
-        armedPointerId = null;
-        consume(event);
-
-        if (!shouldOpen) return;
-
-        window.flutter_inappwebview
-          ?.callHandler("androidOpenQuickMenu", {
-            tappedAt: Date.now(),
-            route: location.pathname,
-            kind: currentKind()
-          })
-          .catch(error => {
-            console.warn(
-              "[DS Android] Could not open native QoL menu",
-              error
-            );
-          });
-      }, true);
-
-      button.addEventListener("pointercancel", event => {
-        armedPointerId = null;
-        consume(event);
-      }, true);
-
-      button.addEventListener("click", event => {
-        consume(event);
-
-        // Accessibility/keyboard activation only. Normal touch already opens
-        // from pointerup and this synthetic click must never reach SpicyChat.
-        if (event.detail === 0) {
-          window.flutter_inappwebview
-            ?.callHandler("androidOpenQuickMenu", {
-            tappedAt: Date.now(),
-            route: location.pathname,
-            kind: currentKind()
-          })
-            .catch(() => {});
-        }
-      }, true);
-
-      button.addEventListener("touchstart", consume, {
-        capture: true,
-        passive: false
-      });
-      button.addEventListener("touchend", consume, {
-        capture: true,
-        passive: false
-      });
-      button.addEventListener("contextmenu", consume, true);
-
-      // Append to body, NOT beside/inside SpicyChat's language/rating button.
-      // It is its own independent hit target.
-      document.body.appendChild(button);
-    }
-
-    button.style.left = `${Math.round(left)}px`;
-    button.style.top = `${Math.round(top)}px`;
-    button.dataset.dsAndroidTopBarKind = kind;
-    button.dataset.dsAndroidTopBarReason = String(reason || "");
-
-    return true;
-  };
-
-  window[STATE_KEY] ||= {};
-  const state = window[STATE_KEY];
-
-  // Kill observers left by the older DOM-sibling implementation.
-  window.__dsAndroidHeaderGearState?.observer?.disconnect?.();
-  window.__dsAndroidTopBarGearState?.observer?.disconnect?.();
-
-  state.enabled = enabled;
-  state.ensure = ensureButton;
-  state.remove = removeButton;
-
-  if (!enabled) {
-    removeButton();
-    state.observer?.disconnect?.();
-    state.observer = null;
-
-    if (state.resizeHandler) {
-      window.removeEventListener(
-        "resize",
-        state.resizeHandler,
-        true
-      );
-      state.resizeHandler = null;
-    }
-
-    if (state.scrollHandler) {
-      window.removeEventListener(
-        "scroll",
-        state.scrollHandler,
-        true
-      );
-      state.scrollHandler = null;
-    }
-
-    return false;
-  }
-
-  let scheduled = false;
-  const schedule = reason => {
-    if (scheduled) return;
-    scheduled = true;
-
-    requestAnimationFrame(() => {
-      scheduled = false;
-      if (!window[STATE_KEY]?.enabled) return;
-      ensureButton(reason);
-    });
-  };
-
-  ensureButton("sync");
-
-  if (!state.observer) {
-    const observer = new MutationObserver(() => {
-      // Once the independent fixed button exists, message virtualization and
-      // long-chat DOM churn must not continuously re-anchor it. Only recover
-      // if React/site navigation actually removed the button.
-      if (!document.getElementById(BUTTON_ID)) {
-        schedule("mutation-recover");
-      }
-    });
-
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true
-    });
-
-    state.observer = observer;
-  }
-
-  if (!state.resizeHandler) {
-    state.resizeHandler = () => schedule("resize");
-    window.addEventListener(
-      "resize",
-      state.resizeHandler,
-      true
-    );
-  }
-
-  // Older builds repositioned the fixed overlay on every scroll. Besides
-  // being unnecessary, a chat with a moving/virtualized anchor could drag the
-  // cog around the screen. Remove any old handler and leave scrolling alone.
-  if (state.scrollHandler) {
-    window.removeEventListener(
-      "scroll",
-      state.scrollHandler,
-      true
-    );
-    state.scrollHandler = null;
-  }
-
-  return true;
-})()'''
-          .replaceFirst('__ENABLED__', enabled ? 'true' : 'false'),
+          return true;
+        })()''',
       );
     } catch (e, stackTrace) {
-      if (_shouldPersistDiagnostic('android-topbar-overlay-button')) {
+      if (_shouldPersistDiagnostic('android-topbar-overlay-cleanup')) {
         unawaited(
           _appLog.log(
             'AndroidUI',
-            'Could not synchronize independent SpicyChat top-bar QoL button',
+            'Could not clean up legacy DOM top-bar QoL button',
             level: 'WARN',
             error: e,
             stackTrace: stackTrace,
@@ -1415,6 +1049,32 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
               ),
+
+              // Native Android top-bar QoL button. Unlike the old WebView DOM
+              // overlay this never re-anchors to Search/card/chat controls.
+              if (useSpicyChatTopBarGear)
+                Positioned(
+                  top: 9,
+                  right: 52,
+                  child: FloatingActionButton(
+                    heroTag: 'android-qol-topbar',
+                    mini: true,
+                    backgroundColor: Colors.deepPurple.withValues(alpha: 0.96),
+                    onPressed: () {
+                      unawaited(
+                        _showQuickMenu(
+                          requestedAt: DateTime.now(),
+                          source: 'native-topbar',
+                        ),
+                      );
+                    },
+                    child: const Icon(
+                      Icons.settings,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                  ),
+                ),
 
               // Loading progress bar
               if (_isLoading)
@@ -3627,10 +3287,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   });
 
-  observer.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["class"]
-  });
+  const focusClassRoot = document.documentElement;
+  if (focusClassRoot instanceof Node) {
+    observer.observe(focusClassRoot, {
+      attributes: true,
+      attributeFilter: ["class"]
+    });
+  }
 
   nativeObserver = new MutationObserver(records => {
     const DS = window.DragonScriptQoL;
@@ -4764,6 +4427,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         : openStartedAt.millisecondsSinceEpoch -
             bridgeReceivedAt.millisecondsSinceEpoch;
 
+    var quickMenuBuildLogged = false;
+
     try {
       await showModalBottomSheet<void>(
         context: context,
@@ -4773,21 +4438,24 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
         ),
         builder: (sheetContext) {
-        final sheetBuiltAt = DateTime.now();
-        final openToBuildMs =
-            sheetBuiltAt.millisecondsSinceEpoch -
-            openStartedAt.millisecondsSinceEpoch;
+        if (!quickMenuBuildLogged) {
+          quickMenuBuildLogged = true;
+          final sheetBuiltAt = DateTime.now();
+          final openToBuildMs =
+              sheetBuiltAt.millisecondsSinceEpoch -
+              openStartedAt.millisecondsSinceEpoch;
 
-        unawaited(
-          _appLog.log(
-            'QuickMenuTiming',
-            'Native QoL menu built: '
-                'source=$source route=$route '
-                'requestToOpenMs=${requestToOpenMs ?? 'unknown'} '
-                'bridgeToOpenMs=${bridgeToOpenMs ?? 'unknown'} '
-                'openToBuildMs=$openToBuildMs',
-          ),
-        );
+          unawaited(
+            _appLog.log(
+              'QuickMenuTiming',
+              'Native QoL menu built: '
+                  'source=$source route=$route '
+                  'requestToOpenMs=${requestToOpenMs ?? 'unknown'} '
+                  'bridgeToOpenMs=${bridgeToOpenMs ?? 'unknown'} '
+                  'openToBuildMs=$openToBuildMs',
+            ),
+          );
+        }
 
         final tabsService = Provider.of<AndroidTabsService>(
           context,

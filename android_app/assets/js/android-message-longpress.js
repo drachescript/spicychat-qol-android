@@ -9,8 +9,6 @@
   const MOVE_CANCEL_PX = 14;
   const SELECT_TEXT_WINDOW_MS = 10000;
   const BRIDGE_ATTR = "data-ds-message-action-bridge";
-  const HEADER_GEAR_ID = "ds-android-native-header-settings";
-  const COG_STYLE_ID = "ds-android-native-cog-appearance";
   const LEGACY_COPY_ID = "ds-android-editable-copy-button";
   const OLD_UI_STYLE_ID = "ds-android-native-ui-cleanup-style";
 
@@ -69,86 +67,9 @@
       });
   }
 
-  // webview_screen.dart owns creation + position.
-  // This only neutralizes global button CSS/pseudo-elements around the cog.
-  function ensureCogAppearanceStyle() {
-    let style = document.getElementById(COG_STYLE_ID);
-    if (style) return style;
-
-    style = document.createElement("style");
-    style.id = COG_STYLE_ID;
-    style.textContent = `
-      #${HEADER_GEAR_ID} {
-        width: 42px !important;
-        height: 42px !important;
-        min-width: 42px !important;
-        min-height: 42px !important;
-        max-width: 42px !important;
-        max-height: 42px !important;
-        padding: 0 !important;
-        margin: 0 !important;
-        border: 0 !important;
-        border-radius: 999px !important;
-        outline: 0 !important;
-        box-shadow: none !important;
-        background: #6d36d9 !important;
-        background-image: none !important;
-        color: #fff !important;
-        box-sizing: border-box !important;
-        overflow: hidden !important;
-        appearance: none !important;
-        -webkit-appearance: none !important;
-        -webkit-tap-highlight-color: transparent !important;
-        isolation: isolate !important;
-      }
-
-      #${HEADER_GEAR_ID}::before,
-      #${HEADER_GEAR_ID}::after,
-      #${HEADER_GEAR_ID} *::before,
-      #${HEADER_GEAR_ID} *::after {
-        content: none !important;
-        display: none !important;
-        width: 0 !important;
-        height: 0 !important;
-        border: 0 !important;
-        outline: 0 !important;
-        box-shadow: none !important;
-        background: transparent !important;
-        background-image: none !important;
-      }
-
-      #${HEADER_GEAR_ID} svg {
-        display: block !important;
-        width: 22px !important;
-        height: 22px !important;
-        min-width: 22px !important;
-        min-height: 22px !important;
-        margin: 0 !important;
-        padding: 0 !important;
-        border: 0 !important;
-        outline: 0 !important;
-        box-shadow: none !important;
-        background: transparent !important;
-        pointer-events: none !important;
-      }
-    `;
-
-    (document.head || document.documentElement).appendChild(style);
-    return style;
-  }
-
+  // The QoL cog is a native Flutter overlay. Keep only the one-time cleanup
+  // for stale Android layout overrides; no page-wide cog DOM observer remains.
   clearLegacyAndroidLayoutOverrides();
-  ensureCogAppearanceStyle();
-
-  const cogStyleObserver = new MutationObserver(() => {
-    if (!document.getElementById(COG_STYLE_ID)) ensureCogAppearanceStyle();
-  });
-
-  cogStyleObserver.observe(document.documentElement, {
-    childList: true,
-    subtree: false
-  });
-
   // ---------------------------------------------------------------------------
   // Native Android message long-press actions only.
   // ---------------------------------------------------------------------------
