@@ -94,6 +94,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   bool _switchingAndroidTab = false;
   bool _tabsEnabledAtSettingsOpen = false;
 
+  // Native top-bar cog geometry. Sample only on load/route/settings changes;
+  // normal chat/list DOM churn never repositions or rescans it.
+  double _androidTopBarGearLeft = 0;
+  double _androidTopBarGearTop = 9;
+  bool _androidTopBarGearPositionReady = false;
+  int _androidTopBarGearPositionGeneration = 0;
+
   // Android Save & Stay history repair.
   DateTime? _androidSaveStayStartedAt;
   String? _androidSaveStayEditorId;
@@ -486,6 +493,153 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  void _scheduleAndroidTopBarGearPosition({String reason = 'route'}) {
+    final generation = ++_androidTopBarGearPositionGeneration;
+
+    // The native control is deliberately not tied to a MutationObserver.
+    // Retry a few bounded times because SpicyChat's header can mount after the
+    // route callback, then leave the position alone until the next route/load.
+    for (final delay in const <Duration>[
+      Duration(milliseconds: 60),
+      Duration(milliseconds: 280),
+      Duration(milliseconds: 900),
+    ]) {
+      Future<void>.delayed(delay, () {
+        if (!mounted || generation != _androidTopBarGearPositionGeneration) {
+          return;
+        }
+        unawaited(_refreshAndroidTopBarGearPosition(reason: reason));
+      });
+    }
+  }
+
+  Future<void> _refreshAndroidTopBarGearPosition({
+    String reason = 'route',
+  }) async {
+    final controller = _webController;
+    if (controller == null || !mounted) return;
+
+    final androidUi = Provider.of<AndroidUiService>(
+      context,
+      listen: false,
+    );
+    if (!androidUi.controlsInSpicyChatTopBar) return;
+
+    try {
+      final value = await controller.evaluateJavascript(
+        source: r'''(() => {
+          const visible = element => {
+            if (!(element instanceof HTMLElement)) return false;
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== "none" &&
+              style.visibility !== "hidden";
+          };
+
+          const path = String(location.pathname || "");
+          const isChat = path === "/chat" || path.startsWith("/chat/");
+          let anchor = null;
+          let kind = "fallback";
+
+          if (isChat) {
+            const rating = document.querySelector(
+              'button[aria-label="ThumbsUp-button"]'
+            );
+            if (visible(rating)) {
+              anchor = rating;
+              kind = "rating";
+            }
+          }
+
+          if (!anchor) {
+            const avatar = document.querySelector('a[aria-label="avatar"]');
+            if (visible(avatar)) {
+              anchor = avatar;
+              kind = "avatar";
+            }
+          }
+
+          if (!anchor) {
+            const locale = document.querySelector('[data-testid="LocaleSelector"]');
+            if (visible(locale)) {
+              anchor = locale;
+              kind = "locale";
+            }
+          }
+
+          const size = 40;
+          const gap = 8;
+          const viewportWidth = Math.max(1, window.innerWidth || 1);
+          let left = Math.max(8, viewportWidth - size - 60);
+          let top = 9;
+
+          if (anchor) {
+            const rect = anchor.getBoundingClientRect();
+            left = rect.left - size - gap;
+            top = rect.top + ((rect.height - size) / 2);
+          }
+
+          left = Math.max(8, Math.min(left, viewportWidth - size - 8));
+          top = Math.max(4, Math.min(top, 140));
+
+          return JSON.stringify({
+            left,
+            top,
+            kind,
+            isChat,
+            reason: __REASON__
+          });
+        })()'''.replaceFirst(
+          '__REASON__',
+          jsonEncode(reason),
+        ),
+      );
+
+      dynamic decoded = value;
+      if (decoded is String) {
+        try {
+          decoded = jsonDecode(decoded);
+          if (decoded is String) decoded = jsonDecode(decoded);
+        } catch (_) {
+          return;
+        }
+      }
+
+      if (decoded is! Map) return;
+      final map = Map<String, dynamic>.from(decoded);
+      final leftValue = map['left'];
+      final topValue = map['top'];
+      if (leftValue is! num || topValue is! num) return;
+
+      final nextLeft = leftValue.toDouble();
+      final nextTop = topValue.toDouble();
+      final changed =
+          !_androidTopBarGearPositionReady ||
+          (_androidTopBarGearLeft - nextLeft).abs() > 0.5 ||
+          (_androidTopBarGearTop - nextTop).abs() > 0.5;
+
+      _androidTopBarGearLeft = nextLeft;
+      _androidTopBarGearTop = nextTop;
+      _androidTopBarGearPositionReady = true;
+
+      if (changed && mounted) setState(() {});
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-topbar-position')) {
+        unawaited(
+          _appLog.log(
+            'AndroidUI',
+            'Could not measure SpicyChat top-bar QoL button position',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+
   FloatingActionButtonLocation _androidControlsLocation(
     String position,
   ) {
@@ -745,6 +899,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   _restorePendingAndroidTabScroll(controller);
                   _scheduleActiveAndroidTabTitleRefresh();
                   unawaited(_syncAndroidChatHeaderGear());
+                  _scheduleAndroidTopBarGearPosition(reason: 'navigation');
                   unawaited(
                     controller.evaluateJavascript(
                       source:
@@ -786,6 +941,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
                   _scheduleActiveAndroidTabTitleRefresh();
                   unawaited(_syncAndroidChatHeaderGear());
+                  _scheduleAndroidTopBarGearPosition(reason: 'navigation');
                   unawaited(
                     controller.evaluateJavascript(
                       source:
@@ -1054,8 +1210,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
               // overlay this never re-anchors to Search/card/chat controls.
               if (useSpicyChatTopBarGear)
                 Positioned(
-                  top: 9,
-                  right: 52,
+                  top: _androidTopBarGearTop,
+                  left: _androidTopBarGearPositionReady
+                      ? _androidTopBarGearLeft
+                      : null,
+                  right: _androidTopBarGearPositionReady ? null : 52,
                   child: FloatingActionButton(
                     heroTag: 'android-qol-topbar',
                     mini: true,
@@ -1465,6 +1624,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
           await _applyAndroidZoomPreference();
           await _syncAndroidChatHeaderGear();
+    _scheduleAndroidTopBarGearPosition(reason: 'settings');
           if (mounted) setState(() {});
         });
   }
@@ -4394,6 +4554,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
     await androidUi.setControlsPosition(selected);
     await _syncAndroidChatHeaderGear();
+    _scheduleAndroidTopBarGearPosition(reason: 'settings');
 
     if (mounted) {
       setState(() {});
