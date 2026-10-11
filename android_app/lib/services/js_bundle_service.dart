@@ -146,6 +146,190 @@ class JsBundleService extends ChangeNotifier {
     'assets/js/main.js',
   ];
 
+  // APK-only composer optimization. Remote extension updates still own all
+  // other modules and features. If the editor module changes shape, use it
+  // unmodified rather than risk breaking a newer QoL release.
+  static String _androidOptimizeComposerSource(String source) {
+    if (!source.contains('function resizeAndroidMessageEdit(textarea)')) {
+      return source;
+    }
+    final resize = RegExp(
+      r'  function resizeAndroidMessageEdit\(textarea\) \{[\s\S]*?(?=\n  function normalizeAndroidMessageEditors\(\))',
+    );
+    final normalize = RegExp(
+      r'  function normalizeAndroidMessageEditors\(\) \{[\s\S]*?(?=\n  function scheduleAndroidMessageEditResize\(textarea = null\))',
+    );
+    final schedule = RegExp(
+      r'  function scheduleAndroidMessageEditResize\(textarea = null\) \{[\s\S]*?(?=\n  function scheduleMobileSendWrapperNormalize\(\))',
+    );
+    if (resize.allMatches(source).length != 1 ||
+        normalize.allMatches(source).length != 1 ||
+        schedule.allMatches(source).length != 1) {
+      return source;
+    }
+
+    return source
+        .replaceFirst(resize, r'''  function resizeAndroidMessageEdit(textarea) {
+    if (!androidAppRuntime() || !mobileLayoutActive()) return false;
+    if (!textarea?.isConnected || !isMessageEditTextarea(textarea)) return false;
+
+    const viewportHeight = Math.max(320,
+      Number(window.visualViewport?.height || window.innerHeight || 640));
+    const minHeight = 96;
+    const maxHeight = Math.max(200, Math.min(360, viewportHeight * 0.46));
+    const styleKey = `${minHeight}:${Math.round(maxHeight)}`;
+    const styleChanged = textarea.dataset.dsAndroidEditStyleKey !== styleKey;
+
+    // React's textarea autosizer and QoL must not write eight CSS properties
+    // twice for every character. Apply the invariant style once per viewport.
+    if (styleChanged) {
+      const properties = {
+        "min-height": `${minHeight}px`,
+        "max-height": `${maxHeight}px`,
+        "box-sizing": "border-box",
+        "line-height": "1.5",
+        "padding-top": "6px",
+        "padding-bottom": "18px",
+        "scroll-padding-bottom": "22px",
+        "overscroll-behavior": "contain"
+      };
+      for (const [name, value] of Object.entries(properties)) {
+        if (textarea.style.getPropertyValue(name) !== value ||
+            textarea.style.getPropertyPriority(name) !== "important") {
+          textarea.style.setProperty(name, value, "important");
+        }
+      }
+      textarea.dataset.dsAndroidEditStyleKey = styleKey;
+    }
+
+    // When a user deletes text, drop the old measured height temporarily so
+    // scrollHeight can shrink. Growing text uses just one measurement/layout.
+    const currentLength = textarea.value.length;
+    const previousLength = Number(textarea.dataset.dsAndroidEditPreviousLength || currentLength);
+    if (currentLength < previousLength) {
+      textarea.style.setProperty("height", "auto", "important");
+    }
+    textarea.dataset.dsAndroidEditPreviousLength = String(currentLength);
+    const naturalHeight = Math.ceil(textarea.scrollHeight + 12);
+    const wantedHeight = Math.max(minHeight, Math.min(maxHeight, naturalHeight));
+    const capped = naturalHeight > maxHeight;
+    const heightValue = `${wantedHeight}px`;
+    const overflowValue = capped ? "auto" : "hidden";
+    const heightChanged = textarea.style.getPropertyValue("height") !== heightValue ||
+      textarea.style.getPropertyPriority("height") !== "important";
+    if (heightChanged) textarea.style.setProperty("height", heightValue, "important");
+    if (textarea.style.getPropertyValue("overflow-y") !== overflowValue) {
+      textarea.style.setProperty("overflow-y", overflowValue, "important");
+    }
+
+    textarea.dataset.dsMobileMessageEditFixed = "1";
+    const layoutReady = textarea.dataset.dsMobileMessageEditLayoutReady === "1";
+    if (styleChanged || heightChanged || !layoutReady) {
+      repairMessageEditAncestors(textarea, wantedHeight);
+    }
+
+    // Keep the active cursor visible without queuing an additional animation
+    // frame every time the user types after hitting the height cap.
+    if (!capped && textarea.scrollTop !== 0) textarea.scrollTop = 0;
+    if (capped && document.activeElement === textarea) {
+      const selectionEnd = Number(textarea.selectionEnd ?? textarea.value.length);
+      if (selectionEnd >= textarea.value.length - 1) {
+        const bottom = Math.max(0, textarea.scrollHeight - textarea.clientHeight);
+        if (Math.abs(textarea.scrollTop - bottom) > 2) textarea.scrollTop = bottom;
+      }
+    }
+    return true;
+  }
+''')
+        .replaceFirst(normalize, r'''  function normalizeAndroidMessageEditors() {
+    if (!androidAppRuntime() || !mobileLayoutActive()) return;
+    // Reconcile restored layouts once when the active editor changes. Repeating
+    // cleanup on every keyboard event is expensive on long message lists.
+    const active = document.activeElement;
+    const editor = active instanceof HTMLTextAreaElement && isMessageEditTextarea(active)
+      ? active : (state.androidTrackedMessageEditor?.isConnected
+        ? state.androidTrackedMessageEditor
+        : document.querySelector("div[id^='message-'] textarea"));
+    if (editor !== state.androidTrackedMessageEditor) {
+      cleanupStaleMessageEditLayoutFixes();
+      state.androidTrackedMessageEditor = editor || null;
+    }
+    if (editor && isMessageEditTextarea(editor)) resizeAndroidMessageEdit(editor);
+  }
+''')
+        .replaceFirst(schedule, r'''  function scheduleAndroidMessageEditResize(textarea = null) {
+    if (!androidAppRuntime() || !mobileLayoutActive()) return;
+    cancelAnimationFrame(state.editResizeRaf);
+    clearTimeout(state.editResizeTimer);
+
+    state.editResizeRaf = requestAnimationFrame(() => {
+      const active = document.activeElement;
+      const editor = textarea?.isConnected && isMessageEditTextarea(textarea)
+        ? textarea
+        : (active instanceof HTMLTextAreaElement && isMessageEditTextarea(active)
+          ? active : document.querySelector("div[id^='message-'] textarea"));
+      if (!editor || !isMessageEditTextarea(editor)) return;
+      resizeAndroidMessageEdit(editor);
+
+      // One cheap conditional React-race check; no second full textarea scan,
+      // no extra double-rAF, and no repeated ancestor restyling after typing.
+      const expectedHeight = editor.style.getPropertyValue("height");
+      state.editResizeTimer = setTimeout(() => {
+        if (!editor.isConnected || !isMessageEditTextarea(editor)) return;
+        if (editor.style.getPropertyValue("height") !== expectedHeight ||
+            editor.dataset.dsMobileMessageEditLayoutReady !== "1") {
+          resizeAndroidMessageEdit(editor);
+        }
+      }, 120);
+    });
+  }
+''');
+  }
+
+  // A tiny event-driven diagnostic hook. No MutationObserver, interval or
+  // chat-wide scan is installed. The app reads one snapshot *after* a renderer
+  // freeze has ended, no more than once per two minutes.
+  static const _androidChatPerformanceDiagnostic = r'''(() => {
+  "use strict";
+  if (window.__dsAndroidPerfDiagnosticInstalled) return;
+  window.__dsAndroidPerfDiagnosticInstalled = true;
+  const activity = { type: "none", at: 0 };
+  const stamp = type => { activity.type = type; activity.at = Date.now(); };
+  document.addEventListener("focusin", event => {
+    const field = event.target;
+    if (field instanceof HTMLTextAreaElement && field.closest("[id^='message-']")) {
+      stamp("edit-focus");
+    }
+  }, true);
+  document.addEventListener("click", event => {
+    const button = event.target?.closest?.("button");
+    if (!button) return;
+    if (button.closest("#ds-long-chat-window-control")) {
+      stamp("chat-history-control");
+      return;
+    }
+    if (!button.closest("[id^='message-']")) return;
+    const label = String(button.textContent || button.getAttribute("aria-label") || "")
+      .trim().toLowerCase();
+    if (label === "save" || label === "cancel") stamp(`edit-${label}`);
+  }, true);
+  window.__dsAndroidChatPerformanceSnapshot = () => {
+    const DS = window.DragonScriptQoL;
+    const state = DS?.state || {};
+    const editor = document.querySelector("[id^='message-'] textarea");
+    return JSON.stringify({
+      path: location.pathname,
+      activity: activity.type,
+      activityAgoMs: activity.at ? Date.now() - activity.at : null,
+      activeEditor: !!editor,
+      historyControl: !!document.getElementById("ds-long-chat-window-control"),
+      folded: Number(state.performanceWindowHiddenCount || 0),
+      shown: Number(state.performanceWindowVisibleCount || 0),
+      loadedMessages: Number(state.runtimePerformance?.loadedChatMessages || 0),
+      performanceProfile: String(state.settings?.runtimePerformanceMode || "unknown")
+    });
+  };
+})();''';
   Future<void> loadAssets() async {
     final remoteActive = qolUpdates.hasDownloadedBundle;
 
@@ -403,6 +587,9 @@ class JsBundleService extends ChangeNotifier {
     `[DS Android] runtime fixes ready; touch tooltip hold=${TOOLTIP_HOLD_MS}ms`
   );
 })();''')
+      ..writeln()
+      ..writeln('// === Android diagnostic hook (APK-owned) ===')
+      ..writeln(_androidChatPerformanceDiagnostic)
       ..writeln();
 
     if (remoteActive) {
@@ -413,17 +600,23 @@ class JsBundleService extends ChangeNotifier {
             'Active QoL update is missing runtime file: $relative',
           );
         }
+        final optimized = relative.endsWith('/composer-control.js')
+            ? _androidOptimizeComposerSource(source)
+            : source;
         buffer
           ..writeln('// === downloaded $relative ===')
-          ..writeln(source)
+          ..writeln(optimized)
           ..writeln();
       }
     } else {
       for (final path in _bundledJsFiles) {
         final source = await rootBundle.loadString(path);
+        final optimized = path.endsWith('/composer-control.js')
+            ? _androidOptimizeComposerSource(source)
+            : source;
         buffer
           ..writeln('// === $path ===')
-          ..writeln(source)
+          ..writeln(optimized)
           ..writeln();
       }
     }

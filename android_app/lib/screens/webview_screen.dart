@@ -1046,6 +1046,12 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                       'Android WebView renderer responsive again; url=${url ?? _lastKnownUrl}',
                     ),
                   );
+                  if (_shouldPersistDiagnostic(
+                    'renderer-recovery-context',
+                    cooldown: const Duration(minutes: 2),
+                  )) {
+                    unawaited(_logRecoveredRendererSnapshot(controller));
+                  }
                   return null;
                 },
                 onRenderProcessGone: (controller, detail) {
@@ -2636,6 +2642,27 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  Future<void> _logRecoveredRendererSnapshot(
+    InAppWebViewController controller,
+  ) async {
+    // The WebView is responsive again; never evaluate JS on an unresponsive
+    // renderer. Give it a short recovery window and avoid large DOM traversals.
+    await Future<void>.delayed(const Duration(milliseconds: 450));
+    if (!mounted) return;
+    try {
+      final result = await controller.evaluateJavascript(
+        source: 'window.__dsAndroidChatPerformanceSnapshot?.() ?? null',
+      );
+      if (result is! String || result.trim().isEmpty) return;
+      await _appLog.log(
+        'RendererContext',
+        'Post-freeze Android chat snapshot: $result',
+      );
+    } catch (_) {
+      // The renderer may have navigated or exited during recovery; do not
+      // turn this optional diagnostic into another failure or log storm.
+    }
+  }
   Future<void> _installAndroidViewportWidthGuard(
     InAppWebViewController controller,
   ) async {
