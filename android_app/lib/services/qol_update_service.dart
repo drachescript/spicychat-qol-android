@@ -23,15 +23,39 @@ class QolUpdateService extends ChangeNotifier {
   static const _rawBase =
       'https://raw.githubusercontent.com/drachescript/spicychat-qol-extension';
 
-  static const _androidOptionsFiles = <String>[
-    'options.html',
-    'options.css',
-    'options.js',
-    'feature-registry.js',
-    'creator-follow-consent.js',
+  // Unlike the old fixed file list, Options dependencies can now live under
+  // settings/, shared/, background/, etc. (QoL 0.2.44+).
+  static const _androidOptionsSupportFiles = <String>[
     'features.md',
     'CHANGELOG.md',
   ];
+
+  static List<String> _optionDependenciesFromHtml(String html) {
+    final tagPattern = RegExp(r'<(?:script|link)\b[^>]*>', caseSensitive: false);
+    final sourcePattern = RegExp(
+      r'''(?:src|href)\s*=\s*["']([^"']+)["']''',
+      caseSensitive: false,
+    );
+    final pathPattern = RegExp(
+      r'^[A-Za-z0-9_./-]+\.(?:js|css)$',
+      caseSensitive: false,
+    );
+    final required = <String>{};
+    for (final tag in tagPattern.allMatches(html)) {
+      final raw = sourcePattern.firstMatch(tag.group(0) ?? '')?.group(1) ?? '';
+      final relative = raw.split(RegExp(r'[?#]')).first.trim();
+      if (relative.isEmpty ||
+          relative.startsWith('/') ||
+          relative.startsWith('.') ||
+          relative.contains('../') ||
+          relative.contains('\\') ||
+          !pathPattern.hasMatch(relative)) {
+        continue;
+      }
+      required.add(relative);
+    }
+    return required.toList(growable: false);
+  }
 
   SharedPreferences? _prefs;
   Directory? _root;
@@ -104,6 +128,7 @@ class QolUpdateService extends ChangeNotifier {
       final runtimeJs = _stringList(map['runtimeJs']);
       final runtimeCss = _stringList(map['runtimeCss']);
       final webResources = _stringList(map['webResources']);
+      final optionsFiles = _stringList(map['optionsFiles']);
       final sha = (map['sha'] ?? '').toString().trim();
 
       if (sha.isEmpty || runtimeJs.isEmpty) {
@@ -111,11 +136,27 @@ class QolUpdateService extends ChangeNotifier {
         return;
       }
 
+      // Reject older, incomplete downloaded bundles even when their commit
+      // SHA hasn't changed. On the next check Android will redownload the same
+      // release with the missing modular Settings assets.
+      final optionsHtmlFile = File(_pathFor(current, 'options.html'));
+      if (!await optionsHtmlFile.exists()) {
+        _clearActiveMetadata();
+        return;
+      }
+      final optionsHtml = await optionsHtmlFile.readAsString();
+      final verifiedOptions = _orderedUnique([
+        'options.html',
+        ...optionsFiles,
+        ..._optionDependenciesFromHtml(optionsHtml),
+      ]);
+
       for (final relative in [
         'manifest.json',
         ...runtimeJs,
         ...runtimeCss,
         ...webResources,
+        ...verifiedOptions,
       ]) {
         if (!await File(_pathFor(current, relative)).exists()) {
           _clearActiveMetadata();
@@ -238,12 +279,30 @@ class QolUpdateService extends ChangeNotifier {
       try {
         await _writeText(staging, 'manifest.json', manifestText);
 
-        final required = <String>[
+        final optionsPage = (manifest['options_page'] ?? 'options.html')
+            .toString()
+            .trim();
+        if (optionsPage != 'options.html') {
+          throw FormatException(
+            'Android does not support this QoL Options page: $optionsPage',
+          );
+        }
+        final optionsHtml = await _getText(
+          client,
+          '$_rawBase/$remoteSha/$optionsPage',
+        );
+        await _writeText(staging, optionsPage, optionsHtml);
+        final optionsFiles = _orderedUnique([
+          optionsPage,
+          ..._optionDependenciesFromHtml(optionsHtml),
+          ..._androidOptionsSupportFiles,
+        ]);
+        final required = _orderedUnique([
           ...js,
           ...css,
           ...web,
-          ..._androidOptionsFiles,
-        ];
+          ...optionsFiles.where((path) => path != optionsPage),
+        ]);
 
         for (var offset = 0; offset < required.length; offset += 8) {
           final end =
@@ -253,19 +312,11 @@ class QolUpdateService extends ChangeNotifier {
           await Future.wait(
             chunk.map(
               (relative) async {
-                try {
-                  final text = await _getText(
-                    client!,
-                    '$_rawBase/$remoteSha/$relative',
-                  );
-                  await _writeText(staging, relative, text);
-                } on HttpException catch (error) {
-                  if (relative == 'creator-follow-consent.js' &&
-                      error.message.contains('404')) {
-                    return;
-                  }
-                  rethrow;
-                }
+                final text = await _getText(
+                  client!,
+                  '$_rawBase/$remoteSha/$relative',
+                );
+                await _writeText(staging, relative, text);
               },
             ),
           );
@@ -288,7 +339,7 @@ class QolUpdateService extends ChangeNotifier {
             'runtimeJs': js,
             'runtimeCss': css,
             'webResources': web,
-            'optionsFiles': _androidOptionsFiles,
+            'optionsFiles': optionsFiles,
           }),
         );
 
