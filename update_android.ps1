@@ -327,6 +327,7 @@ function Update-BundleList {
     param(
         [string]$DartFile,
         [string[]]$ManifestScripts,
+        [string[]]$ManifestStyles,
         [string]$ManifestVersion
     )
 
@@ -375,6 +376,26 @@ function Update-BundleList {
         "`r`n  ];"
 
     $Content = $ListRegex.Replace($Content, $Replacement, 1)
+
+    # Generate the APK fallback stylesheet list from the same manifest as JS.
+    # Otherwise a new CSS module would be copied into assets but never loaded.
+    $CssEntries = [System.Collections.Generic.List[string]]::new()
+    foreach ($CssPath in $ManifestStyles) {
+        $FileName = [System.IO.Path]::GetFileName(($CssPath -replace '/', '\\'))
+        $CssEntries.Add("    'assets/css/$FileName',")
+    }
+    $CssEntriesText = $CssEntries -join "`r`n"
+    $CssListRegex = [regex]::new(
+        '(?ms)^  static const _bundledCssFiles = \[\r?\n.*?^  \];'
+    )
+    if (-not $CssListRegex.IsMatch($Content)) {
+        Fail "Could not find _bundledCssFiles list in js_bundle_service.dart."
+    }
+    $CssReplacement = "  static const _bundledCssFiles = [`r`n" +
+        $CssEntriesText +
+        "`r`n  ];"
+    $Content = $CssListRegex.Replace($Content, $CssReplacement, 1)
+
     Write-IfChanged -Destination $DartFile -Content $Content
 }
 
@@ -687,7 +708,7 @@ if ($OptionsPage) {
 }
 
 # 6) Register every current content script for Android injection in manifest order.
-Update-BundleList -DartFile $BundleService -ManifestScripts $ContentScripts -ManifestVersion ([string]$Manifest.version)
+Update-BundleList -DartFile $BundleService -ManifestScripts $ContentScripts -ManifestStyles $ContentStyles -ManifestVersion ([string]$Manifest.version)
 
 # Guard against the old PowerShell encoding-corruption failure mode.
 $BundleSize = (Get-Item -LiteralPath $BundleService).Length

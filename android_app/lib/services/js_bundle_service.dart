@@ -28,6 +28,12 @@ class JsBundleService extends ChangeNotifier {
     'content/exact-message-counts-bridge.js',
   ];
 
+  // Refreshed from manifest.css by update_android.ps1 on every Android build.
+  // Keep every stylesheet in manifest order, not just content.css.
+  static const _bundledCssFiles = [
+    'assets/css/content.css',
+  ];
+
   static const _bundledJsFiles = [
     'assets/js/card-token-main.js',
     'assets/js/generation-metadata-loader.js',
@@ -333,14 +339,29 @@ class JsBundleService extends ChangeNotifier {
   Future<void> loadAssets() async {
     final remoteActive = qolUpdates.hasDownloadedBundle;
 
-    final remoteCssPath = remoteActive && qolUpdates.runtimeCssPaths.isNotEmpty
-        ? qolUpdates.runtimeCssPaths.first
-        : null;
-
-    _cssContent = remoteCssPath == null
-        ? await rootBundle.loadString('assets/css/content.css')
-        : (await qolUpdates.readDownloadedText(remoteCssPath) ??
-            await rootBundle.loadString('assets/css/content.css'));
+    // Load *all* styles in extension-manifest order. Since v0.2.44 QoL
+    // ships additional CSS modules (Explorer, Memory Vault, Chat Index, etc.)
+    // and content.css on its own cannot style those interfaces completely.
+    // This covers both downloaded QoL updates and APK-bundled fallback files.
+    final cssChunks = <String>[];
+    if (remoteActive) {
+      final paths = qolUpdates.runtimeCssPaths;
+      if (paths.isEmpty) {
+        throw StateError('Downloaded QoL bundle has no stylesheets.');
+      }
+      for (final relative in paths) {
+        final source = await qolUpdates.readDownloadedText(relative);
+        if (source == null) {
+          throw StateError('Downloaded QoL stylesheet missing: $relative');
+        }
+        cssChunks.add(source);
+      }
+    } else {
+      for (final path in _bundledCssFiles) {
+        cssChunks.add(await rootBundle.loadString(path));
+      }
+    }
+    _cssContent = cssChunks.join('\n\n');
 
     _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
         ? qolUpdates.activeVersion
