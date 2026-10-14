@@ -4595,6 +4595,56 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       );
     }
   }
+  // v0.2.48: Android has no browser-action popup. Reuse the QoL content
+  // script's existing BG dialog via the APK-owned runtime message dispatcher.
+  // No polling, DOM scans, duplicate background controls or new JS observers.
+  Future<void> _openAndroidChatBackgroundMenu() async {
+    final controller = _webController;
+    if (!mounted || controller == null || !_isChatUrl(_lastKnownUrl)) return;
+    if (!await _isCurrentUrlTrusted(controller)) return;
+
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r'''(async () => {
+          try {
+            const dispatch = window.__dsAndroidDispatchRuntimeMessage;
+            if (typeof dispatch !== "function") {
+              return JSON.stringify({ ok: false, reason: "bridge" });
+            }
+            const response = await dispatch({ type: "DS_OPEN_CHAT_BACKGROUND_MENU" });
+            return JSON.stringify({
+              ok: response?.ok === true,
+              reason: response?.ok === true ? "" : "disabled"
+            });
+          } catch (error) {
+            return JSON.stringify({ ok: false, reason: "error" });
+          }
+        })()''',
+      );
+
+      final data = raw is String ? jsonDecode(raw) : raw;
+      if (data is Map && data['ok'] == true) return;
+      if (!mounted) return;
+      final reason = data is Map ? data['reason']?.toString() : null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(reason == 'bridge'
+              ? 'QoL has not loaded yet. Open a chat and retry.'
+              : 'Enable Chat backgrounds in QoL Options to use BG.'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not open the chat background menu. Try reloading QoL.'),
+          duration: Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
   Future<void> _showQuickMenu({
     DateTime? requestedAt,
     DateTime? bridgeReceivedAt,
@@ -4688,6 +4738,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
             source: 'window.DragonScriptQoL?.blockCurrentBot?.();',
           );
         },
+        onChatBackground: () {
+          Navigator.pop(sheetContext);
+          unawaited(_openAndroidChatBackgroundMenu());
+        },
         onReloadScripts: () async {
           final messenger = ScaffoldMessenger.of(context);
           Navigator.pop(sheetContext);
@@ -4741,6 +4795,7 @@ class _QuickMenuSheet extends StatelessWidget {
   final VoidCallback onSettings;
   final VoidCallback onExportChat;
   final VoidCallback onBlockCurrentBot;
+  final VoidCallback onChatBackground;
   final VoidCallback onReloadScripts;
   final VoidCallback onRecoverWebView;
   final VoidCallback onCopyLog;
@@ -4759,6 +4814,7 @@ class _QuickMenuSheet extends StatelessWidget {
     required this.onSettings,
     required this.onExportChat,
     required this.onBlockCurrentBot,
+    required this.onChatBackground,
     required this.onReloadScripts,
     required this.onRecoverWebView,
     required this.onCopyLog,
@@ -4839,6 +4895,12 @@ class _QuickMenuSheet extends StatelessWidget {
             label: 'Block Current Bot',
             onTap: onBlockCurrentBot,
           ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.image_outlined,
+              label: 'Chat background (BG)',
+              onTap: onChatBackground,
+            ),
           _QuickMenuItem(
             icon: Icons.code,
             label: 'Re-inject Scripts',
