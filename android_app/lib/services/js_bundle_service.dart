@@ -748,6 +748,9 @@ class JsBundleService extends ChangeNotifier {
       caseSensitive: false,
     );
 
+    // The modular Settings controller runs before options.js in QoL 0.2.47.
+    // Install Android's chrome/storage shim before the FIRST script.
+    final firstRuntimeScriptStart = scriptRegex.firstMatch(html)?.start;
     final scriptMatches =
         scriptRegex.allMatches(html).toList().reversed.toList();
 
@@ -782,7 +785,7 @@ class JsBundleService extends ChangeNotifier {
         source = _androidCompatOptionsScript(source);
       }
 
-      final prefix = name == 'options.js'
+      final prefix = match.start == firstRuntimeScriptStart
           ? '<script>${_safeScript(androidBridge)}</script>\n'
           : '';
       final suffix = name == 'options.js'
@@ -851,7 +854,9 @@ class JsBundleService extends ChangeNotifier {
       }
     }
 
-    const bootBlock = '\nsetupTabs();\nload();\n';
+    const modernBootBlock = '\nsetupTabs();\nsetupSettingsAutosave();\nload();\n';
+    const legacyBootBlock = '\nsetupTabs();\nload();\n';
+    final bootBlock = source.contains(modernBootBlock) ? modernBootBlock : legacyBootBlock;
     if (source.contains(bootBlock)) {
       source = source.replaceFirst(
         bootBlock,
@@ -862,6 +867,15 @@ try {
   console.error("[DS Android Options] setupTabs failed", error);
   (window.__dsAndroidOptionsBootErrors ||= []).push({
     step: "setupTabs()",
+    error: String(error?.stack || error)
+  });
+}
+try {
+  if (typeof setupSettingsAutosave === "function") setupSettingsAutosave();
+} catch (error) {
+  console.error("[DS Android Options] settings autosave initialization failed", error);
+  (window.__dsAndroidOptionsBootErrors ||= []).push({
+    step: "setupSettingsAutosave()",
     error: String(error?.stack || error)
   });
 }

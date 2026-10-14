@@ -133,19 +133,19 @@ function Get-AndroidOptionsHtml([string]$SourceFile) {
     }
 
     if (-not $Html.Contains('options-bridge.js')) {
+        # Android bootstrap must precede the first modular Settings script.
+        # Since 0.2.47, many scripts execute BEFORE options.js.
         $ScriptRegex = [regex]::new(
-            '<script\s+src=["'']options\.js["'']\s*></script>',
+            '<script\b[^>]*\bsrc=["''][^"'']+\.js(?:[?#][^"'']*)?["''][^>]*>\s*</script>',
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
         )
-
-        if (-not $ScriptRegex.IsMatch($Html)) {
-            Fail "Could not find the options.js script tag in options.html."
+        $FirstScript = $ScriptRegex.Match($Html)
+        if (-not $FirstScript.Success) {
+            Fail "Could not find a JavaScript script tag in options.html."
         }
-
-        $Html = $ScriptRegex.Replace(
-            $Html,
-            '<script src="options-bridge.js"></script>' + $NewLine + '  <script src="options.js"></script>',
-            1
+        $Html = $Html.Insert(
+            $FirstScript.Index,
+            '<script src="options-bridge.js"></script>' + $NewLine + '  '
         )
     }
 
