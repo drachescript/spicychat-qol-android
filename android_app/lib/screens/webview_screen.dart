@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -2316,6 +2317,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         if (!await _isCurrentUrlTrusted(controller)) return jsonEncode({'ok': false});
         try {
           final message = jsonDecode(args[0].toString());
+          // Android v0.2.49 HTTPS background image bridge: native HTTPS fetch
+          // with per-host user consent; other runtime messages are untouched.
+          final type = message is Map ? (message['type'] ?? '').toString() : '';
+          if (type == 'DS_BG_FETCH_IMAGE_URL' ||
+              type == 'DS_BG_REQUEST_IMAGE_PERMISSION') {
+            return jsonEncode(await _androidBgRuntimeMessage(message));
+          }
           return jsonEncode(_handleRuntimeMessage(message));
         } catch (e) {
           debugPrint('[Bridge] runtimeMessage error: $e');
@@ -4642,6 +4650,166 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           duration: Duration(seconds: 3),
         ),
       );
+    }
+  }
+
+
+  // Android v0.2.49 HTTPS background image bridge.
+  // Desktop uses optional host permissions in the extension service worker.
+  // The dedicated Android WebView has no service worker, so the app asks the
+  // user for session-only host consent before its native HTTPS image request.
+  final Set<String> _androidBgApprovedHosts = <String>{};
+
+  bool _androidBgIsPublicAddress(InternetAddress address) {
+    if (address.isLoopback || address.isLinkLocal) return false;
+    final text = address.address.toLowerCase();
+    if (address.type == InternetAddressType.IPv6) {
+      // Globally routable IPv6 unicast (2000::/3); no local/mapped addresses.
+      return text.startsWith('2') || text.startsWith('3');
+    }
+    if (address.type != InternetAddressType.IPv4) return false;
+    final parts = text.split('.').map(int.tryParse).toList();
+    if (parts.length != 4 || parts.any((v) => v == null || v < 0 || v > 255)) {
+      return false;
+    }
+    final a = parts[0]!, b = parts[1]!;
+    return a != 0 && a != 10 && a != 127 && a < 224 &&
+        !(a == 100 && b >= 64 && b <= 127) &&
+        !(a == 169 && b == 254) &&
+        !(a == 172 && b >= 16 && b <= 31) &&
+        !(a == 192 && (b == 0 || b == 168)) &&
+        !(a == 198 && (b == 18 || b == 19 || b == 51)) &&
+        !(a == 203 && b == 0);
+  }
+
+  Future<Uri?> _androidBgPublicUrl(String raw) async {
+    final uri = Uri.tryParse(raw.trim());
+    if (uri == null || uri.scheme != 'https' || uri.userInfo.isNotEmpty ||
+        uri.host.isEmpty || uri.toString().length > 2048 ||
+        (uri.hasPort && uri.port != 443)) return null;
+    final host = uri.host.toLowerCase();
+    // No numeric/local hosts, intranet names, or nonstandard hostnames.
+    if (InternetAddress.tryParse(host) != null ||
+        !RegExp(r'^[a-z0-9-]+(?:\.[a-z0-9-]+)+$').hasMatch(host) ||
+        host.endsWith('.local') || host.endsWith('.internal') ||
+        host.endsWith('.localhost') || host.endsWith('.test') ||
+        host.endsWith('.example') || host.endsWith('.invalid')) return null;
+    try {
+      final addresses = await InternetAddress.lookup(host)
+          .timeout(const Duration(seconds: 8));
+      if (addresses.isEmpty || addresses.any((ip) => !_androidBgIsPublicAddress(ip))) {
+        return null;
+      }
+      return uri;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _androidBgImageType(Uint8List bytes) {
+    if (bytes.length < 12) return null;
+    if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e &&
+        bytes[3] == 0x47 && bytes[4] == 0x0d && bytes[5] == 0x0a) return 'image/png';
+    if (bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff) return 'image/jpeg';
+    if (bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 &&
+        bytes[3] == 0x38 && (bytes[4] == 0x37 || bytes[4] == 0x39)) return 'image/gif';
+    if (bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 &&
+        bytes[3] == 0x46 && bytes[8] == 0x57 && bytes[9] == 0x45 &&
+        bytes[10] == 0x42 && bytes[11] == 0x50) return 'image/webp';
+    if (bytes[0] == 0x42 && bytes[1] == 0x4d) return 'image/bmp';
+    if (bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 &&
+        bytes[7] == 0x70 && bytes[8] == 0x61 && bytes[9] == 0x76 &&
+        bytes[10] == 0x69 && (bytes[11] == 0x66 || bytes[11] == 0x73)) return 'image/avif';
+    return null; // In particular never return HTML or SVG as image content.
+  }
+
+  Future<Map<String, dynamic>> _androidBgRuntimeMessage(dynamic message) async {
+    const limit = 8 * 1024 * 1024;
+    if (message is! Map) return {'ok': false, 'error': 'Invalid background request.'};
+    final type = (message['type'] ?? '').toString();
+    final uri = await _androidBgPublicUrl((message['url'] ?? '').toString());
+    if (uri == null) {
+      return {'ok': false, 'error': 'Use a public HTTPS image URL with a valid host.'};
+    }
+    final host = uri.host.toLowerCase();
+    if (type == 'DS_BG_REQUEST_IMAGE_PERMISSION') {
+      if (_androidBgApprovedHosts.contains(host)) return {'ok': true};
+      if (!mounted) return {'ok': false, 'error': 'App is not ready.'};
+      final allowed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Allow background image download?'),
+          content: Text('Allow QoL to download an image from $host? '
+              'Permission lasts until the app closes. No SpicyChat '
+              'account details or cookies will be sent to this site.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Allow this host'),
+            ),
+          ],
+        ),
+      );
+      if (allowed != true) return {'ok': false, 'error': 'Image host permission denied.'};
+      _androidBgApprovedHosts.add(host);
+      return {'ok': true};
+    }
+    if (type != 'DS_BG_FETCH_IMAGE_URL') {
+      return {'ok': false, 'error': 'Unsupported background request.'};
+    }
+    if (!_androidBgApprovedHosts.contains(host)) {
+      return {'ok': false, 'requiresPermission': true, 'origin': 'https://$host/*'};
+    }
+
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client.getUrl(uri).timeout(const Duration(seconds: 12));
+      request.followRedirects = false; // Redirects must not bypass host consent.
+      request.headers.set(HttpHeaders.acceptHeader,
+          'image/png,image/jpeg,image/webp,image/gif,image/avif,image/bmp');
+      final response = await request.close().timeout(const Duration(seconds: 15));
+      if (response.statusCode != HttpStatus.ok) {
+        return {'ok': false, 'error': 'Image server returned HTTP ${response.statusCode}. Redirects are not followed on Android.'};
+      }
+      if (response.contentLength > limit) {
+        return {'ok': false, 'error': 'Image exceeds the 8 MB limit.'};
+      }
+      final contentType = (response.headers.value(HttpHeaders.contentTypeHeader) ?? '')
+          .split(';').first.trim().toLowerCase();
+      if (contentType.isNotEmpty && contentType != 'application/octet-stream' &&
+          !contentType.startsWith('image/')) {
+        return {'ok': false, 'error': 'The URL did not return an image.'};
+      }
+      final buffer = await response.fold<BytesBuilder>(BytesBuilder(copy: false),
+          (builder, chunk) {
+        if (builder.length + chunk.length > limit) {
+          throw const FormatException('Image exceeds the 8 MB limit.');
+        }
+        builder.add(chunk);
+        return builder;
+      }).timeout(const Duration(seconds: 30));
+      final bytes = buffer.takeBytes();
+      final mime = _androidBgImageType(bytes);
+      if (mime == null) {
+        return {'ok': false, 'error': 'Only PNG, JPG, GIF, WebP, AVIF, or BMP images are supported.'};
+      }
+      final lastPath = uri.pathSegments.isNotEmpty ? uri.pathSegments.last : '';
+      final name = lastPath.replaceAll(RegExp(r'[^a-zA-Z0-9._ -]'), '_');
+      return {
+        'ok': true,
+        'dataUrl': 'data:$mime;base64,${base64Encode(bytes)}',
+        'name': name.isEmpty ? 'Background image' : name.substring(0, name.length > 90 ? 90 : name.length),
+      };
+    } on FormatException catch (error) {
+      return {'ok': false, 'error': error.message};
+    } catch (_) {
+      return {'ok': false, 'error': 'Image download failed. Check the URL and connection.'};
+    } finally {
+      client.close(force: true);
     }
   }
 
