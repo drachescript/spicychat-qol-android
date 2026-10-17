@@ -4638,7 +4638,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         SnackBar(
           content: Text(reason == 'bridge'
               ? 'QoL has not loaded yet. Open a chat and retry.'
-              : 'Enable Chat backgrounds in QoL Options to use BG.'),
+              : 'Enable a Custom Pictures feature in QoL Options to use this menu.'),
           duration: const Duration(seconds: 3),
         ),
       );
@@ -4646,7 +4646,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Could not open the chat background menu. Try reloading QoL.'),
+          content: Text('Could not open Custom Pictures. Try reloading QoL.'),
           duration: Duration(seconds: 3),
         ),
       );
@@ -5066,7 +5066,7 @@ class _QuickMenuSheet extends StatelessWidget {
           if (isChatPage)
             _QuickMenuItem(
               icon: Icons.image_outlined,
-              label: 'Chat background (BG)',
+              label: 'Custom Pictures',
               onTap: onChatBackground,
             ),
           _QuickMenuItem(
