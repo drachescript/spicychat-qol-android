@@ -155,6 +155,25 @@ class JsBundleService extends ChangeNotifier {
   // APK-only composer optimization. Remote extension updates still own all
   // other modules and features. If the editor module changes shape, use it
   // unmodified rather than risk breaking a newer QoL release.
+  // Android uses one WebView. Keep the queued Lorebook entry in storage
+  // before navigating away from its originating chat; desktop keeps its popup.
+  static String _androidCompatChatLorebookManagerSource(String source) {
+    const popupBeforeSave = "const opened=window.open(destination,'_blank','noopener,noreferrer');";
+    const afterSave = "state.textContent='Prepared. Open the editor tab and use Review queued entry to fill the native Add Entry form.';";
+    if (!source.contains(popupBeforeSave) || !source.contains(afterSave)) {
+      return source; // A future QoL revision may own this flow itself.
+    }
+    return source.replaceFirst(
+      popupBeforeSave,
+      "const opened=window.__spicyChatQolAndroidApp===true ? null : "
+      "window.open(destination,'_blank','noopener,noreferrer');",
+    ).replaceFirst(
+      afterSave,
+      "if (window.__spicyChatQolAndroidApp===true) { window.location.assign(destination); return; }\n"
+      "$afterSave",
+    );
+  }
+
   static String _androidOptimizeComposerSource(String source) {
     if (!source.contains('function resizeAndroidMessageEdit(textarea)')) {
       return source;
@@ -623,7 +642,9 @@ class JsBundleService extends ChangeNotifier {
         }
         final optimized = relative.endsWith('/composer-control.js')
             ? _androidOptimizeComposerSource(source)
-            : source;
+            : relative.endsWith('/chat-lorebook-manager.js')
+                ? _androidCompatChatLorebookManagerSource(source)
+                : source;
         buffer
           ..writeln('// === downloaded $relative ===')
           ..writeln(optimized)
@@ -634,7 +655,9 @@ class JsBundleService extends ChangeNotifier {
         final source = await rootBundle.loadString(path);
         final optimized = path.endsWith('/composer-control.js')
             ? _androidOptimizeComposerSource(source)
-            : source;
+            : path.endsWith('/chat-lorebook-manager.js')
+                ? _androidCompatChatLorebookManagerSource(source)
+                : source;
         buffer
           ..writeln('// === $path ===')
           ..writeln(optimized)
