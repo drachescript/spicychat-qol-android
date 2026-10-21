@@ -242,12 +242,25 @@ class AndroidSettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  const Text(
-                    'Source: spicychat-qol-extension / main',
-                    style: TextStyle(
+                  Text(
+                    'Source: ${qolUpdates.updateChannel}',
+                    style: const TextStyle(
                       color: Colors.white70,
                       fontSize: 13,
                     ),
+                  ),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Experimental QoL updates'),
+                    subtitle: const Text(
+                      'OFF: published stable releases. ON: untested main branch changes.',
+                    ),
+                    value: qolUpdates.experimentalChannel,
+                    onChanged: qolUpdates.checking
+                        ? null
+                        : (enabled) async {
+                            await qolUpdates.setExperimentalChannel(enabled);
+                          },
                   ),
                   const SizedBox(height: 4),
                   const Text(
@@ -357,8 +370,30 @@ class AndroidSettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: qolUpdates.checking ? null : () async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      try {
+                        final oldDownloaded = await qolUpdates.restoreWorkingBundle();
+                        if (!context.mounted) return;
+                        messenger.showSnackBar(SnackBar(content: Text(
+                          oldDownloaded
+                              ? 'Previous QoL bundle restored. Reload SpicyChat to use it.'
+                              : 'APK-bundled QoL fallback restored. Reload SpicyChat to use it.',
+                        )));
+                      } catch (error) {
+                        if (!context.mounted) return;
+                        messenger.showSnackBar(SnackBar(content: Text(
+                          'QoL recovery failed: $error',
+                        )));
+                      }
+                    },
+                    icon: const Icon(Icons.restore),
+                    label: const Text('Restore working QoL version'),
+                  ),
+                  const SizedBox(height: 8),
                   const Text(
-                    'This updater follows the extension repository directly. '
+                    'Stable updates follow published QoL releases. '
                     'It downloads the shared runtime, CSS, Options page and '
                     'support files into app storage. The APK-owned Android '
                     'bridge stays bundled for safety. A newly downloaded '
@@ -544,7 +579,7 @@ class AndroidSettingsScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
-                    value: androidUi.controlsPosition,
+                    initialValue: androidUi.controlsPosition,
                     isExpanded: true,
                     decoration: const InputDecoration(
                       labelText: 'Position',
@@ -595,7 +630,7 @@ class AndroidSettingsScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
-                    value: androidUi.defaultStartPage,
+                    initialValue: androidUi.defaultStartPage,
                     isExpanded: true,
                     decoration: const InputDecoration(
                       labelText: 'Start page',

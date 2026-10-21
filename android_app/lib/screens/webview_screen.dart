@@ -6,7 +6,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:file_picker/file_picker.dart';
@@ -671,7 +670,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       body: SafeArea(
         child: PopScope(
           canPop: false,
-          onPopInvoked: (didPop) async {
+          onPopInvokedWithResult: (didPop, _) async {
             if (didPop) return;
 
             final tabsService = Provider.of<AndroidTabsService>(
@@ -1925,6 +1924,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       // work and used to make Android Options report the live page as unknown.
       var title = 'SpicyChat';
       try {
+        if (!mounted) return null;
         final tabsService = Provider.of<AndroidTabsService>(
           context,
           listen: false,
@@ -4005,6 +4005,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  // Kept for native file backup import; currently not called by the screen.
+  // ignore: unused_element
   Future<void> _importBackup() async {
     try {
       final result = await FilePicker.platform.pickFiles(
@@ -4036,6 +4038,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  // Kept for native clipboard backup import; currently not called by the screen.
+  // ignore: unused_element
   Future<void> _pasteBackup() async {
     final clipboard = await Clipboard.getData(Clipboard.kTextPlain);
     final controller = TextEditingController(text: clipboard?.text ?? '');
@@ -4077,6 +4081,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     await _restoreBackupText(pasted, source: 'pasted text');
   }
 
+  // Kept for native backup clipboard export; currently not called by the screen.
+  // ignore: unused_element
   Future<void> _copyFullBackup() async {
     try {
       final settingsService = Provider.of<SettingsService>(
@@ -4104,6 +4110,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   // ── Backup Export ──────────────────────────────────────────
 
+  // Kept for native backup file export; currently not called by the screen.
+  // ignore: unused_element
   Future<void> _exportFullBackup() async {
     try {
       final settingsService = Provider.of<SettingsService>(
@@ -4576,20 +4584,27 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   style: TextStyle(color: Colors.white60),
                 ),
               ),
-              for (final value in AndroidUiService.allowedPositions)
-                RadioListTile<String>(
-                  value: value,
-                  groupValue: androidUi.controlsPosition,
-                  title: Text(
-                    AndroidUiService.labelFor(value),
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                  onChanged: (next) {
-                    if (next != null) {
-                      Navigator.of(sheetContext).pop(next);
-                    }
-                  },
+              RadioGroup<String>(
+                groupValue: androidUi.controlsPosition,
+                onChanged: (next) {
+                  if (next != null) {
+                    Navigator.of(sheetContext).pop(next);
+                  }
+                },
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final value in AndroidUiService.allowedPositions)
+                      RadioListTile<String>(
+                        value: value,
+                        title: Text(
+                          AndroidUiService.labelFor(value),
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                  ],
                 ),
+              ),
               const SizedBox(height: 8),
             ],
           ),
@@ -4698,14 +4713,18 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     final uri = Uri.tryParse(raw.trim());
     if (uri == null || uri.scheme != 'https' || uri.userInfo.isNotEmpty ||
         uri.host.isEmpty || uri.toString().length > 2048 ||
-        (uri.hasPort && uri.port != 443)) return null;
+        (uri.hasPort && uri.port != 443)) {
+      return null;
+    }
     final host = uri.host.toLowerCase();
     // No numeric/local hosts, intranet names, or nonstandard hostnames.
     if (InternetAddress.tryParse(host) != null ||
         !RegExp(r'^[a-z0-9-]+(?:\.[a-z0-9-]+)+$').hasMatch(host) ||
         host.endsWith('.local') || host.endsWith('.internal') ||
         host.endsWith('.localhost') || host.endsWith('.test') ||
-        host.endsWith('.example') || host.endsWith('.invalid')) return null;
+        host.endsWith('.example') || host.endsWith('.invalid')) {
+      return null;
+    }
     try {
       final addresses = await InternetAddress.lookup(host)
           .timeout(const Duration(seconds: 8));
@@ -4721,17 +4740,25 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   String? _androidBgImageType(Uint8List bytes) {
     if (bytes.length < 12) return null;
     if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e &&
-        bytes[3] == 0x47 && bytes[4] == 0x0d && bytes[5] == 0x0a) return 'image/png';
+        bytes[3] == 0x47 && bytes[4] == 0x0d && bytes[5] == 0x0a) {
+      return 'image/png';
+    }
     if (bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff) return 'image/jpeg';
     if (bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 &&
-        bytes[3] == 0x38 && (bytes[4] == 0x37 || bytes[4] == 0x39)) return 'image/gif';
+        bytes[3] == 0x38 && (bytes[4] == 0x37 || bytes[4] == 0x39)) {
+      return 'image/gif';
+    }
     if (bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 &&
         bytes[3] == 0x46 && bytes[8] == 0x57 && bytes[9] == 0x45 &&
-        bytes[10] == 0x42 && bytes[11] == 0x50) return 'image/webp';
+        bytes[10] == 0x42 && bytes[11] == 0x50) {
+      return 'image/webp';
+    }
     if (bytes[0] == 0x42 && bytes[1] == 0x4d) return 'image/bmp';
     if (bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 &&
         bytes[7] == 0x70 && bytes[8] == 0x61 && bytes[9] == 0x76 &&
-        bytes[10] == 0x69 && (bytes[11] == 0x66 || bytes[11] == 0x73)) return 'image/avif';
+        bytes[10] == 0x69 && (bytes[11] == 0x66 || bytes[11] == 0x73)) {
+      return 'image/avif';
+    }
     return null; // In particular never return HTML or SVG as image content.
   }
 

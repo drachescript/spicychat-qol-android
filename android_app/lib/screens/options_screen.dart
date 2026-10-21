@@ -1,7 +1,6 @@
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -460,10 +459,10 @@ class _OptionsScreenState extends State<OptionsScreen> {
               displayZoomControls: false,
             ),
             onWebViewCreated: _registerHandlers,
-            onLoadStart: (_, __) {
+            onLoadStart: (_, _) {
               if (mounted) setState(() => _isLoading = true);
             },
-            onLoadStop: (_, __) {
+            onLoadStop: (_, _) {
               if (mounted) setState(() => _isLoading = false);
             },
             onProgressChanged: (_, progress) {

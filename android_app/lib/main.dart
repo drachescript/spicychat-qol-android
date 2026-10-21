@@ -183,6 +183,19 @@ void main() async {
     await bundleService.loadAssets().timeout(const Duration(seconds: 15));
     unawaited(appLog.log('Startup', 'QoL bundle assets loaded'));
   } catch (e, stackTrace) {
+    // A damaged remote bundle must not leave QoL unavailable at launch.
+    // Try the last downloaded version, then the APK's bundled assets.
+    try {
+      final recovered = await qolUpdateService.rollbackToPrevious();
+      if (!recovered) await qolUpdateService.disableDownloadedBundle();
+      await bundleService.loadAssets().timeout(const Duration(seconds: 15));
+      unawaited(appLog.log('Startup',
+          recovered ? 'Recovered previous QoL bundle'
+              : 'Recovered APK-bundled QoL fallback', level: 'WARN'));
+    } catch (recoveryError, recoveryTrace) {
+      unawaited(appLog.log('Startup', 'QoL fallback recovery failed',
+          level: 'ERROR', error: recoveryError, stackTrace: recoveryTrace));
+    }
     unawaited(
       appLog.log(
         'Startup',

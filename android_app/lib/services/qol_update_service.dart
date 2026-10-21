@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -18,6 +20,9 @@ class QolUpdateService extends ChangeNotifier {
   static const automaticCheckInterval = Duration(hours: 12);
 
   static const _lastCheckedKey = 'ds_android_qol_update_last_checked_ms';
+  static const _experimentalKey = 'ds_android_qol_update_experimental';
+  // Increment only for an APK change to the native bridge protocol.
+  static const int androidBridgeVersion = 1;
   static const _repoApi =
       'https://api.github.com/repos/drachescript/spicychat-qol-extension';
   static const _rawBase =
@@ -67,6 +72,9 @@ class QolUpdateService extends ChangeNotifier {
   String? _errorMessage;
   String _activeVersion = '';
   String _activeSha = '';
+  bool _experimentalChannel = false;
+  String? _selectedReleaseVersion;
+  bool _activeHasHashes = false;
   List<String> _runtimeJs = const [];
   List<String> _runtimeCss = const [];
   List<String> _webResources = const [];
@@ -79,6 +87,19 @@ class QolUpdateService extends ChangeNotifier {
   DateTime? get lastCheckedAt => _lastCheckedAt;
   String get activeVersion => _activeVersion;
   String get activeSha => _activeSha;
+  bool get experimentalChannel => _experimentalChannel;
+  String get updateChannel => _experimentalChannel
+      ? 'Experimental (main)'
+      : 'Stable releases';
+
+  Future<void> setExperimentalChannel(bool enabled) async {
+    if (_checking || _experimentalChannel == enabled) return;
+    _experimentalChannel = enabled;
+    _lastCheckedAt = null; // Recheck immediately on the chosen channel.
+    await _prefs?.setBool(_experimentalKey, enabled);
+    await _prefs?.remove(_lastCheckedKey);
+    notifyListeners();
+  }
   List<String> get runtimeJsPaths => List.unmodifiable(_runtimeJs);
   List<String> get runtimeCssPaths => List.unmodifiable(_runtimeCss);
   List<String> get webResourcePaths => List.unmodifiable(_webResources);
@@ -89,6 +110,7 @@ class QolUpdateService extends ChangeNotifier {
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
+    _experimentalChannel = _prefs?.getBool(_experimentalKey) ?? false;
     final last = _prefs?.getInt(_lastCheckedKey);
     if (last != null && last > 0) {
       _lastCheckedAt = DateTime.fromMillisecondsSinceEpoch(last);
@@ -101,6 +123,10 @@ class QolUpdateService extends ChangeNotifier {
         Directory('${_root!.path}${Platform.pathSeparator}current');
 
     await _loadActiveMetadata();
+    // A partial/corrupt update must never strand a launch.
+    if (!hasDownloadedBundle) {
+      await rollbackToPrevious();
+    }
   }
 
   Future<void> _loadActiveMetadata() async {
@@ -129,6 +155,11 @@ class QolUpdateService extends ChangeNotifier {
       final runtimeCss = _stringList(map['runtimeCss']);
       final webResources = _stringList(map['webResources']);
       final optionsFiles = _stringList(map['optionsFiles']);
+      final fileHashesRaw = map['fileHashes'];
+      final hashes = fileHashesRaw is Map
+          ? Map<String, dynamic>.from(fileHashesRaw)
+          : <String, dynamic>{};
+      final requiresHashes = (map['schemaVersion'] == 2);
       final sha = (map['sha'] ?? '').toString().trim();
 
       if (sha.isEmpty || runtimeJs.isEmpty) {
@@ -151,21 +182,34 @@ class QolUpdateService extends ChangeNotifier {
         ..._optionDependenciesFromHtml(optionsHtml),
       ]);
 
-      for (final relative in [
+      for (final relative in _orderedUnique([
         'manifest.json',
         ...runtimeJs,
         ...runtimeCss,
         ...webResources,
         ...verifiedOptions,
-      ]) {
-        if (!await File(_pathFor(current, relative)).exists()) {
+      ])) {
+        final file = File(_pathFor(current, relative));
+        if (!await file.exists()) {
           _clearActiveMetadata();
           return;
+        }
+        // Old v1 downloads are readable, but all newly downloaded v2
+        // bundles must have every asset verified byte for byte.
+        if (requiresHashes || hashes.isNotEmpty) {
+          final expected = (hashes[relative] ?? '').toString();
+          if (!RegExp(r'^[a-f0-9]{64}$').hasMatch(expected) ||
+              sha256.convert(await file.readAsBytes()).toString() !=
+                  expected) {
+            _clearActiveMetadata();
+            return;
+          }
         }
       }
 
       _activeVersion = (map['version'] ?? '').toString().trim();
       _activeSha = sha;
+      _activeHasHashes = requiresHashes;
       _runtimeJs = runtimeJs;
       _runtimeCss = runtimeCss;
       _webResources = webResources;
@@ -175,6 +219,7 @@ class QolUpdateService extends ChangeNotifier {
   }
 
   void _clearActiveMetadata() {
+    _activeHasHashes = false;
     _activeVersion = '';
     _activeSha = '';
     _runtimeJs = const [];
@@ -218,12 +263,13 @@ class QolUpdateService extends ChangeNotifier {
         ..connectionTimeout = const Duration(seconds: 12)
         ..idleTimeout = const Duration(seconds: 12);
 
-      final remoteSha = await _fetchRemoteMainSha(client);
+      final remoteSha = await _fetchRemoteApprovedSha(client);
       if (remoteSha.isEmpty) {
         throw const FormatException('GitHub did not return a main-branch SHA.');
       }
 
-      if (remoteSha == _activeSha && hasDownloadedBundle) {
+      if (remoteSha == _activeSha && hasDownloadedBundle &&
+          _activeHasHashes) {
         await _recordSuccessfulCheck();
         _status = QolUpdateStatus.upToDate;
         return;
@@ -238,6 +284,21 @@ class QolUpdateService extends ChangeNotifier {
         throw const FormatException('QoL manifest.json was not an object.');
       }
       final manifest = Map<String, dynamic>.from(manifestRaw);
+      _checkManifestCompatibility(manifest);
+      final incomingVersion =
+          (manifest['version_name'] ?? manifest['version'] ?? '').toString().trim();
+      if (!_experimentalChannel &&
+          incomingVersion != _selectedReleaseVersion) {
+        throw FormatException(
+          'Stable release tag does not match its manifest version.',
+        );
+      }
+      if (hasDownloadedBundle &&
+          _compareNumericVersions(incomingVersion, _activeVersion) < 0) {
+        throw StateError(
+          'Refusing to downgrade QoL from $_activeVersion to $incomingVersion.',
+        );
+      }
 
       final runtimeJs = <String>[];
       final runtimeCss = <String>[];
@@ -277,7 +338,12 @@ class QolUpdateService extends ChangeNotifier {
       await staging.create(recursive: true);
 
       try {
-        await _writeText(staging, 'manifest.json', manifestText);
+        final fileHashes = <String, String>{};
+        Future<void> save(String relative, String value) async {
+          await _writeText(staging, relative, value);
+          fileHashes[relative] = sha256.convert(utf8.encode(value)).toString();
+        }
+        await save('manifest.json', manifestText);
 
         final optionsPage = (manifest['options_page'] ?? 'options.html')
             .toString()
@@ -291,7 +357,7 @@ class QolUpdateService extends ChangeNotifier {
           client,
           '$_rawBase/$remoteSha/$optionsPage',
         );
-        await _writeText(staging, optionsPage, optionsHtml);
+        await save(optionsPage, optionsHtml);
         final optionsFiles = _orderedUnique([
           optionsPage,
           ..._optionDependenciesFromHtml(optionsHtml),
@@ -316,7 +382,7 @@ class QolUpdateService extends ChangeNotifier {
                   client!,
                   '$_rawBase/$remoteSha/$relative',
                 );
-                await _writeText(staging, relative, text);
+                await save(relative, text);
               },
             ),
           );
@@ -332,7 +398,8 @@ class QolUpdateService extends ChangeNotifier {
           staging,
           'metadata.json',
           const JsonEncoder.withIndent('  ').convert({
-            'schemaVersion': 1,
+            'schemaVersion': 2,
+            'fileHashes': fileHashes,
             'version': version,
             'sha': remoteSha,
             'downloadedAt': DateTime.now().toUtc().toIso8601String(),
@@ -344,20 +411,30 @@ class QolUpdateService extends ChangeNotifier {
         );
 
         await _activateStaging(staging);
-        await _loadActiveMetadata();
-
-        if (!hasDownloadedBundle || _activeSha != remoteSha) {
-          throw const FileSystemException(
-            'Downloaded QoL bundle did not activate cleanly.',
-          );
-        }
-
-        await _recordSuccessfulCheck();
-        _status = QolUpdateStatus.updated;
-
-        final callback = onBundleActivated;
-        if (callback != null) {
-          await callback();
+        try {
+          await _loadActiveMetadata();
+          if (!hasDownloadedBundle || _activeSha != remoteSha) {
+            throw const FileSystemException(
+              'Downloaded QoL bundle did not activate cleanly.',
+            );
+          }
+          final callback = onBundleActivated;
+          if (callback != null) await callback();
+          // Previous bundle remains on disk for a future manual or
+          // startup rollback. Never discard the last working version
+          // just because the downloaded files exist.
+          await _recordSuccessfulCheck();
+          _status = QolUpdateStatus.updated;
+        } catch (activationError) {
+          if (!await rollbackToPrevious()) {
+            await disableDownloadedBundle();
+          }
+          try {
+            await onBundleActivated?.call();
+          } catch (_) {
+            // Keep the older bundle/fallback; report original error.
+          }
+          rethrow;
         }
       } catch (_) {
         if (await staging.exists()) {
@@ -375,11 +452,81 @@ class QolUpdateService extends ChangeNotifier {
     }
   }
 
-  Future<String> _fetchRemoteMainSha(HttpClient client) async {
-    final text = await _getText(client, '$_repoApi/commits/main');
-    final decoded = jsonDecode(text);
-    if (decoded is! Map) return '';
-    return (decoded['sha'] ?? '').toString().trim();
+  /// Stable follows GitHub's latest published non-prerelease. Experimental
+  /// deliberately follows main and can receive unpublished changes.
+  Future<String> _fetchRemoteApprovedSha(HttpClient client) async {
+    _selectedReleaseVersion = null;
+    if (_experimentalChannel) {
+      final raw = jsonDecode(await _getText(client, '$_repoApi/commits/main'));
+      if (raw is! Map) return '';
+      return (raw['sha'] ?? '').toString().trim();
+    }
+    final release = jsonDecode(await _getText(client, '$_repoApi/releases/latest'));
+    if (release is! Map || release['draft'] == true ||
+        release['prerelease'] == true) {
+      throw const FormatException('No approved stable QoL release found.');
+    }
+    final tag = (release['tag_name'] ?? '').toString().trim();
+    if (!RegExp(r'^v[0-9]+\.[0-9]+\.[0-9]+$').hasMatch(tag)) {
+      throw FormatException('Invalid stable QoL release tag: $tag');
+    }
+    _selectedReleaseVersion = tag.substring(1);
+    final commit = jsonDecode(await _getText(
+      client, '$_repoApi/commits/${Uri.encodeComponent(tag)}',
+    ));
+    if (commit is! Map) return '';
+    return (commit['sha'] ?? '').toString().trim();
+  }
+
+  static int _compareNumericVersions(String incoming, String current) {
+    List<int>? parse(String value) {
+      final match = RegExp(r'^([0-9]+)\.([0-9]+)\.([0-9]+)$').firstMatch(value);
+      if (match == null) return null;
+      return [for (var i = 1; i <= 3; i++) int.parse(match.group(i)!)];
+    }
+    final a = parse(incoming);
+    final b = parse(current);
+    if (a == null || b == null) return 0;
+    for (var i = 0; i < 3; i++) {
+      final diff = a[i].compareTo(b[i]);
+      if (diff != 0) return diff;
+    }
+    return 0;
+  }
+
+  static void _checkManifestCompatibility(Map<String, dynamic> manifest) {
+    final compatibility = manifest['androidCompatibility'];
+    final rawVersion = compatibility is Map
+        ? compatibility['minBridgeVersion']
+        : manifest['minAndroidBridgeVersion'];
+    final minimum = rawVersion == null ? 1 : int.tryParse(rawVersion.toString());
+    if (minimum == null || minimum < 1) {
+      throw const FormatException('Invalid minimum Android bridge version.');
+    }
+    final groups = manifest['content_scripts'];
+    if (groups is List) {
+      for (final group in groups) {
+        if (group is! Map || group['world'] != 'MAIN') continue;
+        final paths = group['js'];
+        if (paths is! List) continue;
+        for (final path in paths) {
+          if (path != 'content/card-token-main.js') {
+            throw StateError('New MAIN-world script requires Android review: $path');
+          }
+        }
+      }
+    }
+    if (minimum > androidBridgeVersion) {
+      throw StateError('QoL requires Android bridge $minimum; this APK has '
+          '$androidBridgeVersion. Update the Android APK first.');
+    }
+    final required = compatibility is Map
+        ? compatibility['requiredNativeFeatures']
+        : null;
+    if (required != null && (required is! List || required.isNotEmpty)) {
+      throw StateError('QoL requires additional native Android features. '
+          'Update the Android APK first.');
+    }
   }
 
   Future<void> _recordSuccessfulCheck() async {
@@ -403,7 +550,11 @@ class QolUpdateService extends ChangeNotifier {
     );
 
     final response = await request.close();
-    final text = await utf8.decoder.bind(response).join();
+    final text = await utf8.decoder.bind(response).join()
+        .timeout(const Duration(seconds: 45));
+    if (text.length > 8 * 1024 * 1024) {
+      throw const FormatException('Downloaded QoL source file is too large.');
+    }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw HttpException(
@@ -469,9 +620,7 @@ class QolUpdateService extends ChangeNotifier {
 
     try {
       await staging.rename(current.path);
-      if (await backup.exists()) {
-        await backup.delete(recursive: true);
-      }
+      // Retain previous until another successfully staged update.
     } catch (_) {
       if (await current.exists()) {
         await current.delete(recursive: true);
@@ -481,6 +630,65 @@ class QolUpdateService extends ChangeNotifier {
       }
       rethrow;
     }
+  }
+
+  /// User-invoked recovery. Switching bundle data does not touch account
+  /// preferences or data and takes effect on the next page load.
+  Future<bool> restoreWorkingBundle() async {
+    if (_checking) return false;
+    final restoredPrevious = await rollbackToPrevious();
+    if (!restoredPrevious) await disableDownloadedBundle();
+    await onBundleActivated?.call();
+    _status = QolUpdateStatus.idle;
+    _errorMessage = null;
+    notifyListeners();
+    return restoredPrevious;
+  }
+
+  /// Restore the last downloaded working version without affecting user
+  /// settings, login state, backups, or synced lists.
+  Future<bool> rollbackToPrevious() async {
+    final root = _root;
+    final current = _currentDir;
+    if (root == null || current == null) return false;
+    final previous = Directory('${root.path}${Platform.pathSeparator}previous');
+    if (!await previous.exists()) return false;
+    final rejected = Directory(
+      '${root.path}${Platform.pathSeparator}rejected-${DateTime.now().millisecondsSinceEpoch}',
+    );
+    final existed = await current.exists();
+    if (existed) await current.rename(rejected.path);
+    try {
+      await previous.rename(current.path);
+      await _loadActiveMetadata();
+      if (!hasDownloadedBundle) {
+        // Corrupt previous release is not a working fallback.
+        if (await current.exists()) await current.delete(recursive: true);
+        if (existed) await rejected.rename(current.path);
+        _clearActiveMetadata();
+        return false;
+      }
+      if (await rejected.exists()) await rejected.delete(recursive: true);
+      notifyListeners();
+      return true;
+    } catch (_) {
+      if (await current.exists()) await current.delete(recursive: true);
+      if (existed && await rejected.exists()) {
+        await rejected.rename(current.path);
+      }
+      _clearActiveMetadata();
+      return false;
+    }
+  }
+
+  /// Emergency fallback to the immutable JS/CSS bundled in the APK.
+  Future<void> disableDownloadedBundle() async {
+    final current = _currentDir;
+    if (current != null && await current.exists()) {
+      await current.delete(recursive: true);
+    }
+    _clearActiveMetadata();
+    notifyListeners();
   }
 
   Future<String?> readDownloadedText(String relative) async {

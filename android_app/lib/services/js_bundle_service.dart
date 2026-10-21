@@ -709,6 +709,9 @@ class JsBundleService extends ChangeNotifier {
       if (remoteActive) {
         final remote = await qolUpdates.readDownloadedText(remotePath);
         if (remote != null) return remote;
+        // A complete downloaded bundle is mandatory. Never silently
+        // combine missing modular Settings files with stale APK assets.
+        throw StateError('Downloaded QoL Options file missing: $remotePath');
       }
 
       try {

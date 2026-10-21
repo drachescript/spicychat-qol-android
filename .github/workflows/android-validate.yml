@@ -54,6 +54,11 @@ jobs:
           .\update_android.ps1 `
             -SourceRoot "$env:GITHUB_WORKSPACE\spicychat-qol-extension"
 
+      - name: Validate complete QoL manifest and Android assets
+        shell: pwsh
+        run: |
+          python tools/validate_qol_bundle.py --extension spicychat-qol-extension --android android_app
+
       - name: Flutter dependencies
         working-directory: android_app
         shell: pwsh
@@ -70,3 +75,6 @@ jobs:
           node --check android_app/assets/js/bridge.js
           node --check android_app/assets/options/options-bridge.js
           node --check android_app/assets/js/android-message-longpress.js
+          # Parse ALL shared JS files and Android native shim sources.
+          Get-ChildItem android_app/assets/js -Filter *.js -File | ForEach-Object { node --check $_.FullName; if ($LASTEXITCODE -ne 0) { throw "Invalid JS: $($_.Name)" } }
+          Get-ChildItem android_app/assets/options -Filter *.js -File | ForEach-Object { node --check $_.FullName; if ($LASTEXITCODE -ne 0) { throw "Invalid Options JS: $($_.Name)" } }

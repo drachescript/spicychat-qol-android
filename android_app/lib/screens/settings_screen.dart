@@ -462,6 +462,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  // Kept for the legacy sidebar configuration UI; currently not called by the screen.
+  // ignore: unused_element
   List<Widget> _buildSidebarToggles() {
     final items = <MapEntry<String, bool Function()>>[
       MapEntry('Hide Logo', () => _settings.hideSidebarLogo),

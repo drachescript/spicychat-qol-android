@@ -214,13 +214,32 @@ jobs:
           Write-Host ""
           Write-Host "You can also use workflow_dispatch with force_same_version_hotfix=true."
 
-      - name: Check out current SpicyChat QoL extension
+      - name: Resolve last published stable QoL release
+        if: steps.version.outputs.should_build == 'true'
+        id: qol_source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/drachescript/spicychat-qol-extension/releases/latest' -Headers @{ 'User-Agent' = 'SpicyChat-QoL-Android-CI' } -TimeoutSec 30
+          if ($r.draft -or $r.prerelease -or $r.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'No valid stable QoL release tag' }
+          "tag=$($r.tag_name)" >> $env:GITHUB_OUTPUT
+      - name: Check out published stable SpicyChat QoL extension
         if: steps.version.outputs.should_build == 'true'
         uses: actions/checkout@v4
         with:
           repository: drachescript/spicychat-qol-extension
-          ref: main
+          ref: ${{ steps.qol_source.outputs.tag }}
           path: spicychat-qol-extension
+      - name: Validate bundled stable QoL source
+        if: steps.version.outputs.should_build == 'true'
+        shell: pwsh
+        env:
+          QOL_TAG: ${{ steps.qol_source.outputs.tag }}
+        run: |
+          $manifest = Get-Content 'spicychat-qol-extension/manifest.json' -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $env:QOL_TAG.Substring(1)) { throw 'Tag and manifest version mismatch' }
+          .\update_android.ps1 -SourceRoot "$env:GITHUB_WORKSPACE\spicychat-qol-extension"
+          python tools/validate_qol_bundle.py --extension spicychat-qol-extension --android android_app
 
       - name: Set up Java 17
         if: steps.version.outputs.should_build == 'true'

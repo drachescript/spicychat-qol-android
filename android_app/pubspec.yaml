@@ -1,7 +1,7 @@
 name: spicychat_qol_app
 description: "SpicyChat QOL - Android App"
 publish_to: 'none'
-version: 0.1.27+102
+version: 0.1.28+103
 environment:
   sdk: ^3.10.7
 
@@ -10,6 +10,7 @@ dependencies:
     sdk: flutter
   flutter_inappwebview: ^6.1.5
   path_provider: ^2.1.6
+  crypto: ^3.0.6
   provider: ^6.1.5+1
   shared_preferences: ^2.5.5
   file_picker: ^8.0.0
