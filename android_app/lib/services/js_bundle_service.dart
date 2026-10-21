@@ -155,23 +155,50 @@ class JsBundleService extends ChangeNotifier {
   // APK-only composer optimization. Remote extension updates still own all
   // other modules and features. If the editor module changes shape, use it
   // unmodified rather than risk breaking a newer QoL release.
-  // Android uses one WebView. Keep the queued Lorebook entry in storage
-  // before navigating away from its originating chat; desktop keeps its popup.
-  static String _androidCompatChatLorebookManagerSource(String source) {
-    const popupBeforeSave = "const opened=window.open(destination,'_blank','noopener,noreferrer');";
-    const afterSave = "state.textContent='Prepared. Open the editor tab and use Review queued entry to fill the native Add Entry form.';";
-    if (!source.contains(popupBeforeSave) || !source.contains(afterSave)) {
-      return source; // A future QoL revision may own this flow itself.
+  // Desktop-only policy for Android's one-WebView runtime and Settings.
+  // This does not erase synced desktop settings or user lists.
+  static String _androidDesktopOnlySource(String path, String source) {
+    final file = path.replaceAll('\\', '/');
+
+    // These modules manage helper/browser tabs, or open another window as a
+    // required part of the feature. Do not run them on Android at all.
+    if (file.endsWith('/chat-lorebook-manager.js') ||
+        file.endsWith('/auto-afk.js') ||
+        file.endsWith('/list-fill.js')) {
+      return '// Desktop-only module omitted in Android single-WebView build.';
     }
-    return source.replaceFirst(
-      popupBeforeSave,
-      "const opened=window.__spicyChatQolAndroidApp===true ? null : "
-      "window.open(destination,'_blank','noopener,noreferrer');",
-    ).replaceFirst(
-      afterSave,
-      "if (window.__spicyChatQolAndroidApp===true) { window.location.assign(destination); return; }\n"
-      "$afterSave",
-    );
+
+    // QoL's common platform layer already hides the other desktop-only
+    // controls. Supply the few missing 0.2.53 rules to BOTH downloaded and
+    // bundled runtime scripts, and to Android's real Settings page.
+    if (!file.endsWith('/platform-capabilities.js')) return source;
+
+    const settingsAnchor = '    showQuickDislikeButtons: ["helperTabs"],';
+    const settingsRules = '''
+    showQuickLessLikeButtons: ["helperTabs"],
+    showQuickNotInterestedButtons: ["helperTabs"],
+    enableChatLorebookManager: ["helperTabs"],''';
+    const featureAnchor =
+        '    "quick-dislike": { requires: ["helperTabs"], mode: "all" },';
+    const featureRule =
+        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },';
+    const actionAnchor =
+        '    bulkLessLikeBlockedBots: ["bulkOperations", "helperTabs"],';
+    const actionRules = '''
+    resumeBlockedLessLikeRun: ["bulkOperations", "helperTabs"],
+    retryFailedBlockedLessLikes: ["bulkOperations", "helperTabs"],
+    resetAndRedoBlockedLessLikes: ["bulkOperations", "helperTabs"],''';
+    // If a future QoL changes its platform API, don't inject broken JS.
+    // Existing shared desktop-only guards continue to apply.
+    if (!source.contains(settingsAnchor) ||
+        !source.contains(featureAnchor) ||
+        !source.contains(actionAnchor)) {
+      return source;
+    }
+    return source
+        .replaceFirst(settingsAnchor, '$settingsAnchor$settingsRules')
+        .replaceFirst(featureAnchor, '$featureAnchor\n$featureRule')
+        .replaceFirst(actionAnchor, '$actionAnchor$actionRules');
   }
 
   static String _androidOptimizeComposerSource(String source) {
@@ -640,11 +667,12 @@ class JsBundleService extends ChangeNotifier {
             'Active QoL update is missing runtime file: $relative',
           );
         }
-        final optimized = relative.endsWith('/composer-control.js')
-            ? _androidOptimizeComposerSource(source)
-            : relative.endsWith('/chat-lorebook-manager.js')
-                ? _androidCompatChatLorebookManagerSource(source)
-                : source;
+        final optimized = _androidDesktopOnlySource(
+          relative,
+          relative.endsWith('/composer-control.js')
+              ? _androidOptimizeComposerSource(source)
+              : source,
+        );
         buffer
           ..writeln('// === downloaded $relative ===')
           ..writeln(optimized)
@@ -653,11 +681,12 @@ class JsBundleService extends ChangeNotifier {
     } else {
       for (final path in _bundledJsFiles) {
         final source = await rootBundle.loadString(path);
-        final optimized = path.endsWith('/composer-control.js')
-            ? _androidOptimizeComposerSource(source)
-            : path.endsWith('/chat-lorebook-manager.js')
-                ? _androidCompatChatLorebookManagerSource(source)
-                : source;
+        final optimized = _androidDesktopOnlySource(
+          path,
+          path.endsWith('/composer-control.js')
+              ? _androidOptimizeComposerSource(source)
+              : source,
+        );
         buffer
           ..writeln('// === $path ===')
           ..writeln(optimized)
@@ -804,6 +833,7 @@ class JsBundleService extends ChangeNotifier {
         continue;
       }
 
+      source = _androidDesktopOnlySource(relative, source);
       if (name == 'options.js') {
         source = _androidCompatOptionsScript(source);
       }

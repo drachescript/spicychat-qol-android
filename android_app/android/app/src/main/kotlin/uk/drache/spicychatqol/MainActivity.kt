@@ -17,6 +17,12 @@ class MainActivity : FlutterActivity() {
     private val appInfoChannel = "uk.drache.spicychatqol/app_info"
     private val microphonePermissionRequestCode = 4021
     private var pendingMicrophonePermissionResult: MethodChannel.Result? = null
+    // Native text export is verified by reading the written Storage Access
+    // Framework document back before success is reported to Flutter.
+    private val diagnosticExportRequestCode = 4718
+    private var pendingDiagnosticExportResult: MethodChannel.Result? = null
+    private var pendingDiagnosticExportBytes: ByteArray? = null
+
 
     @Suppress("DEPRECATION")
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -81,6 +87,39 @@ class MainActivity : FlutterActivity() {
                         arrayOf(Manifest.permission.RECORD_AUDIO),
                         microphonePermissionRequestCode,
                     )
+                }
+
+                "exportDiagnosticLog" -> {
+                    if (pendingDiagnosticExportResult != null) {
+                        result.error("LOG_EXPORT_BUSY", "Another App Log export is in progress.", null)
+                        return@setMethodCallHandler
+                    }
+                    val content = call.argument<String>("content").orEmpty()
+                    val bytes = content.toByteArray(Charsets.UTF_8)
+                    if (bytes.isEmpty() || bytes.size > 4 * 1024 * 1024) {
+                        result.error("LOG_EXPORT_SIZE", "The App Log is empty or exceeds the 4 MB export limit.", bytes.size)
+                        return@setMethodCallHandler
+                    }
+                    val suggested = call.argument<String>("filename").orEmpty()
+                    val safeName = suggested
+                        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                        .take(140)
+                        .let { if (it.isBlank()) "spicychat-qol-android-log.txt" else it }
+                        .let { if (it.lowercase().endsWith(".txt")) it else "$it.txt" }
+                    val documentIntent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TITLE, safeName)
+                    }
+                    pendingDiagnosticExportResult = result
+                    pendingDiagnosticExportBytes = bytes
+                    try {
+                        startActivityForResult(documentIntent, diagnosticExportRequestCode)
+                    } catch (error: Exception) {
+                        pendingDiagnosticExportResult = null
+                        pendingDiagnosticExportBytes = null
+                        result.error("LOG_EXPORT_PICKER", "Could not open the Android document picker.", error.message)
+                    }
                 }
 
                 "installApk" -> {
@@ -181,6 +220,49 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != diagnosticExportRequestCode) return
+
+        val reply = pendingDiagnosticExportResult ?: return
+        val expected = pendingDiagnosticExportBytes
+        pendingDiagnosticExportResult = null
+        pendingDiagnosticExportBytes = null
+
+        if (resultCode != RESULT_OK || data?.data == null) {
+            reply.success(mapOf("ok" to false, "cancelled" to true))
+            return
+        }
+        if (expected == null || expected.isEmpty()) {
+            reply.error("LOG_EXPORT_EMPTY", "The App Log content was unavailable.", null)
+            return
+        }
+
+        try {
+            val uri = data.data!!
+            val output = contentResolver.openOutputStream(uri, "wt")
+                ?: throw java.io.IOException("The document provider refused the output stream.")
+            output.use {
+                it.write(expected)
+                it.flush()
+            }
+            val written = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw java.io.IOException("The exported log cannot be read back for verification.")
+            if (!expected.contentEquals(written)) {
+                reply.error(
+                    "LOG_EXPORT_VERIFY",
+                    "The exported log did not match the original content. Use Copy App Log instead.",
+                    "expected=${expected.size}, actual=${written.size}",
+                )
+                return
+            }
+            reply.success(mapOf("ok" to true, "verified" to true, "bytes" to written.size))
+        } catch (error: Exception) {
+            reply.error("LOG_EXPORT_FAILED", "Could not write and verify the App Log.", error.message)
         }
     }
 

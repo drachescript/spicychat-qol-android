@@ -4469,37 +4469,49 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  // The Android Storage Access Framework is used directly. file_picker 8.x can
+  // report a chosen filename even if zero bytes were saved by the provider.
   Future<void> _exportDiagnosticLog() async {
     try {
       final log = await _appLog.readAll();
+      if (log.trim().isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('App Log is empty; nothing to export. Try Copy App Log to investigate.')),
+          );
+        }
+        return;
+      }
       final timestamp = DateTime.now()
           .toIso8601String()
           .replaceAll(':', '-')
           .split('.')
           .first;
       final filename = 'spicychat-qol-android-log-$timestamp.txt';
+      final expectedBytes = utf8.encode(log).length;
 
-      final outputFile = await FilePicker.platform.saveFile(
-        dialogTitle: 'Save App Diagnostic Log',
-        fileName: filename,
-        type: FileType.custom,
-        allowedExtensions: ['txt'],
-        bytes: Uint8List.fromList(utf8.encode(log)),
-      );
+      final result = await const MethodChannel('uk.drache.spicychatqol/app_info')
+          .invokeMapMethod<String, dynamic>('exportDiagnosticLog', {
+        'filename': filename,
+        'content': log,
+      });
+      if (result?['cancelled'] == true) return;
+      if (result?['ok'] != true ||
+          result?['verified'] != true ||
+          result?['bytes'] != expectedBytes) {
+        throw StateError('App Log export was not byte-verified (expected $expectedBytes bytes).');
+      }
 
-      if (outputFile == null) return;
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('App log saved to ${outputFile.split('/').last}'),
-          ),
+          SnackBar(content: Text('App Log exported and verified ($expectedBytes bytes).')),
         );
       }
     } catch (e, stackTrace) {
       unawaited(
         _appLog.log(
           'Diagnostics',
-          'Export log failed',
+          'Native App Log export failed; log remains available via Copy App Log',
           level: 'ERROR',
           error: e,
           stackTrace: stackTrace,
@@ -4507,7 +4519,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('App log export failed: $e')),
+          SnackBar(content: Text('App Log export failed: $e. Try Copy App Log instead.')),
         );
       }
     }
