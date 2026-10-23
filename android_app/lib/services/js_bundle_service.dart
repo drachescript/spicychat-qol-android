@@ -345,8 +345,27 @@ class JsBundleService extends ChangeNotifier {
   "use strict";
   if (window.__dsAndroidPerfDiagnosticInstalled) return;
   window.__dsAndroidPerfDiagnosticInstalled = true;
+  // DS_ANDROID_PERF59_DIAGNOSTICS: passive, bounded long-task counters.
+  // Observes only tasks >= 50ms; never reads message text or retains entries.
   const activity = { type: "none", at: 0 };
   const stamp = type => { activity.type = type; activity.at = Date.now(); };
+  const tasks = { count: 0, worstMs: 0, totalMs: 0, recentMs: [] };
+  try {
+    if (typeof PerformanceObserver === "function" &&
+        PerformanceObserver.supportedEntryTypes?.includes("longtask")) {
+      const observer = new PerformanceObserver(list => {
+        for (const item of list.getEntries()) {
+          const duration = Math.round(Number(item.duration || 0));
+          tasks.count++;
+          tasks.totalMs += duration;
+          tasks.worstMs = Math.max(tasks.worstMs, duration);
+          tasks.recentMs.push(duration);
+          if (tasks.recentMs.length > 12) tasks.recentMs.shift();
+        }
+      });
+      observer.observe({ type: "longtask" });
+    }
+  } catch (_) { /* Unsupported Android System WebView: counters remain empty. */ }
   document.addEventListener("focusin", event => {
     const field = event.target;
     if (field instanceof HTMLTextAreaElement && field.closest("[id^='message-']")) {
@@ -369,6 +388,12 @@ class JsBundleService extends ChangeNotifier {
     const DS = window.DragonScriptQoL;
     const state = DS?.state || {};
     const editor = document.querySelector("[id^='message-'] textarea");
+    // QoL's runtime counter can be zero even when a full native chat is mounted.
+    // Check the real DOM only on a requested recovery snapshot, never in a loop.
+    const mountedMessages = document.querySelectorAll("div[id^='message-']").length;
+    const reportedMessages = Number(state.runtimePerformance?.loadedChatMessages || 0);
+    const heapBytes = Number(performance.memory?.usedJSHeapSize || 0);
+    const runtime = state.runtimePerformance || {};
     return JSON.stringify({
       path: location.pathname,
       activity: activity.type,
@@ -377,7 +402,23 @@ class JsBundleService extends ChangeNotifier {
       historyControl: !!document.getElementById("ds-long-chat-window-control"),
       folded: Number(state.performanceWindowHiddenCount || 0),
       shown: Number(state.performanceWindowVisibleCount || 0),
-      loadedMessages: Number(state.runtimePerformance?.loadedChatMessages || 0),
+      loadedMessages: reportedMessages > 0 ? reportedMessages : mountedMessages,
+      reportedLoadedMessages: reportedMessages,
+      mountedMessages,
+      messageCountSource: reportedMessages > 0 ? "qol-runtime" : "native-dom",
+      documentElements: document.getElementsByTagName("*").length,
+      heapUsedMiB: heapBytes > 0 ? Math.round(heapBytes / 1048576) : null,
+      longTasks: { ...tasks, supported: tasks.count > 0 ||
+        (typeof PerformanceObserver === "function" &&
+         PerformanceObserver.supportedEntryTypes?.includes("longtask")) },
+      injection: window.__dsAndroidQolInjectionMetrics || null,
+      runtimeCounters: {
+        nativeActionQuietDeferrals: Number(runtime.nativeActionQuietDeferrals || 0),
+        swipeScans: Number(runtime.swipeScans || 0),
+        swipeMessageRootsInspected: Number(runtime.swipeMessageRootsInspected || 0),
+        slowPasses: Number(runtime.slowPasses || 0)
+      },
+      pageHidden: document.hidden,
       performanceProfile: String(state.settings?.runtimePerformanceMode || "unknown")
     });
   };

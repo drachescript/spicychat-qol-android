@@ -84,6 +84,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   int _visualGuardGeneration = 0;
   int _lastProgressPercent = -1;
   bool _recoveringWebView = false;
+  // DS_ANDROID_PERF59_DIAGNOSTICS: time renderer stalls without extra probes.
+  DateTime? _rendererUnresponsiveSince;
   bool _appIsResumed = true;
   bool _messageLongPressMenuOpen = false;
   String? _androidMessageLongPressSource;
@@ -823,6 +825,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onLoadStart: (controller, url) {
                   _loadStartedAt = DateTime.now();
+                  _rendererUnresponsiveSince = null;
                   _lastProgressPercent = -1;
                   _lastSpaRouteUrl = null;
                   _lastSpaRouteAt = null;
@@ -1023,6 +1026,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onRenderProcessUnresponsive: (controller, url) async {
+                  _rendererUnresponsiveSince ??= DateTime.now();
                   if (_shouldPersistDiagnostic(
                     'renderer-unresponsive',
                     cooldown: const Duration(seconds: 45),
@@ -1040,10 +1044,16 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessResponsive: (controller, url) async {
+                  final stallStart = _rendererUnresponsiveSince;
+                  _rendererUnresponsiveSince = null;
+                  final stallMs = stallStart == null
+                      ? null
+                      : DateTime.now().difference(stallStart).inMilliseconds;
                   unawaited(
                     _appLog.log(
                       'Renderer',
-                      'Android WebView renderer responsive again; url=${url ?? _lastKnownUrl}',
+                      'Android WebView renderer responsive again; '
+                      'stallMs=${stallMs ?? "unknown"}; url=${url ?? _lastKnownUrl}',
                     ),
                   );
                   if (_shouldPersistDiagnostic(
@@ -1055,6 +1065,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessGone: (controller, detail) {
+                  _rendererUnresponsiveSince = null;
                   unawaited(
                     _appLog.log(
                       'Renderer',
@@ -2675,7 +2686,22 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (!mounted) return;
     try {
       final result = await controller.evaluateJavascript(
-        source: 'window.__dsAndroidChatPerformanceSnapshot?.() ?? null',
+        source: r'''(() => {
+          try {
+            const report = window.__dsAndroidChatPerformanceSnapshot?.();
+            if (typeof report === "string" && report.length) return report;
+            return JSON.stringify({
+              available: false,
+              reason: "QoL diagnostic hook not installed",
+              path: location.pathname,
+              mountedMessages: document.querySelectorAll("div[id^='message-']").length,
+              documentElements: document.getElementsByTagName("*").length,
+              pageHidden: document.hidden
+            });
+          } catch (_) {
+            return JSON.stringify({ available: false, reason: "snapshot failed" });
+          }
+        })()''',
       );
       if (result is! String || result.trim().isEmpty) return;
       await _appLog.log(
@@ -3630,10 +3656,15 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       await _installAndroidViewportWidthGuard(controller);
       await _installAndroidListingIdentityHelper(controller);
 
+      // Timing only. Preserve the extension's original script order.
+      final cssStart = DateTime.now();
       await controller.evaluateJavascript(
         source: widget.bundleService.cssInjectionScript,
       );
+      final cssMs = DateTime.now().difference(cssStart).inMilliseconds;
+      final jsStart = DateTime.now();
       await controller.evaluateJavascript(source: widget.bundleService.jsBundle);
+      final jsMs = DateTime.now().difference(jsStart).inMilliseconds;
 
       // Shared Focus Mode uses desktop-oriented ancestor targeting. Install a
       // lightweight Android guard after the shared bundle exists so mobile
@@ -3702,10 +3733,26 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
       _lastInjectedDocumentToken = token;
       final elapsed = DateTime.now().difference(started).inMilliseconds;
+      // This value is diagnostic-only and is never persisted in website storage.
+      final timing = <String, dynamic>{
+        'totalMs': elapsed,
+        'cssMs': cssMs,
+        'jsMs': jsMs,
+        'sourceChars': widget.bundleService.jsBundle.length,
+        'version': widget.bundleService.extensionVersion,
+      };
+      try {
+        await controller.evaluateJavascript(
+          source: 'window.__dsAndroidQolInjectionMetrics = ${jsonEncode(timing)};',
+        );
+      } catch (_) {
+        // A failed metrics write must never break an otherwise healthy chat.
+      }
       unawaited(
         _appLog.log(
           'Injection',
-          'QoL bundle injected once for document=$token in ${elapsed}ms; url=$url',
+          'QoL bundle injected once for document=$token in ${elapsed}ms '
+          '(css=${cssMs}ms, js=${jsMs}ms); url=$url',
         ),
       );
     } finally {
