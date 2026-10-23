@@ -49,6 +49,20 @@ def check(extensions: Path, android: Path) -> list[str]:
 
     validate(list(dict.fromkeys(js+resources)), '.js', 'assets/js')
     validate(list(dict.fromkeys(css)), '.css', 'assets/css')
+    # DS_ANDROID_V057_BINARY_RESOURCE_FIX: the Archive cover is a binary web resource. Android
+    # syncs it byte-for-byte for fallback when a remote bundle is inactive.
+    image = 'icons/qol-archive-cover.png'
+    all_resources = [p for g in manifest.get('web_accessible_resources', [])
+                     for p in g.get('resources', [])]
+    if image in all_resources:
+        source = extensions / image
+        embedded = android / 'assets/options/qol-archive-cover.png'
+        if not source.is_file():
+            problems.append(f'Missing declared binary resource: {image}')
+        elif not embedded.is_file():
+            problems.append('Android fallback is missing QoL Archive cover PNG')
+        elif source.read_bytes() != embedded.read_bytes():
+            problems.append('Android QoL Archive cover PNG is stale')
     html = (extensions / manifest.get('options_page','options.html'))
     if not html.is_file():
         problems.append(f'Missing Options page: {html}')

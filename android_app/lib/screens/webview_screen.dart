@@ -2624,6 +2624,22 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         // These are handled by the JS-side loop in WebView
         return {'ok': true};
 
+      // DS_ANDROID_V057_BINARY_RESOURCE_FIX: desktop writer actions fail closed.
+      // Native Android has no extension service worker or hidden helper tabs.
+      // Never claim a protected Lorebook/Archive write succeeded when the
+      // authenticated desktop background writer did not actually run.
+      case 'DS_PRIVATE_ARCHIVE_SETUP_WRITE':
+      case 'DS_PRIVATE_LOREBOOK_ENTRY_CREATE':
+      case 'DS_BOT_EXPORT_HELPER':
+        return {
+          'ok': false,
+          'android': true,
+          'status': 'android-background-writer-unavailable',
+          'ambiguous': false,
+          'error': 'This desktop background/helper-tab action is not '
+              'implemented by the Android single-WebView bridge.',
+        };
+
       case 'DS_LOREBOOK_EXPORT_HELPER':
         // The desktop exporter opens the opposite Lorebook page in a
         // background browser tab. Android intentionally owns one live WebView.

@@ -424,6 +424,37 @@ class JsBundleService extends ChangeNotifier {
       ..writeln(bridge)
       ..writeln();
 
+    // DS_ANDROID_V057_BINARY_RESOURCE_FIX: expose ONLY the signed/hashed QoL Archive cover image to
+    // chrome.runtime.getURL() as an in-memory data URI. Do not expose local
+    // filesystem paths or general-purpose file/resource URLs to a web page.
+    List<int>? archiveCover;
+    if (remoteActive) {
+      archiveCover = await qolUpdates.readDownloadedImage(
+        'icons/qol-archive-cover.png',
+      );
+    }
+    if (archiveCover == null) {
+      try {
+        final embedded = await rootBundle.load(
+          'assets/options/qol-archive-cover.png',
+        );
+        archiveCover = embedded.buffer.asUint8List(
+          embedded.offsetInBytes, embedded.lengthInBytes,
+        );
+      } catch (_) {
+        // Older APKs do not contain this optional resource.
+      }
+    }
+    if (archiveCover != null && archiveCover.length >= 1000 &&
+        archiveCover.length <= 2 * 1024 * 1024 &&
+        archiveCover[0] == 0x89 && archiveCover[1] == 0x50 &&
+        archiveCover[2] == 0x4e && archiveCover[3] == 0x47) {
+      final dataUrl = 'data:image/png;base64,${base64Encode(archiveCover)}';
+      buffer.writeln(
+        'window.__dsAndroidQolArchiveCoverUrl = ${jsonEncode(dataUrl)};',
+      );
+    }
+
     // Android does not have chrome-extension:// web-accessible-resource URLs.
     // Install the two MAIN-world network bridges directly before the normal
     // extension loaders run. The APK-owned runtime guard below makes those

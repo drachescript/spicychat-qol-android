@@ -283,7 +283,13 @@
     },
 
     getURL(path) {
-      return String(path || "");
+      const relative = String(path || "");
+      // DS_ANDROID_V057_BINARY_RESOURCE_FIX: only this verified PNG has a WebView data-URI mapping.
+      // Never synthesize a file:// URL or serve an arbitrary package path.
+      if (relative === "icons/qol-archive-cover.png") {
+        return window.__dsAndroidQolArchiveCoverUrl || relative;
+      }
+      return relative;
     },
 
     openOptionsPage(callback) {

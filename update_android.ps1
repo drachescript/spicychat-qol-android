@@ -565,6 +565,17 @@ Get-ChildItem -LiteralPath $AndroidCss -Filter "*.css" -File | ForEach-Object {
     }
 }
 
+# DS_ANDROID_V057_BINARY_RESOURCE_FIX: package the optional published Archive cover for the
+# embedded fallback, too. The runtime updater separately downloads/validates
+# the raw PNG when remote QoL assets are active.
+$ArchiveCoverSource = Join-Path $ResolvedSource "icons\qol-archive-cover.png"
+if (Test-Path -LiteralPath $ArchiveCoverSource) {
+    New-Item -ItemType Directory -Path $AndroidOptions -Force | Out-Null
+    Copy-IfChanged -Source $ArchiveCoverSource -Destination (
+        Join-Path $AndroidOptions "qol-archive-cover.png"
+    )
+}
+
 # 5) Sync the extension Options UI while retaining Android bridge/mobile additions.
 $OptionsPage = if ($Manifest.options_page) {
     [string]$Manifest.options_page

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
@@ -339,9 +340,14 @@ class QolUpdateService extends ChangeNotifier {
 
       try {
         final fileHashes = <String, String>{};
+        // All assets are hashed over their original downloaded bytes.
+        // Images and future binary resources must never pass through UTF-8.
+        Future<void> saveBytes(String relative, List<int> bytes) async {
+          await _writeBytes(staging, relative, bytes);
+          fileHashes[relative] = sha256.convert(bytes).toString();
+        }
         Future<void> save(String relative, String value) async {
-          await _writeText(staging, relative, value);
-          fileHashes[relative] = sha256.convert(utf8.encode(value)).toString();
+          await saveBytes(relative, utf8.encode(value));
         }
         await save('manifest.json', manifestText);
 
@@ -378,11 +384,19 @@ class QolUpdateService extends ChangeNotifier {
           await Future.wait(
             chunk.map(
               (relative) async {
-                final text = await _getText(
-                  client!,
-                  '$_rawBase/$remoteSha/$relative',
-                );
-                await save(relative, text);
+                final url = '$_rawBase/$remoteSha/$relative';
+                // Manifest JS/CSS, Options scripts and documentation are text;
+                // PNG/JPEG/WebP/ICO and other web resources are raw bytes.
+                // An unfamiliar extension is safely treated as binary.
+                final textAsset = RegExp(
+                  r'\.(?:js|css|html|json|md|txt|svg|xml)$',
+                  caseSensitive: false,
+                ).hasMatch(relative);
+                if (textAsset) {
+                  await save(relative, await _getText(client!, url));
+                } else {
+                  await saveBytes(relative, await _getBytes(client!, url));
+                }
               },
             ),
           );
@@ -538,32 +552,44 @@ class QolUpdateService extends ChangeNotifier {
     );
   }
 
-  Future<String> _getText(HttpClient client, String rawUrl) async {
-    final request = await client.getUrl(Uri.parse(rawUrl));
+  // DS_ANDROID_V057_BINARY_RESOURCE_FIX: stream original bytes instead of
+  // passing binary manifest resources through a UTF-8 text decoder.
+  Future<Uint8List> _getBytes(HttpClient client, String rawUrl) async {
+    final uri = Uri.parse(rawUrl);
+    final request = await client.getUrl(uri);
     request.headers.set(
       HttpHeaders.userAgentHeader,
       'SpicyChat-QOL-Android/QoL-Updater',
     );
-    request.headers.set(
-      HttpHeaders.acceptHeader,
-      'application/json,text/plain,*/*',
-    );
-
+    request.headers.set(HttpHeaders.acceptHeader, '*/*');
     final response = await request.close();
-    final text = await utf8.decoder.bind(response).join()
-        .timeout(const Duration(seconds: 45));
-    if (text.length > 8 * 1024 * 1024) {
-      throw const FormatException('Downloaded QoL source file is too large.');
-    }
-
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      await response.drain<void>();
       throw HttpException(
         'HTTP ${response.statusCode} for $rawUrl',
-        uri: Uri.parse(rawUrl),
+        uri: uri,
       );
     }
+    final chunks = await response.fold<BytesBuilder>(
+      BytesBuilder(copy: false),
+      (builder, chunk) {
+        if (builder.length + chunk.length > 8 * 1024 * 1024) {
+          throw const FormatException('Downloaded QoL asset exceeds 8 MiB.');
+        }
+        builder.add(chunk);
+        return builder;
+      },
+    ).timeout(const Duration(seconds: 45));
+    return chunks.takeBytes();
+  }
 
-    return text;
+  Future<String> _getText(HttpClient client, String rawUrl) async {
+    final bytes = await _getBytes(client, rawUrl);
+    try {
+      return utf8.decode(bytes);
+    } on FormatException {
+      throw FormatException('Expected a UTF-8 QoL text asset: $rawUrl');
+    }
   }
 
   List<String> _orderedUnique(List<String> input) {
@@ -594,14 +620,22 @@ class QolUpdateService extends ChangeNotifier {
         '${safe.replaceAll('/', Platform.pathSeparator)}';
   }
 
+  Future<void> _writeBytes(
+    Directory base,
+    String relative,
+    List<int> bytes,
+  ) async {
+    final file = File(_pathFor(base, relative));
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(bytes, flush: true);
+  }
+
   Future<void> _writeText(
     Directory base,
     String relative,
     String text,
   ) async {
-    final file = File(_pathFor(base, relative));
-    await file.parent.create(recursive: true);
-    await file.writeAsString(text, flush: true);
+    await _writeBytes(base, relative, utf8.encode(text));
   }
 
   Future<void> _activateStaging(Directory staging) async {
@@ -689,6 +723,27 @@ class QolUpdateService extends ChangeNotifier {
     }
     _clearActiveMetadata();
     notifyListeners();
+  }
+
+  // Only web-accessible image resources may be requested as APK data URLs.
+  // The v2 metadata and SHA-256 checks have already verified these bytes.
+  Future<List<int>?> readDownloadedImage(String relative) async {
+    final current = _currentDir;
+    if (!hasDownloadedBundle || current == null ||
+        !_webResources.contains(relative) ||
+        !RegExp(r'\.(?:png|jpe?g|webp|gif|ico)$', caseSensitive: false)
+            .hasMatch(relative)) {
+      return null;
+    }
+    try {
+      final file = File(_pathFor(current, relative));
+      if (!await file.exists() || await file.length() > 2 * 1024 * 1024) {
+        return null;
+      }
+      return await file.readAsBytes();
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<String?> readDownloadedText(String relative) async {
