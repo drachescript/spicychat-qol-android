@@ -130,7 +130,18 @@
     },
 
     getKeys(callback) {
-      const promise = storageLocal.get(null).then(obj => Object.keys(obj || {}));
+      // DS_ANDROID_V061_KEYLIST: native key enumeration avoids transferring large backups,
+      // creator metadata and every other storage value to JavaScript.
+      // Keep the old path as a compatibility fallback only.
+      const promise = window.flutter_inappwebview.callHandler("storageGetKeys")
+        .then(raw => {
+          if (Array.isArray(raw)) return raw;
+          if (typeof raw === "string") {
+            try { const keys = JSON.parse(raw); if (Array.isArray(keys)) return keys; } catch {}
+          }
+          return storageLocal.get(null).then(obj => Object.keys(obj || {}));
+        })
+        .catch(() => storageLocal.get(null).then(obj => Object.keys(obj || {})));
       if (callback) promise.then(callback);
       return promise;
     }

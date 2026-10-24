@@ -2261,6 +2261,20 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       },
     );
 
+    // DS_ANDROID_V061_KEYLIST: getKeys() returns names only, not stored values.
+    controller.addJavaScriptHandler(
+      handlerName: 'storageGetKeys',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return <String>[];
+        try {
+          return await settingsService.storageGetKeys();
+        } catch (e) {
+          debugPrint('[Bridge] storageGetKeys error: $e');
+          return <String>[];
+        }
+      },
+    );
+
     // Handle chrome.storage.local.set()
     controller.addJavaScriptHandler(
       handlerName: 'storageSet',

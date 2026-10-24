@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -372,25 +373,39 @@ class SettingsService extends ChangeNotifier {
   // payload as Chrome, but it no longer needs a separate native read to get it.
   // Read the committed values back: large-value fallbacks and JSON decoding
   // remain handled by the existing storage backend.
+  // DS_ANDROID_V061_STORAGE_ORDER: keep the read/write/read operation atomic
+  // relative to other WebView fast-path writes. Overlapping updates could make
+  // the reported oldValue/newValue pair refer to a different write. Every
+  // operation stays asynchronous, and a rejected write cannot poison the queue.
+  Future<void> _pendingWebStorageDelta = Future<void>.value();
+
   Future<Map<String, dynamic>> storageSetWithChanges(
     Map<String, dynamic> obj,
-  ) async {
-    if (obj.isEmpty) return <String, dynamic>{};
-    final keys = obj.keys.toList(growable: false);
-    final before = await storageGet(keys);
-    await storageSet(obj);
-    final after = await storageGet(keys);
-    final changes = <String, dynamic>{};
-    for (final key in keys) {
-      final previous = before[key];
-      final current = after[key];
-      if (jsonEncode(previous) == jsonEncode(current)) continue;
-      changes[key] = <String, dynamic>{
-        'oldValue': previous,
-        'newValue': current,
-      };
-    }
-    return changes;
+  ) {
+    if (obj.isEmpty) return Future<Map<String, dynamic>>.value(<String, dynamic>{});
+    final result = Completer<Map<String, dynamic>>();
+    _pendingWebStorageDelta = _pendingWebStorageDelta.then((_) async {
+      try {
+        final keys = obj.keys.toList(growable: false);
+        final before = await storageGet(keys);
+        await storageSet(obj);
+        final after = await storageGet(keys);
+        final changes = <String, dynamic>{};
+        for (final key in keys) {
+          final previous = before[key];
+          final current = after[key];
+          if (jsonEncode(previous) == jsonEncode(current)) continue;
+          changes[key] = <String, dynamic>{
+            'oldValue': previous,
+            'newValue': current,
+          };
+        }
+        result.complete(changes);
+      } catch (error, stackTrace) {
+        result.completeError(error, stackTrace);
+      }
+    });
+    return result.future;
   }
 
   Future<void> storageRemove(dynamic keys) async {

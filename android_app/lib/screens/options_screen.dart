@@ -243,6 +243,19 @@ class _OptionsScreenState extends State<OptionsScreen> {
       },
     );
 
+    // DS_ANDROID_V061_KEYLIST: Options can list storage names without decoding backups.
+    controller.addJavaScriptHandler(
+      handlerName: 'optionsStorageGetKeys',
+      callback: (args) async {
+        try {
+          return await settingsService.storageGetKeys();
+        } catch (e) {
+          debugPrint('[Options] storageGetKeys error: $e');
+          return <String>[];
+        }
+      },
+    );
+
     controller.addJavaScriptHandler(
       handlerName: 'optionsStorageSet',
       callback: (args) async {

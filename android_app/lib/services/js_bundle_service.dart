@@ -416,7 +416,13 @@ class JsBundleService extends ChangeNotifier {
         nativeActionQuietDeferrals: Number(runtime.nativeActionQuietDeferrals || 0),
         swipeScans: Number(runtime.swipeScans || 0),
         swipeMessageRootsInspected: Number(runtime.swipeMessageRootsInspected || 0),
-        slowPasses: Number(runtime.slowPasses || 0)
+        slowPasses: Number(runtime.slowPasses || 0),
+        // v0.2.61's shared monitor counts reuse instead of re-querying DOM.
+        sharedLongTaskObserverReuses: Number(runtime.sharedLongTaskObserverReuses || 0),
+        pressureDomSamples: Number(runtime.pressureDomSamples || 0),
+        pressureDomSampleReuses: Number(runtime.pressureDomSampleReuses || 0),
+        nativeSlowClickSamples: Number(runtime.nativeSlowClickSamples || 0),
+        nativeWorstInputDelayMs: Number(runtime.nativeWorstInputDelayMs || 0)
       },
       pageHidden: document.hidden,
       performanceProfile: String(state.settings?.runtimePerformanceMode || "unknown")
