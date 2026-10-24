@@ -64,23 +64,23 @@
     },
 
     set(obj, callback) {
+      // DS_ANDROID_STORAGE_FASTPATH_V060: one native hop instead of GET+SET.
+      // Flutter computes the committed old/new delta and we still emit the
+      // standard chrome.storage.onChanged notification (no skipped listeners).
       const next = obj && typeof obj === "object" ? obj : {};
-      const keys = Object.keys(next);
-      const promise = storageLocal.get(keys).then(before =>
-        window.flutter_inappwebview
-          .callHandler("storageSet", JSON.stringify(next))
-          .then(() => {
-            const changes = {};
-            for (const key of keys) {
-              const oldValue = before?.[key];
-              const newValue = next[key];
-              if (!valuesEqual(oldValue, newValue)) {
-                changes[key] = { oldValue, newValue };
-              }
-            }
-            emitStorageChanges(changes);
-          })
-      ).catch(() => {});
+      const promise = window.flutter_inappwebview
+        .callHandler("storageSetWithChanges", JSON.stringify(next))
+        .then(raw => {
+          const result = parseStored(raw);
+          if (result.ok !== true) {
+            console.warn("[DS Bridge] Native storage write did not confirm completion");
+            return;
+          }
+          emitStorageChanges(result.changes);
+        })
+        .catch(error => {
+          console.warn("[DS Bridge] Native storage write failed", error);
+        });
       if (callback) promise.then(() => callback());
       return promise;
     },

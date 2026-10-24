@@ -368,6 +368,31 @@ class SettingsService extends ChangeNotifier {
     }
   }
 
+  // DS_ANDROID_STORAGE_FASTPATH_V060: the WebView needs the same onChanged
+  // payload as Chrome, but it no longer needs a separate native read to get it.
+  // Read the committed values back: large-value fallbacks and JSON decoding
+  // remain handled by the existing storage backend.
+  Future<Map<String, dynamic>> storageSetWithChanges(
+    Map<String, dynamic> obj,
+  ) async {
+    if (obj.isEmpty) return <String, dynamic>{};
+    final keys = obj.keys.toList(growable: false);
+    final before = await storageGet(keys);
+    await storageSet(obj);
+    final after = await storageGet(keys);
+    final changes = <String, dynamic>{};
+    for (final key in keys) {
+      final previous = before[key];
+      final current = after[key];
+      if (jsonEncode(previous) == jsonEncode(current)) continue;
+      changes[key] = <String, dynamic>{
+        'oldValue': previous,
+        'newValue': current,
+      };
+    }
+    return changes;
+  }
+
   Future<void> storageRemove(dynamic keys) async {
     final keyList = _requestedKeys(keys) ?? const <String>[];
 

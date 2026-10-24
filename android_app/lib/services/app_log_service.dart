@@ -15,6 +15,13 @@ class AppLogService {
 
   static const int _maxBytes = 1024 * 1024;
   static const int _maxBufferedEntries = 200;
+  // DS_ANDROID_LOG_BATCH_V060: routine info messages are appended together.
+  // WARN/ERROR, renderer, recovery and lifecycle records still flush now.
+  static const int _maxBatchEntries = 20;
+  static const Duration _batchDelay = Duration(milliseconds: 250);
+
+  final List<String> _batch = <String>[];
+  Timer? _batchTimer;
 
   File? _file;
   bool _initializing = false;
@@ -47,7 +54,7 @@ class AppLogService {
       for (final entry in queued) {
         await _append(entry);
       }
-      await _append(_line('INFO', 'AppLog', 'Persistent diagnostics log ready'));
+      await _append(_line('INFO', 'AppLog', 'Persistent diagnostics log ready'), urgent: true);
     } catch (e, stackTrace) {
       debugPrint('[AppLog] init failed: $e');
       debugPrintStack(stackTrace: stackTrace);
@@ -71,7 +78,31 @@ class AppLogService {
     _file = File(file.path);
   }
 
-  Future<void> _append(String entry) async {
+  Future<void> _flushBatch({bool durable = false}) async {
+    _batchTimer?.cancel();
+    _batchTimer = null;
+    if (_batch.isEmpty) {
+      await _writeChain;
+      return;
+    }
+    final entries = List<String>.from(_batch);
+    _batch.clear();
+    _writeChain = _writeChain.then((_) async {
+      try {
+        await _rotateIfNeeded();
+        await _file!.writeAsString(
+          '${entries.join('\n')}\n',
+          mode: FileMode.append,
+          flush: durable,
+        );
+      } catch (e) {
+        debugPrint('[AppLog] write failed: $e');
+      }
+    });
+    await _writeChain;
+  }
+
+  Future<void> _append(String entry, {bool urgent = false}) async {
     final file = _file;
     if (!_ready || file == null) {
       _pending.add(entry);
@@ -81,16 +112,19 @@ class AppLogService {
       return;
     }
 
-    _writeChain = _writeChain.then((_) async {
-      try {
-        await _rotateIfNeeded();
-        await _file!.writeAsString('$entry\n', mode: FileMode.append, flush: true);
-      } catch (e) {
-        debugPrint('[AppLog] write failed: $e');
-      }
-    });
-    await _writeChain;
+    _batch.add(entry);
+    if (urgent || _batch.length >= _maxBatchEntries) {
+      await _flushBatch(durable: urgent);
+    } else {
+      _batchTimer ??= Timer(
+        _batchDelay,
+        () => unawaited(_flushBatch()),
+      );
+    }
   }
+
+  // Can be called before exporting logs or when entering the background.
+  Future<void> flush() => _flushBatch(durable: true);
 
   Future<void> log(
     String area,
@@ -109,12 +143,18 @@ class AppLogService {
     if (!_ready && !_initializing) {
       unawaited(init());
     }
-    await _append(entry);
+    await _append(
+      entry,
+      urgent: level != 'INFO' ||
+          area == 'Renderer' ||
+          area == 'Recovery' ||
+          area == 'Lifecycle',
+    );
   }
 
   Future<String> readAll() async {
     await init();
-    await _writeChain;
+    await flush();
 
     final parts = <String>[];
     final file = _file;
@@ -132,7 +172,7 @@ class AppLogService {
 
   Future<void> clear() async {
     await init();
-    await _writeChain;
+    await flush();
 
     final file = _file;
     if (file == null) return;
@@ -146,6 +186,7 @@ class AppLogService {
 
   Future<String?> filePath() async {
     await init();
+    await flush();
     return _file?.path;
   }
 }

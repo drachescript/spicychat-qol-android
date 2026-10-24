@@ -2276,6 +2276,26 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       },
     );
 
+    // DS_ANDROID_STORAGE_FASTPATH_V060: one WebView/native call performs the
+    // storage write and returns a verified onChanged delta. The existing
+    // storageSet handler stays for Android Settings and older bridge callers.
+    controller.addJavaScriptHandler(
+      handlerName: 'storageSetWithChanges',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) {
+          return jsonEncode({'ok': false});
+        }
+        try {
+          final obj = jsonDecode(args[0].toString()) as Map<String, dynamic>;
+          final changes = await settingsService.storageSetWithChanges(obj);
+          return jsonEncode({'ok': true, 'changes': changes});
+        } catch (e) {
+          debugPrint('[Bridge] storageSetWithChanges error: $e');
+          return jsonEncode({'ok': false});
+        }
+      },
+    );
+
     // Handle chrome.storage.local.remove()
     controller.addJavaScriptHandler(
       handlerName: 'storageRemove',
