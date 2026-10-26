@@ -2,14 +2,16 @@
 
 ## Current status
 
-- Current public Android release: **v0.1.7** (`0.1.7+79`).
+- Latest verified public Android release: **v0.1.32** (`0.1.32+107`). The `main` branch may be preparing a newer build; source changes are not an APK release by themselves.
 - The Android app can update the shared SpicyChat QoL files separately from the APK.
 - Shared QoL updates are checked automatically about every **12 hours** and can also be checked manually from **Android Settings → QoL updates**.
 - Android APK updates are checked separately about every **12 hours** and can also be checked manually from **Android Settings → Android app updates**.
 - The shared QoL updater follows `drachescript/spicychat-qol-extension/main`; Android-only bridge code stays inside the APK.
 - **Multiple Android Chat Tabs** remains experimental, opt-in, and disabled by default.
 
-## Next Android release
+## Additional Android changes noted during development
+
+These notes describe work tracked after the early public releases. They are not a complete release-by-release history through v0.1.32; consult the tagged GitHub releases and commits for the precise contents of a specific APK.
 
 - Cleaned up the Android cog and send-button area to stop the dark/rectangular blocks that could appear around the controls.
 - The Android cog now stays with the real SpicyChat header controls instead of behaving like a separate page overlay whenever a safe header row is available.
