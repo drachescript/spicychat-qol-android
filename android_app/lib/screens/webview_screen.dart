@@ -84,6 +84,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   int _visualGuardGeneration = 0;
   int _lastProgressPercent = -1;
   bool _recoveringWebView = false;
+  // DS_ANDROID_V062_VERIFIED_EXPORT / lifecycle attribution. No polling.
+  bool _nativeSaveBusy = false;
+  DateTime? _lastBackgroundAt;
+  int _navigationSequence = 0;
+  String _lastNavigationCause = 'initial';
   // DS_ANDROID_PERF59_DIAGNOSTICS: time renderer stalls without extra probes.
   DateTime? _rendererUnresponsiveSince;
   bool _appIsResumed = true;
@@ -155,14 +160,28 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     WidgetsBinding.instance.removeObserver(this);
     _healthTimer?.cancel();
     _androidSaveStayBackRepairTimer?.cancel();
-    unawaited(_appLog.log('WebView', 'WebView screen disposed'));
+    unawaited(_appLog.log('WebView', 'WebView screen disposed; nav=$_navigationSequence; lastCause=$_lastNavigationCause; url=$_lastKnownUrl'));
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appIsResumed = state == AppLifecycleState.resumed;
-    unawaited(_appLog.log('Lifecycle', 'App lifecycle changed to $state'));
+    final elapsed = _lastBackgroundAt == null ? -1 :
+        DateTime.now().difference(_lastBackgroundAt!).inMilliseconds;
+    if (_appIsResumed) {
+      unawaited(_appLog.log('Lifecycle',
+          'App resumed after ${elapsed}ms; nav=$_navigationSequence; '
+          'webViewPresent=${_webController != null}; loading=$_isLoading; '
+          'recovering=$_recoveringWebView; url=$_lastKnownUrl'));
+      _lastBackgroundAt = null;
+    } else {
+      _lastBackgroundAt ??= DateTime.now();
+      unawaited(_appLog.log('Lifecycle',
+          'App lifecycle $state; nav=$_navigationSequence; '
+          'webViewPresent=${_webController != null}; url=$_lastKnownUrl'));
+      unawaited(_appLog.flush());
+    }
     if (_appIsResumed) {
       _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
       _scheduleVisualGuardForCurrentPage('app-resumed');
@@ -812,6 +831,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onWebViewCreated: (controller) {
                   _webController = controller;
+                  unawaited(_appLog.log('Navigation',
+                      'Native WebView created; nav=$_navigationSequence; '
+                      'lastCause=$_lastNavigationCause; resumed=$_appIsResumed; '
+                      'url=$_lastKnownUrl'));
                   _lastInjectedDocumentToken = null;
                   _injectionInProgressToken = null;
                   _lastProgressPercent = -1;
@@ -825,6 +848,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onLoadStart: (controller, url) {
                   _loadStartedAt = DateTime.now();
+                  _navigationSequence++;
+                  _lastNavigationCause = _recoveringWebView
+                      ? 'native-recovery' : _appIsResumed
+                          ? 'webview-or-site-navigation' : 'while-backgrounded';
+                  unawaited(_appLog.log('Navigation',
+                      'Load start #$_navigationSequence; cause=$_lastNavigationCause; '
+                      'url=${url ?? _lastKnownUrl}'));
                   _rendererUnresponsiveSince = null;
                   _lastProgressPercent = -1;
                   _lastSpaRouteUrl = null;
@@ -864,6 +894,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onLoadStop: (controller, url) async {
+                  unawaited(_appLog.log('Navigation',
+                      'Load stop #$_navigationSequence; cause=$_lastNavigationCause; '
+                      'url=${url ?? _lastKnownUrl}'));
                   if (url != null) {
                     _lastKnownUrl = url.toString();
                     _initialWebUri = url;
@@ -2034,10 +2067,39 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         } catch (_) {}
       }
 
-      if (decoded is Map && decoded['ok'] == true) {
+      if (decoded is Map && decoded['ok'] == true &&
+          decoded['response'] != null) {
         return decoded['response'];
       }
-
+      // Only after a requested diagnostic dispatch fails: return a clearly
+      // marked partial snapshot. Never read or export chat text.
+      if (message is Map && message['type'] == 'DS_GET_PAGE_DIAGNOSTICS') {
+        final partial = await controller.evaluateJavascript(
+          source: r'''(() => {
+            const DS = window.DragonScriptQoL;
+            if (!DS) return null;
+            const counters = DS.state?.runtimePerformance || {};
+            let snapshot = null;
+            try {
+              const value = window.__dsAndroidChatPerformanceSnapshot?.();
+              if (typeof value === 'string') snapshot = JSON.parse(value);
+            } catch (_) {}
+            return JSON.stringify({
+              androidPartialDiagnostics: true,
+              androidNativeBridge: true,
+              runtimePerformance: { ...counters },
+              performance: [],
+              androidEnvironment: { android: true, webview: true, dedicatedApp: true },
+              runtimeContext: { visibilityState: document.visibilityState,
+                focused: document.hasFocus?.() ?? null },
+              androidRendererSnapshot: snapshot
+            });
+          })()''',
+        );
+        if (partial is String && partial.isNotEmpty) {
+          try { return jsonDecode(partial); } catch (_) {}
+        }
+      }
       return null;
     } catch (e, stackTrace) {
       if (_shouldPersistDiagnostic('android-options-main-runtime-message')) {
@@ -2466,17 +2528,19 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     controller.addJavaScriptHandler(
       handlerName: 'exportChat',
       callback: (args) async {
-        if (!await _isCurrentUrlTrusted(controller)) return null;
+        if (!await _isCurrentUrlTrusted(controller)) {
+          return {'ok': false, 'error': 'untrusted URL'};
+        }
         try {
           final data = jsonDecode(args[0].toString());
-          await _exportChatText(
-            data['text'] ?? '',
-            data['filename'] ?? 'spicychat-chat.txt',
+          return await _exportChatText(
+            (data['text'] ?? '').toString(),
+            (data['filename'] ?? 'spicychat-chat.txt').toString(),
           );
         } catch (e) {
           debugPrint('[Bridge] exportChat error: $e');
+          return {'ok': false, 'error': e.toString()};
         }
-        return null;
       },
     );
 
@@ -2494,12 +2558,12 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
             return {'ok': false, 'error': 'invalid payload'};
           }
 
-          final saved = await _saveNativeFile(
+          return await _saveNativeFile(
             bytes: data.bytes,
             filename: data.filename,
             dialogTitle: 'Save File',
+            mimeType: 'application/octet-stream',
           );
-          return {'ok': saved};
         } catch (e) {
           debugPrint('[Bridge] saveFile error: $e');
           return {'ok': false, 'error': e.toString()};
@@ -4013,56 +4077,58 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     return filename;
   }
 
-  Future<bool> _saveNativeFile({
+  // DS_ANDROID_V062_VERIFIED_EXPORT: same SAF readback path as verified App Logs.
+  Future<Map<String, dynamic>> _saveNativeFile({
     required Uint8List bytes,
     required String filename,
     required String dialogTitle,
+    String mimeType = 'application/octet-stream',
   }) async {
+    if (_nativeSaveBusy) return {'ok': false, 'error': 'save-busy'};
+    if (bytes.isEmpty) return {'ok': false, 'error': 'empty-file', 'bytes': 0};
+    _nativeSaveBusy = true;
     try {
-      final dot = filename.lastIndexOf('.');
-      final extension = dot >= 0 && dot < filename.length - 1
-          ? filename.substring(dot + 1).toLowerCase()
-          : null;
-      final safeExtension = extension != null &&
-              RegExp(r'^[a-z0-9]{1,12}$').hasMatch(extension)
-          ? extension
-          : null;
-
-      final outputFile = await FilePicker.platform.saveFile(
-        dialogTitle: dialogTitle,
-        fileName: filename,
-        type: safeExtension == null ? FileType.any : FileType.custom,
-        allowedExtensions: safeExtension == null ? null : [safeExtension],
-        bytes: bytes,
-      );
-
-      if (outputFile == null) return false;
-
+      final safe = _safeNativeFilename(filename, fallback: 'spicychat-qol-export.txt');
+      final lower = safe.toLowerCase();
+      final inferredMime = lower.endsWith('.gz')
+          ? 'application/gzip'
+          : lower.endsWith('.txt') ? 'text/plain'
+          : lower.endsWith('.json') ? 'application/json'
+          : 'application/octet-stream';
+      final mime = mimeType == 'application/octet-stream'
+          ? inferredMime : mimeType;
+      final native = await const MethodChannel('uk.drache.spicychatqol/app_info')
+          .invokeMapMethod<String, dynamic>('saveVerifiedFile', {
+        'filename': safe,
+        'mimeType': mime,
+        'base64': base64Encode(bytes),
+      });
+      if (native?['canceled'] == true) return {'ok': false, 'canceled': true};
+      if (native?['ok'] != true || native?['verified'] != true ||
+          native?['bytes'] != bytes.length) {
+        return {'ok': false, 'error': native?['error'] ?? 'save-unverified',
+            'bytes': native?['bytes'] ?? 0};
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved ${outputFile.split("/").last}')),
+          SnackBar(content: Text('Saved $safe (${bytes.length} bytes)')),
         );
       }
-      return true;
+      return {'ok': true, 'verified': true, 'bytes': bytes.length, 'name': safe};
     } catch (e) {
       debugPrint('[Native Save] Error: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Save failed: $e')),
-        );
-      }
-      return false;
+      return {'ok': false, 'error': e.toString()};
+    } finally {
+      _nativeSaveBusy = false;
     }
   }
 
-  Future<void> _exportChatText(String text, String filename) async {
-    await _saveNativeFile(
+  Future<Map<String, dynamic>> _exportChatText(String text, String filename) async {
+    return _saveNativeFile(
       bytes: Uint8List.fromList(utf8.encode(text)),
-      filename: _safeNativeFilename(
-        filename,
-        fallback: 'spicychat-chat.txt',
-      ),
+      filename: filename,
       dialogTitle: 'Save Export',
+      mimeType: 'text/plain',
     );
   }
 

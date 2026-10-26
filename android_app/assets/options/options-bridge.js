@@ -369,7 +369,7 @@
 
           return {
             ok: true,
-            runtimeAvailable: !!liveDiagnostics,
+            runtimeAvailable: !!liveDiagnostics && liveDiagnostics.androidPartialDiagnostics !== true,
             url: tab.url || "",
             title: tab.title || "",
             pageDiagnostics,
@@ -456,6 +456,10 @@
             base64: bytesToBase64(bytes)
           }));
           if (result?.canceled) throw new Error("Download canceled");
+          if (result?.ok !== true || result?.verified !== true ||
+              Number(result?.bytes) !== bytes.length) {
+            throw new Error(result?.error || "Native download did not verify the saved bytes");
+          }
           return 1;
         })();
         if (callback) {
@@ -754,12 +758,18 @@
 
   async function saveAndroidGeneratedBlob(blob, filename) {
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    return call("saveFile", JSON.stringify({
+    const result = await call("saveFile", JSON.stringify({
       filename,
       fileName: filename,
       mimeType: blob.type || "application/octet-stream",
       base64: bytesToBase64(bytes)
     }));
+    if (result?.ok !== true || result?.verified !== true ||
+        Number(result?.bytes) !== bytes.length) {
+      throw new Error(result?.canceled ? "Download canceled" :
+        result?.error || "Native download was not verified");
+    }
+    return result;
   }
 
   async function saveAndroidGeneratedHref(href, filename) {

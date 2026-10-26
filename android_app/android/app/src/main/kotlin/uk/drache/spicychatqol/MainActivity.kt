@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.Base64
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -22,6 +23,11 @@ class MainActivity : FlutterActivity() {
     private val diagnosticExportRequestCode = 4718
     private var pendingDiagnosticExportResult: MethodChannel.Result? = null
     private var pendingDiagnosticExportBytes: ByteArray? = null
+    // DS_ANDROID_V062_VERIFIED_EXPORT: one in-flight SAF document request at a time.
+    private val verifiedExportRequestCode = 4719
+    private var pendingVerifiedExportResult: MethodChannel.Result? = null
+    private var pendingVerifiedExportBytes: ByteArray? = null
+    private var pendingVerifiedExportName = ""
 
 
     @Suppress("DEPRECATION")
@@ -119,6 +125,52 @@ class MainActivity : FlutterActivity() {
                         pendingDiagnosticExportResult = null
                         pendingDiagnosticExportBytes = null
                         result.error("LOG_EXPORT_PICKER", "Could not open the Android document picker.", error.message)
+                    }
+                }
+
+                "saveVerifiedFile" -> {
+                    if (pendingVerifiedExportResult != null || pendingDiagnosticExportResult != null) {
+                        result.success(mapOf("ok" to false, "error" to "save-busy"))
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val encoded = call.argument<String>("base64").orEmpty()
+                        // Limit IPC inflation and bound verification memory.
+                        if (encoded.isEmpty() || encoded.length > 34 * 1024 * 1024) {
+                            result.success(mapOf("ok" to false, "error" to "invalid-size", "bytes" to 0))
+                            return@setMethodCallHandler
+                        }
+                        val bytes = Base64.decode(encoded, Base64.DEFAULT)
+                        if (bytes.isEmpty() || bytes.size > 24 * 1024 * 1024) {
+                            result.success(mapOf("ok" to false, "error" to "invalid-size", "bytes" to 0))
+                            return@setMethodCallHandler
+                        }
+                        val filename = call.argument<String>("filename").orEmpty()
+                            .replace(Regex("[^A-Za-z0-9._ -]"), "_")
+                            .trim().take(140)
+                            .ifEmpty { "spicychat-qol-export.txt" }
+                        val requestedMime = call.argument<String>("mimeType").orEmpty()
+                            .substringBefore(';').trim()
+                        val mime = if (requestedMime.matches(Regex("^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$")))
+                            requestedMime else "application/octet-stream"
+                        val documentIntent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = mime
+                            putExtra(Intent.EXTRA_TITLE, filename)
+                        }
+                        pendingVerifiedExportBytes = bytes
+                        pendingVerifiedExportName = filename
+                        pendingVerifiedExportResult = result
+                        try {
+                            startActivityForResult(documentIntent, verifiedExportRequestCode)
+                        } catch (error: Exception) {
+                            pendingVerifiedExportResult = null
+                            pendingVerifiedExportBytes = null
+                            pendingVerifiedExportName = ""
+                            result.success(mapOf("ok" to false, "error" to "picker-failed"))
+                        }
+                    } catch (error: Exception) {
+                        result.success(mapOf("ok" to false, "error" to "invalid-payload"))
                     }
                 }
 
@@ -226,6 +278,51 @@ class MainActivity : FlutterActivity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == verifiedExportRequestCode) {
+            val reply = pendingVerifiedExportResult ?: return
+            val expected = pendingVerifiedExportBytes
+            val name = pendingVerifiedExportName
+            pendingVerifiedExportResult = null
+            pendingVerifiedExportBytes = null
+            pendingVerifiedExportName = ""
+            if (resultCode != RESULT_OK || data?.data == null) {
+                reply.success(mapOf("ok" to false, "canceled" to true, "bytes" to 0))
+                return
+            }
+            if (expected == null || expected.isEmpty()) {
+                reply.success(mapOf("ok" to false, "error" to "missing-data", "bytes" to 0))
+                return
+            }
+            try {
+                val uri = data.data!!
+                val output = contentResolver.openOutputStream(uri, "wt")
+                    ?: throw java.io.IOException("Document provider refused output stream")
+                output.use { it.write(expected); it.flush() }
+                val actual = contentResolver.openInputStream(uri)?.use { input ->
+                    val bytes = java.io.ByteArrayOutputStream()
+                    val chunk = ByteArray(65536)
+                    while (true) {
+                        val n = input.read(chunk)
+                        if (n <= 0) break
+                        if (bytes.size() + n > 24 * 1024 * 1024) {
+                            throw java.io.IOException("Verification exceeds export size limit")
+                        }
+                        bytes.write(chunk, 0, n)
+                    }
+                    bytes.toByteArray()
+                } ?: throw java.io.IOException("Document provider refused readback")
+                if (!expected.contentEquals(actual)) {
+                    reply.success(mapOf("ok" to false, "error" to "verification-mismatch",
+                        "bytes" to actual.size, "expectedBytes" to expected.size))
+                    return
+                }
+                reply.success(mapOf("ok" to true, "verified" to true,
+                    "bytes" to actual.size, "name" to name))
+            } catch (error: Exception) {
+                reply.success(mapOf("ok" to false, "error" to "write-or-readback-failed", "bytes" to 0))
+            }
+            return
+        }
         if (requestCode != diagnosticExportRequestCode) return
 
         val reply = pendingDiagnosticExportResult ?: return

@@ -388,9 +388,15 @@
     emitStorageChanges(changes);
   };
 
-  window._dsRequestExport = function (text, filename) {
-    return window.flutter_inappwebview
+  window._dsRequestExport = async function (text, filename) {
+    const result = await window.flutter_inappwebview
       .callHandler("exportChat", JSON.stringify({ text, filename }));
+    if (result?.ok !== true || result?.verified !== true ||
+        !Number.isFinite(Number(result?.bytes)) || Number(result.bytes) <= 0) {
+      throw new Error(result?.canceled ? "Export canceled" :
+        result?.error || "Native export was not verified");
+    }
+    return result;
   };
 
   window._dsSaveFile = function (content, filename, mimeType) {

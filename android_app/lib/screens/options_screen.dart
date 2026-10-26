@@ -41,6 +41,7 @@ class _OptionsScreenState extends State<OptionsScreen> {
   bool _isLoading = true;
   double _progress = 0;
   bool _storageChanged = false;
+  bool _nativeSaveBusy = false;
 
   @override
   void dispose() {
@@ -104,53 +105,58 @@ class _OptionsScreenState extends State<OptionsScreen> {
     );
   }
 
+  // DS_ANDROID_V062_VERIFIED_EXPORT: do not trust a file-picker filename as proof.
   Future<Map<String, dynamic>> _saveFromOptionsBridge(
     List<dynamic> args, {
     String dialogTitle = 'Save File',
   }) async {
+    if (_nativeSaveBusy) return {'ok': false, 'error': 'save-busy'};
+    _nativeSaveBusy = true;
     try {
       final data = _decodeNativeSaveArgs(args);
       if (data == null) return {'ok': false, 'error': 'invalid payload'};
-
+      final bytes = _nativeSaveBytes(data);
+      if (bytes.isEmpty) return {'ok': false, 'error': 'empty file', 'bytes': 0};
       final filename = _safeNativeFilename(
         data['filename'] ?? data['fileName'],
         fallback: 'spicychat-qol-export.txt',
       );
-      final bytes = _nativeSaveBytes(data);
-
-      final dot = filename.lastIndexOf('.');
-      final extension = dot >= 0 && dot < filename.length - 1
-          ? filename.substring(dot + 1).toLowerCase()
-          : null;
-      final safeExtension = extension != null &&
-              RegExp(r'^[a-z0-9]{1,12}$').hasMatch(extension)
-          ? extension
-          : null;
-
-      final outputFile = await FilePicker.platform.saveFile(
-        dialogTitle: dialogTitle,
-        fileName: filename,
-        type: safeExtension == null ? FileType.any : FileType.custom,
-        allowedExtensions: safeExtension == null ? null : [safeExtension],
-        bytes: bytes,
-      );
-
-      if (outputFile == null) return {'ok': false, 'canceled': true};
-
+      final lower = filename.toLowerCase();
+      final inferredMime = lower.endsWith('.gz')
+          ? 'application/gzip'
+          : lower.endsWith('.txt') ? 'text/plain'
+          : lower.endsWith('.json') ? 'application/json'
+          : 'application/octet-stream';
+      final requestedMime = (data['mimeType'] ?? '').toString().trim();
+      final mime = requestedMime.isEmpty || requestedMime == 'application/octet-stream'
+          ? inferredMime : requestedMime;
+      final native = await const MethodChannel('uk.drache.spicychatqol/app_info')
+          .invokeMapMethod<String, dynamic>('saveVerifiedFile', {
+        'filename': filename,
+        'mimeType': mime,
+        'base64': base64Encode(bytes),
+      });
+      if (native?['canceled'] == true) return {'ok': false, 'canceled': true};
+      final verified = native?['ok'] == true && native?['verified'] == true &&
+          native?['bytes'] == bytes.length;
+      if (!verified) {
+        return {
+        'ok': false,
+        'error': native?['error'] ?? 'save-unverified',
+        'bytes': native?['bytes'] ?? 0,
+      };
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved ${outputFile.split("/").last}')),
+          SnackBar(content: Text('Saved $filename (${bytes.length} bytes)')),
         );
       }
-      return {'ok': true, 'name': filename};
-    } catch (e) {
-      debugPrint('[Options] native save error: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Save failed: $e')),
-        );
-      }
-      return {'ok': false, 'error': e.toString()};
+      return {'ok': true, 'verified': true, 'bytes': bytes.length, 'name': filename};
+    } catch (error) {
+      debugPrint('[Options] verified native save failed: $error');
+      return {'ok': false, 'error': error.toString()};
+    } finally {
+      _nativeSaveBusy = false;
     }
   }
 
