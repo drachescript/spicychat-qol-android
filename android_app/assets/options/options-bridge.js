@@ -374,7 +374,8 @@
             title: tab.title || "",
             pageDiagnostics,
             androidNativeBridge: true,
-            androidPartialDiagnostics: !liveDiagnostics
+            androidPartialDiagnostics: !liveDiagnostics ||
+              liveDiagnostics.androidPartialDiagnostics === true
           };
         }
 

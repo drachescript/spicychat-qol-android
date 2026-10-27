@@ -221,6 +221,10 @@
 
   async function dispatchRuntimeMessage(message, sender = {}) {
     const listeners = [..._runtimeMessageListeners];
+    // Requested diagnostics are read-only. Prefer the latest diagnostic
+    // listener so earlier async listeners cannot stall the Settings reply.
+    // Keep all other message ordering, writes and controls unchanged.
+    if (message?.type === 'DS_GET_PAGE_DIAGNOSTICS') listeners.reverse();
     for (const listener of listeners) {
       const result = await invokeRuntimeListener(listener, message, sender);
       if (result.handled) return result.value;

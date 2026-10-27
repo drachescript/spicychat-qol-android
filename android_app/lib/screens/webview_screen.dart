@@ -184,7 +184,12 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
     if (_appIsResumed) {
       _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
-      _scheduleVisualGuardForCurrentPage('app-resumed');
+      // A surviving WebView does not need two full avatar/layout sweeps just
+      // because Android resumed the Activity. Keep the existing guard for
+      // real page loads, SPA route changes and renderer recovery.
+      if (_isLoading || _recoveringWebView) {
+        _scheduleVisualGuardForCurrentPage('app-resumed');
+      }
     } else {
       _routeHealthGeneration++;
       _visualGuardGeneration++;
@@ -2060,15 +2065,24 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         })()''',
       );
 
+      // Android WebView can return either JSON text or a JSON-quoted
+      // string containing JSON. Decode no more than twice and never treat a
+      // failed dispatch as a successful full QoL runtime response.
       dynamic decoded = rawResult;
-      if (rawResult is String && rawResult.isNotEmpty) {
+      for (var attempt = 0; attempt < 2 && decoded is String; attempt++) {
         try {
-          decoded = jsonDecode(rawResult);
-        } catch (_) {}
+          decoded = jsonDecode(decoded);
+        } catch (_) {
+          break;
+        }
       }
 
       if (decoded is Map && decoded['ok'] == true &&
           decoded['response'] != null) {
+        if (message is Map && message['type'] == 'DS_GET_PAGE_DIAGNOSTICS') {
+          unawaited(_appLog.log('AndroidDiagnostics',
+              'On-demand QoL runtime diagnostics answered through active WebView'));
+        }
         return decoded['response'];
       }
       // Only after a requested diagnostic dispatch fails: return a clearly
@@ -2077,8 +2091,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         final partial = await controller.evaluateJavascript(
           source: r'''(() => {
             const DS = window.DragonScriptQoL;
-            if (!DS) return null;
-            const counters = DS.state?.runtimePerformance || {};
+            // The APK diagnostic hook may still be alive when the shared QoL
+            // runtime has not initialized. Report a *partial* result then.
+            const counters = DS?.state?.runtimePerformance || {};
             let snapshot = null;
             try {
               const value = window.__dsAndroidChatPerformanceSnapshot?.();
@@ -2097,7 +2112,14 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           })()''',
         );
         if (partial is String && partial.isNotEmpty) {
-          try { return jsonDecode(partial); } catch (_) {}
+          try {
+            final data = jsonDecode(partial);
+            if (data is Map) {
+              unawaited(_appLog.log('AndroidDiagnostics',
+                  'On-demand partial renderer snapshot returned; shared QoL runtime not confirmed'));
+              return data;
+            }
+          } catch (_) {}
         }
       }
       return null;
@@ -4097,11 +4119,14 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           : 'application/octet-stream';
       final mime = mimeType == 'application/octet-stream'
           ? inferredMime : mimeType;
+      final encodedBytes = bytes.length > 256 * 1024
+          ? await compute(base64Encode, bytes)
+          : base64Encode(bytes);
       final native = await const MethodChannel('uk.drache.spicychatqol/app_info')
           .invokeMapMethod<String, dynamic>('saveVerifiedFile', {
         'filename': safe,
         'mimeType': mime,
-        'base64': base64Encode(bytes),
+        'base64': encodedBytes,
       });
       if (native?['canceled'] == true) return {'ok': false, 'canceled': true};
       if (native?['ok'] != true || native?['verified'] != true ||

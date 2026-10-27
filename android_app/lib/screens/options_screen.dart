@@ -130,11 +130,14 @@ class _OptionsScreenState extends State<OptionsScreen> {
       final requestedMime = (data['mimeType'] ?? '').toString().trim();
       final mime = requestedMime.isEmpty || requestedMime == 'application/octet-stream'
           ? inferredMime : requestedMime;
+      final encodedBytes = bytes.length > 256 * 1024
+          ? await compute(base64Encode, bytes)
+          : base64Encode(bytes);
       final native = await const MethodChannel('uk.drache.spicychatqol/app_info')
           .invokeMapMethod<String, dynamic>('saveVerifiedFile', {
         'filename': filename,
         'mimeType': mime,
-        'base64': base64Encode(bytes),
+        'base64': encodedBytes,
       });
       if (native?['canceled'] == true) return {'ok': false, 'canceled': true};
       final verified = native?['ok'] == true && native?['verified'] == true &&

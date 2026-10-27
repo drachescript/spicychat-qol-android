@@ -26,8 +26,10 @@ class MainActivity : FlutterActivity() {
     // DS_ANDROID_V062_VERIFIED_EXPORT: one in-flight SAF document request at a time.
     private val verifiedExportRequestCode = 4719
     private var pendingVerifiedExportResult: MethodChannel.Result? = null
-    private var pendingVerifiedExportBytes: ByteArray? = null
+    private var pendingVerifiedExportBase64: String? = null
     private var pendingVerifiedExportName = ""
+    // DS_ANDROID_V063_EXPORT_WORKER: keep duplicate saves blocked until I/O finishes.
+    @Volatile private var verifiedExportWriteInProgress = false
 
 
     @Suppress("DEPRECATION")
@@ -129,7 +131,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "saveVerifiedFile" -> {
-                    if (pendingVerifiedExportResult != null || pendingDiagnosticExportResult != null) {
+                    if (pendingVerifiedExportResult != null || verifiedExportWriteInProgress || pendingDiagnosticExportResult != null) {
                         result.success(mapOf("ok" to false, "error" to "save-busy"))
                         return@setMethodCallHandler
                     }
@@ -140,11 +142,7 @@ class MainActivity : FlutterActivity() {
                             result.success(mapOf("ok" to false, "error" to "invalid-size", "bytes" to 0))
                             return@setMethodCallHandler
                         }
-                        val bytes = Base64.decode(encoded, Base64.DEFAULT)
-                        if (bytes.isEmpty() || bytes.size > 24 * 1024 * 1024) {
-                            result.success(mapOf("ok" to false, "error" to "invalid-size", "bytes" to 0))
-                            return@setMethodCallHandler
-                        }
+                        // The worker decodes and checks the actual size after picking.
                         val filename = call.argument<String>("filename").orEmpty()
                             .replace(Regex("[^A-Za-z0-9._ -]"), "_")
                             .trim().take(140)
@@ -158,14 +156,14 @@ class MainActivity : FlutterActivity() {
                             type = mime
                             putExtra(Intent.EXTRA_TITLE, filename)
                         }
-                        pendingVerifiedExportBytes = bytes
+                        pendingVerifiedExportBase64 = encoded
                         pendingVerifiedExportName = filename
                         pendingVerifiedExportResult = result
                         try {
                             startActivityForResult(documentIntent, verifiedExportRequestCode)
                         } catch (error: Exception) {
                             pendingVerifiedExportResult = null
-                            pendingVerifiedExportBytes = null
+                            pendingVerifiedExportBase64 = null
                             pendingVerifiedExportName = ""
                             result.success(mapOf("ok" to false, "error" to "picker-failed"))
                         }
@@ -280,46 +278,70 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == verifiedExportRequestCode) {
             val reply = pendingVerifiedExportResult ?: return
-            val expected = pendingVerifiedExportBytes
+            val encodedPayload = pendingVerifiedExportBase64
             val name = pendingVerifiedExportName
             pendingVerifiedExportResult = null
-            pendingVerifiedExportBytes = null
+            pendingVerifiedExportBase64 = null
             pendingVerifiedExportName = ""
             if (resultCode != RESULT_OK || data?.data == null) {
                 reply.success(mapOf("ok" to false, "canceled" to true, "bytes" to 0))
                 return
             }
-            if (expected == null || expected.isEmpty()) {
+            if (encodedPayload.isNullOrEmpty()) {
                 reply.success(mapOf("ok" to false, "error" to "missing-data", "bytes" to 0))
                 return
             }
+            // DS_ANDROID_V063_EXPORT_WORKER: SAF I/O and verification run off
+            // the Android UI thread; reply only after readback confirmation.
+            val uri = data.data!!
+            verifiedExportWriteInProgress = true
             try {
-                val uri = data.data!!
-                val output = contentResolver.openOutputStream(uri, "wt")
-                    ?: throw java.io.IOException("Document provider refused output stream")
-                output.use { it.write(expected); it.flush() }
-                val actual = contentResolver.openInputStream(uri)?.use { input ->
-                    val bytes = java.io.ByteArrayOutputStream()
-                    val chunk = ByteArray(65536)
-                    while (true) {
-                        val n = input.read(chunk)
-                        if (n <= 0) break
-                        if (bytes.size() + n > 24 * 1024 * 1024) {
-                            throw java.io.IOException("Verification exceeds export size limit")
+                Thread({
+                    val outcome: Map<String, Any> = try {
+                        val expected = Base64.decode(encodedPayload, Base64.DEFAULT)
+                        if (expected.isEmpty() || expected.size > 24 * 1024 * 1024) {
+                            throw java.io.IOException("Invalid export size")
                         }
-                        bytes.write(chunk, 0, n)
+                        contentResolver.openOutputStream(uri, "wt")?.use { output ->
+                            output.write(expected)
+                            output.flush()
+                        } ?: throw java.io.IOException("Document provider refused output stream")
+                        val digest = MessageDigest.getInstance("SHA-256")
+                        var writtenBytes = 0
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            val buffer = ByteArray(65536)
+                            while (true) {
+                                val n = input.read(buffer)
+                                if (n < 0) break
+                                if (n == 0) continue
+                                writtenBytes += n
+                                if (writtenBytes > expected.size) break
+                                digest.update(buffer, 0, n)
+                            }
+                        } ?: throw java.io.IOException("Document provider refused readback")
+                        val verified = writtenBytes == expected.size &&
+                            MessageDigest.isEqual(
+                                MessageDigest.getInstance("SHA-256").digest(expected),
+                                digest.digest(),
+                            )
+                        if (verified) {
+                            mapOf("ok" to true, "verified" to true,
+                                "bytes" to writtenBytes, "name" to name)
+                        } else {
+                            mapOf("ok" to false, "error" to "verification-mismatch",
+                                "bytes" to writtenBytes, "expectedBytes" to expected.size)
+                        }
+                    } catch (_: Exception) {
+                        mapOf("ok" to false, "error" to "write-or-readback-failed", "bytes" to 0)
                     }
-                    bytes.toByteArray()
-                } ?: throw java.io.IOException("Document provider refused readback")
-                if (!expected.contentEquals(actual)) {
-                    reply.success(mapOf("ok" to false, "error" to "verification-mismatch",
-                        "bytes" to actual.size, "expectedBytes" to expected.size))
-                    return
-                }
-                reply.success(mapOf("ok" to true, "verified" to true,
-                    "bytes" to actual.size, "name" to name))
-            } catch (error: Exception) {
-                reply.success(mapOf("ok" to false, "error" to "write-or-readback-failed", "bytes" to 0))
+                    runOnUiThread {
+                        verifiedExportWriteInProgress = false
+                        reply.success(outcome)
+                    }
+                }, "qol-verified-file-export").start()
+            } catch (_: Exception) {
+                verifiedExportWriteInProgress = false
+                reply.success(mapOf("ok" to false, "error" to "export-worker-failed", "bytes" to 0))
             }
             return
         }
