@@ -338,6 +338,18 @@
   };
 
 
+  // DS_ANDROID_TRANSFER_V063_VERIFIED_DOWNLOAD: a picker response is not proof of a write.
+  function requireVerifiedNativeSave(result, expectedBytes) {
+    if (result?.canceled || result?.cancelled) {
+      return { ok: false, canceled: true };
+    }
+    if (expectedBytes <= 0 || result?.ok !== true || result?.verified !== true ||
+        Number(result?.bytes) !== expectedBytes) {
+      throw new Error(String(result?.error || "Native download was not verified"));
+    }
+    return result;
+  }
+
   async function nativeDownload(options = {}) {
     const filename = String(options.filename || "spicychat-qol-export.json");
     const url = String(options.url || "");
@@ -355,7 +367,8 @@
         base64: bytesToBase64(bytes)
       })
     );
-    if (result?.canceled) throw new Error("Download canceled");
+    const verified = requireVerifiedNativeSave(result, bytes.length);
+    if (verified.canceled) throw new Error("Download canceled");
     return 1;
   }
 
@@ -476,11 +489,7 @@
       })
     );
 
-    if (result?.canceled) return { ok: false, canceled: true };
-    if (result?.ok === false) {
-      throw new Error(String(result?.error || "Native save failed"));
-    }
-    return result || { ok: true };
+    return requireVerifiedNativeSave(result, bytes.length);
   }
 
   async function saveGeneratedHref(href, filename) {

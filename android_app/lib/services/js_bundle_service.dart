@@ -429,6 +429,68 @@ class JsBundleService extends ChangeNotifier {
     });
   };
 })();''';
+  // DS_ANDROID_TRANSFER_V063: overrides only the opt-in Transfer window on Android.
+  // No native messages, chat text processing or work while the dialog is closed.
+  static const _androidTransferMobileCss = r'''
+@media (max-width: 760px) {
+  html[data-spicychat-qol-android="1"] .ds-continuation-overlay {
+    align-items: flex-start !important;
+    overflow-y: auto !important;
+    padding: 8px !important;
+    padding-top: max(8px, env(safe-area-inset-top)) !important;
+    padding-bottom: max(8px, env(safe-area-inset-bottom)) !important;
+  }
+  html[data-spicychat-qol-android="1"] .ds-continuation-panel {
+    width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 auto !important;
+    max-height: calc(var(--ds-android-transfer-visible-height, 100dvh) - 16px) !important;
+    overscroll-behavior: contain !important;
+  }
+  html[data-spicychat-qol-android="1"] .ds-continuation-fields {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  html[data-spicychat-qol-android="1"] .ds-continuation-controls label {
+    min-width: 0 !important;
+  }
+}
+''';
+
+  // Event-driven viewport fit. No polling, MutationObserver or history scan.
+  static const _androidTransferViewportScript = r'''
+(() => {
+  "use strict";
+  if (window.__dsAndroidTransferViewportInstalled) return;
+  window.__dsAndroidTransferViewportInstalled = true;
+  let scheduled = 0;
+  const update = () => {
+    scheduled = 0;
+    const overlay = document.getElementById("ds-qol-continuation-overlay");
+    if (!overlay || !window.matchMedia("(max-width: 760px)").matches) return;
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const height = Math.max(160, Math.round(viewport.height || innerHeight));
+    const top = Math.max(0, Math.round(viewport.offsetTop || 0));
+    overlay.style.setProperty("--ds-android-transfer-visible-height", `${height}px`);
+    overlay.style.setProperty("height", `${height}px`, "important");
+    overlay.style.setProperty("top", `${top}px`, "important");
+    overlay.style.setProperty("bottom", "auto", "important");
+  };
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = requestAnimationFrame(update);
+  };
+  window.visualViewport?.addEventListener("resize", schedule, { passive: true });
+  window.visualViewport?.addEventListener("scroll", schedule, { passive: true });
+  document.addEventListener("focusin", event => {
+    if (event.target?.closest?.(".ds-continuation-panel")) schedule();
+  }, true);
+  document.addEventListener("focusout", event => {
+    if (event.target?.closest?.(".ds-continuation-panel")) schedule();
+  }, true);
+})();
+''';
+
   Future<void> loadAssets() async {
     final remoteActive = qolUpdates.hasDownloadedBundle;
 
@@ -454,6 +516,12 @@ class JsBundleService extends ChangeNotifier {
         cssChunks.add(await rootBundle.loadString(path));
       }
     }
+    // Only activate Android Transfer adjustments if shared QoL actually
+    // contains the published Transfer stylesheet (remote or synced APK fallback).
+    final hasChatContinuation = remoteActive
+        ? qolUpdates.runtimeCssPaths.any((p) => p.endsWith('/chat-continuation.css'))
+        : _bundledCssFiles.any((p) => p.endsWith('/chat-continuation.css'));
+    if (hasChatContinuation) cssChunks.add(_androidTransferMobileCss);
     _cssContent = cssChunks.join('\n\n');
 
     _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
@@ -772,6 +840,14 @@ class JsBundleService extends ChangeNotifier {
       }
     }
 
+    // The shared Transfer module remains unchanged. This only adjusts
+    // its mobile viewport while the on-screen keyboard is visible.
+    if (hasChatContinuation) {
+      buffer
+        ..writeln('// === Android Transfer viewport (APK-owned) ===')
+        ..writeln(_androidTransferViewportScript)
+        ..writeln();
+    }
     _jsBundle = buffer.toString();
     await _loadOptions(remoteActive: remoteActive);
     notifyListeners();
