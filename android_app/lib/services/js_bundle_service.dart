@@ -491,6 +491,80 @@ class JsBundleService extends ChangeNotifier {
 })();
 ''';
 
+  // DS_ANDROID_V064_VERIFIED_TEXT_DOWNLOAD: one Android-specific download path.
+  static const _androidV064ImportMobileCss = r'''
+@media (max-width: 760px) {
+  html[data-spicychat-qol-android="1"] #ds-qol-lorebook-import-confirm {
+    align-items: flex-start !important;
+    overflow-y: auto !important;
+    padding: 8px !important;
+    padding-top: max(8px, env(safe-area-inset-top)) !important;
+    padding-bottom: max(8px, env(safe-area-inset-bottom)) !important;
+  }
+  html[data-spicychat-qol-android="1"] #ds-qol-lorebook-import-confirm > [role="dialog"] {
+    box-sizing: border-box !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-height: calc(100dvh - 16px) !important;
+    overflow-y: auto !important;
+    padding: 12px !important;
+  }
+}
+''';
+
+  // Installed AFTER shared QoL modules: leaves desktop code and Android settings alone.
+  static const _androidV064VerifiedTextDownloadScript = r'''
+(() => {
+  "use strict";
+  if (window.__dsAndroidV064VerifiedTextDownloadInstalled) return;
+  if (!window.__spicyChatQolAndroidApp ||
+      !window.flutter_inappwebview?.callHandler) return;
+  const DS = window.DragonScriptQoL;
+  if (!DS || typeof DS.downloadTextFile !== "function") return;
+  window.__dsAndroidV064VerifiedTextDownloadInstalled = true;
+  // The shared saver currently launches native export without awaiting it.
+  // Safety-backup callers must wait until Android confirms the actual bytes.
+  DS.downloadTextFile = async function androidVerifiedDownloadTextFile(
+    text, filename = "spicychat-qol-export.txt",
+    mimeType = "text/plain;charset=utf-8"
+  ) {
+    const value = String(text ?? "");
+    if (!value) return { ok: false, error: "Export payload is empty." };
+    const safeName = String(filename || "spicychat-qol-export.txt")
+      .replace(/[\\/:*?"<>|]+/g, "-")
+      .replace(/^\.+|\.+$/g, "")
+      .slice(0, 180) || "spicychat-qol-export.txt";
+    const safeMime = String(mimeType || "text/plain;charset=utf-8").slice(0, 120);
+    try {
+      // Text is sent ONCE: no duplicate content property, no retries after timeout.
+      const raw = await window.flutter_inappwebview.callHandler(
+        "saveFile", JSON.stringify({
+          filename: safeName,
+          mimeType: safeMime,
+          text: value
+        })
+      );
+      let result = raw;
+      if (typeof raw === "string") {
+        try { result = JSON.parse(raw); } catch {}
+      }
+      const expectedBytes = new Blob([value]).size;
+      if (expectedBytes > 0 && result?.ok === true && result?.verified === true &&
+          Number(result?.bytes) === expectedBytes) {
+        return { ok: true, method: "android-verified", verified: true,
+          bytes: expectedBytes };
+      }
+      return { ok: false, canceled: result?.canceled === true,
+        error: String(result?.error || (result?.canceled ? "Save canceled" :
+          "Android did not verify the saved file")) };
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error ||
+        "Android save failed") };
+    }
+  };
+})();
+''';
+
   Future<void> loadAssets() async {
     final remoteActive = qolUpdates.hasDownloadedBundle;
 
@@ -522,6 +596,7 @@ class JsBundleService extends ChangeNotifier {
         ? qolUpdates.runtimeCssPaths.any((p) => p.endsWith('/chat-continuation.css'))
         : _bundledCssFiles.any((p) => p.endsWith('/chat-continuation.css'));
     if (hasChatContinuation) cssChunks.add(_androidTransferMobileCss);
+    cssChunks.add(_androidV064ImportMobileCss);
     _cssContent = cssChunks.join('\n\n');
 
     _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
@@ -848,6 +923,10 @@ class JsBundleService extends ChangeNotifier {
         ..writeln(_androidTransferViewportScript)
         ..writeln();
     }
+    buffer
+      ..writeln()
+      ..writeln('// === Android verified text downloads (v0.2.64) ===')
+      ..writeln(_androidV064VerifiedTextDownloadScript);
     _jsBundle = buffer.toString();
     await _loadOptions(remoteActive: remoteActive);
     notifyListeners();
