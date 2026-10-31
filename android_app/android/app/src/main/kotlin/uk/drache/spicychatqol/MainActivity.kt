@@ -325,8 +325,15 @@ class MainActivity : FlutterActivity() {
                                 digest.digest(),
                             )
                         if (verified) {
-                            mapOf("ok" to true, "verified" to true,
-                                "bytes" to writtenBytes, "name" to name)
+                            // DS_ANDROID_V066_VERIFIED_RESULT: only successful
+                            // SHA-256 readback may produce a nonzero byte report.
+                            mapOf("ok" to true, "success" to true, "verified" to true,
+                                "bytes" to writtenBytes,
+                                "bytesWritten" to writtenBytes,
+                                "savedBytes" to writtenBytes,
+                                "fileSize" to writtenBytes,
+                                "name" to name, "filename" to name,
+                                "uri" to uri.toString())
                         } else {
                             mapOf("ok" to false, "error" to "verification-mismatch",
                                 "bytes" to writtenBytes, "expectedBytes" to expected.size)

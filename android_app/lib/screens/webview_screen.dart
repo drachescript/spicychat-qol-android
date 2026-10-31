@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -728,6 +729,17 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
               InAppWebView(
                 key: _webViewKey,
                 initialUrlRequest: URLRequest(url: _initialWebUri),
+                // DS_ANDROID_V065_EARLY_ACCOUNT_OBSERVER: the shared MAIN-world
+                // listener must precede SpicyChat's early XHR, not onLoadStop.
+                // On WebViews without document-start support the plugin uses
+                // its earliest available injection; it cannot guarantee order.
+                initialUserScripts: UnmodifiableListView<UserScript>([
+                  UserScript(
+                    source: widget.bundleService.earlyCardTokenMainScript,
+                    injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+                    forMainFrameOnly: true,
+                  ),
+                ]),
                 initialSettings: InAppWebViewSettings(
                   javaScriptEnabled: true,
                   javaScriptCanOpenWindowsAutomatically: true,
@@ -2555,9 +2567,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         }
         try {
           final data = jsonDecode(args[0].toString());
+          final text = (data['text'] ?? data['content'] ?? '').toString();
+          final filename = (data['filename'] ?? data['fileName'] ??
+              'spicychat-chat.txt').toString();
+          final supplied = (data['mimeType'] ?? '').toString().trim();
           return await _exportChatText(
-            (data['text'] ?? '').toString(),
-            (data['filename'] ?? 'spicychat-chat.txt').toString(),
+            text, filename,
+            mimeType: supplied.isNotEmpty ? supplied : _nativeTextMime(filename),
           );
         } catch (e) {
           debugPrint('[Bridge] exportChat error: $e');
@@ -4139,7 +4155,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           SnackBar(content: Text('Saved $safe (${bytes.length} bytes)')),
         );
       }
-      return {'ok': true, 'verified': true, 'bytes': bytes.length, 'name': safe};
+      return {
+        'ok': true, 'success': true, 'verified': true,
+        'bytes': bytes.length, 'bytesWritten': bytes.length,
+        'savedBytes': bytes.length, 'fileSize': bytes.length,
+        'filename': safe, 'name': safe,
+        if (native?['uri'] is String) 'uri': native?['uri'],
+      };
     } catch (e) {
       debugPrint('[Native Save] Error: $e');
       return {'ok': false, 'error': e.toString()};
@@ -4148,12 +4170,26 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
-  Future<Map<String, dynamic>> _exportChatText(String text, String filename) async {
+  // DS_ANDROID_V066_VERIFIED_RESULT: preserve text file MIME for Support,
+  // JSON, HTML, Markdown, and ordinary TXT exports.
+  String _nativeTextMime(String filename) {
+    final lower = filename.toLowerCase();
+    if (lower.endsWith('.json')) return 'application/json;charset=utf-8';
+    if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      return 'text/html;charset=utf-8';
+    }
+    if (lower.endsWith('.md')) return 'text/markdown;charset=utf-8';
+    return 'text/plain;charset=utf-8';
+  }
+
+  Future<Map<String, dynamic>> _exportChatText(
+    String text, String filename, {String? mimeType}
+  ) async {
     return _saveNativeFile(
       bytes: Uint8List.fromList(utf8.encode(text)),
       filename: filename,
       dialogTitle: 'Save Export',
-      mimeType: 'text/plain',
+      mimeType: mimeType ?? _nativeTextMime(filename),
     );
   }
 
@@ -4740,6 +4776,43 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   // ── Quick Menu ─────────────────────────────────────────────
 
+  // DS_ANDROID_V066_COG_GEOMETRY: log only positions/sizes, never chat text.
+  // This is triggered solely when the user opens/changes the native cog position.
+  Future<void> _logCogComposerGeometry(String phase) async {
+    final controller = _webController;
+    if (controller == null || !_isChatUrl(_lastKnownUrl)) return;
+    try {
+      final data = await controller.evaluateJavascript(source: r'''(() => {
+        const rect = selector => {
+          const el = document.querySelector(selector);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return [Math.round(r.x), Math.round(r.y),
+            Math.round(r.width), Math.round(r.height)];
+        };
+        return JSON.stringify({
+          viewport: [Math.round(window.innerWidth), Math.round(window.innerHeight)],
+          visualViewport: window.visualViewport
+            ? [Math.round(window.visualViewport.width), Math.round(window.visualViewport.height)]
+            : null,
+          textarea: rect('textarea[placeholder], textarea[aria-label]'),
+          send: rect('button[type="submit"], button[aria-label*="send" i]'),
+          ooc: rect('.ds-chat-ooc-shortcut'),
+          attachment: rect('button[aria-label="Plus-button"], button[aria-label="generate-image"]'),
+          visibleMessageEditors: document.querySelectorAll('div[id^="message-"] textarea').length
+        });
+      })()''');
+      final value = data?.toString() ?? '';
+      if (value.isNotEmpty) {
+        await _appLog.log('AndroidUI',
+          'Cog/composer geometry $phase: '
+          '${value.length > 850 ? value.substring(0, 850) : value}');
+      }
+    } catch (_) {
+      // Geometry logging is optional and must never affect the chat UI.
+    }
+  }
+
   Future<void> _showAndroidCogPositionPicker() async {
     if (!mounted) return;
 
@@ -4748,6 +4821,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       listen: false,
     );
 
+    unawaited(_logCogComposerGeometry('before-picker'));
     final selected = await showModalBottomSheet<String>(
       context: context,
       useSafeArea: true,
@@ -4805,6 +4879,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     await androidUi.setControlsPosition(selected);
     await _syncAndroidChatHeaderGear();
     _scheduleAndroidTopBarGearPosition(reason: 'settings');
+    Future<void>.delayed(const Duration(milliseconds: 300), () {
+      if (mounted) {
+        unawaited(_logCogComposerGeometry('after-picker'));
+      }
+    });
 
     if (mounted) {
       setState(() {});

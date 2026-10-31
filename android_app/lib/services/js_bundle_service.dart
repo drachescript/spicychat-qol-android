@@ -12,6 +12,8 @@ class JsBundleService extends ChangeNotifier {
 
   String _cssContent = '';
   String _jsBundle = '';
+  // DS_ANDROID_V065_EARLY_ACCOUNT_OBSERVER: refreshed with every verified QoL bundle.
+  String _earlyCardTokenMainScript = '';
   String _extensionVersion = bundledExtensionVersion;
   String _optionsHtml = '';
   final Map<String, String> _optionsSupportText = {};
@@ -20,6 +22,7 @@ class JsBundleService extends ChangeNotifier {
 
   String get cssContent => _cssContent;
   String get jsBundle => _jsBundle;
+  String get earlyCardTokenMainScript => _earlyCardTokenMainScript;
   String get extensionVersion => _extensionVersion;
   String get optionsHtml => _optionsHtml;
 
@@ -202,6 +205,12 @@ class JsBundleService extends ChangeNotifier {
   }
 
   static String _androidOptimizeComposerSource(String source) {
+    // DS_ANDROID_V066_VERIFIED_RESULT: upstream now owns mobile composer width,
+    // OOC lane and editor/keyboard gap fixes. Do not replace its updated editor
+    // implementation with APK-era code; keep the older optimization for old QoL.
+    if (source.contains('dsMobileComposerField')) {
+      return source;
+    }
     if (!source.contains('function resizeAndroidMessageEdit(textarea)')) {
       return source;
     }
@@ -552,7 +561,8 @@ class JsBundleService extends ChangeNotifier {
       if (expectedBytes > 0 && result?.ok === true && result?.verified === true &&
           Number(result?.bytes) === expectedBytes) {
         return { ok: true, method: "android-verified", verified: true,
-          bytes: expectedBytes };
+          bytes: expectedBytes, bytesWritten: expectedBytes,
+          savedBytes: expectedBytes, fileSize: expectedBytes };
       }
       return { ok: false, canceled: result?.canceled === true,
         error: String(result?.error || (result?.canceled ? "Save canceled" :
@@ -602,6 +612,21 @@ class JsBundleService extends ChangeNotifier {
     _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
         ? qolUpdates.activeVersion
         : bundledExtensionVersion;
+
+    // Install the SAME shared MAIN-world bridge at document start so the
+    // first native /users/settings response can be observed on /favorite-bots.
+    // Other shared modules still load normally, in manifest order, on load.
+    final earlyMainSource = remoteActive
+        ? await qolUpdates.readDownloadedText('content/card-token-main.js')
+        : await rootBundle.loadString('assets/js/card-token-main.js');
+    if (earlyMainSource == null || earlyMainSource.isEmpty) {
+      throw StateError('Verified QoL bundle is missing card-token-main.js');
+    }
+    _earlyCardTokenMainScript = '''(() => {
+  if (location.protocol !== 'https:' ||
+      !['spicychat.ai', 'www.spicychat.ai'].includes(location.hostname)) return;
+$earlyMainSource
+})();''';
 
     final bridge = await rootBundle.loadString('assets/js/bridge.js');
     final buffer = StringBuffer()

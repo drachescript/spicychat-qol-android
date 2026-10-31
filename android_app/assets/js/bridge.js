@@ -248,6 +248,16 @@
     },
 
     sendMessage(message, callback) {
+      // Full Favorites recovery uses the desktop background Typesense worker.
+      // Do not silently pretend a missing result means the bot was deleted.
+      if (message?.type === "DS_FAVORITES_RECOVERY_SEARCH") {
+        const response = {
+          ok: false,
+          error: "Full recovered-Favorites search requires the desktop QoL background worker. Android can still save account ID snapshots and use Later; run full recovery on desktop."
+        };
+        if (typeof callback === "function") queueMicrotask(() => callback(response));
+        return Promise.resolve(response);
+      }
       if (message?.type === "DS_OPEN_OPTIONS") {
         window.flutter_inappwebview
           .callHandler("openOptions")
@@ -647,7 +657,10 @@
   const MIGRATION_KEY = "dsGranularSettingsV1";
   const REVISION_KEY = "dsSettingsRevisionV1";
   const ALARM_NAME = "ds-qol-account-sync-v1";
-  const SYNC_INTERVAL_MINUTES = 5;
+  // DS_ANDROID_V065_EARLY_ACCOUNT_OBSERVER: keep native sync aligned with shared QoL.
+  const SYNC_INTERVAL_MINUTES = 360;
+  const LIST_EDIT_SETTLE_MS = 90_000;
+  let listPublishNotBefore = 0;
   const REQUEST_TIMEOUT_MS = 30000;
   const MAX_PUSH_KEYS = 20;
   const LIST_LEDGER_KEY = "qolSyncListLedgerV1";
@@ -1281,7 +1294,11 @@
     if (listMayUpload(prefs, scope)) {
       pendingListSources.add(scope);
       clearTimeout(listSyncTimer);
-      listSyncTimer = setTimeout(() => queued(() => syncListData()).catch(() => {}), 1600);
+      listPublishNotBefore = Date.now() + LIST_EDIT_SETTLE_MS;
+      listSyncTimer = setTimeout(() => {
+        if (document.visibilityState !== "visible") return;
+        queued(() => syncListData()).catch(() => {});
+      }, LIST_EDIT_SETTLE_MS);
     }
   }
 
@@ -1843,18 +1860,34 @@
     // The APK has no Chrome service-worker alarms. Check only in the active
     // WebView and let the upstream per-device settings/list modes decide
     // whether anything should be uploaded or downloaded.
+    // No native background worker: do not poll sync while a chat is hidden or
+    // issue network reads on every quick app switch. Manual sync is unchanged.
+    let lastAutoAttempt = 0;
     const runAutomaticSync = () => {
+      if (document.visibilityState !== "visible" ||
+          Date.now() - lastAutoAttempt < 15 * 60_000) return;
+      lastAutoAttempt = Date.now();
       queued(async () => {
         const { state, auth, prefs } = await getSyncContext();
         if (!state.accountId || !auth.token || state.paused || state.automatic === false) return;
         if (["off", "manual"].includes(prefs.mode) && !anyListsActive(prefs)) return;
+        if (Date.now() - Number(state.lastSyncAt || 0) < SYNC_INTERVAL_MINUTES * 60_000) return;
         await syncNowInternal();
       }).catch(() => {});
     };
     setTimeout(runAutomaticSync, 1800);
     setInterval(runAutomaticSync, SYNC_INTERVAL_MINUTES * 60 * 1000);
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") setTimeout(runAutomaticSync, 1200);
+      if (document.visibilityState !== "visible") return;
+      // A 90-second list-settle timer may have fired while backgrounded.
+      // Resume that pending list publish, but do not duplicate the user edit.
+      if (pendingListSources.size) {
+        clearTimeout(listSyncTimer);
+        listSyncTimer = setTimeout(() => {
+          queued(() => syncListData()).catch(() => {});
+        }, Math.max(1200, listPublishNotBefore - Date.now()));
+      }
+      setTimeout(runAutomaticSync, 1200);
     }, { passive: true });
   }
 })();

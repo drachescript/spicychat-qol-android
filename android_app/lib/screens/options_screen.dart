@@ -124,8 +124,11 @@ class _OptionsScreenState extends State<OptionsScreen> {
       final lower = filename.toLowerCase();
       final inferredMime = lower.endsWith('.gz')
           ? 'application/gzip'
-          : lower.endsWith('.txt') ? 'text/plain'
-          : lower.endsWith('.json') ? 'application/json'
+          : lower.endsWith('.txt') ? 'text/plain;charset=utf-8'
+          : lower.endsWith('.json') ? 'application/json;charset=utf-8'
+          : lower.endsWith('.html') || lower.endsWith('.htm')
+              ? 'text/html;charset=utf-8'
+          : lower.endsWith('.md') ? 'text/markdown;charset=utf-8'
           : 'application/octet-stream';
       final requestedMime = (data['mimeType'] ?? '').toString().trim();
       final mime = requestedMime.isEmpty || requestedMime == 'application/octet-stream'
@@ -154,7 +157,14 @@ class _OptionsScreenState extends State<OptionsScreen> {
           SnackBar(content: Text('Saved $filename (${bytes.length} bytes)')),
         );
       }
-      return {'ok': true, 'verified': true, 'bytes': bytes.length, 'name': filename};
+      // DS_ANDROID_V066_VERIFIED_RESULT: shared QoL 0.2.66 requires byte aliases.
+      return {
+        'ok': true, 'success': true, 'verified': true,
+        'bytes': bytes.length, 'bytesWritten': bytes.length,
+        'savedBytes': bytes.length, 'fileSize': bytes.length,
+        'filename': filename, 'name': filename,
+        if (native?['uri'] is String) 'uri': native?['uri'],
+      };
     } catch (error) {
       debugPrint('[Options] verified native save failed: $error');
       return {'ok': false, 'error': error.toString()};
