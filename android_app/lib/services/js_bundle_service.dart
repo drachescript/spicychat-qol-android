@@ -575,6 +575,76 @@ class JsBundleService extends ChangeNotifier {
 })();
 ''';
 
+
+  // DS_ANDROID_V067_MEMORY_PACK_MOBILE: shared QoL owns Memory Packs logic.
+  // Only mobile viewport/keyboard layout is adjusted by Android.
+  static const _androidV067MemoryPackMobileCss = r'''
+@media (max-width: 760px), (pointer: coarse) {
+  html[data-spicychat-qol-android="1"] .ds-memory-pack-screen {
+    align-items: start !important;
+    overflow-y: auto !important;
+    padding: 8px !important;
+    padding-top: max(8px, env(safe-area-inset-top)) !important;
+    padding-bottom: max(8px, env(safe-area-inset-bottom)) !important;
+    height: var(--ds-android-memory-pack-visible-height, 100dvh) !important;
+    box-sizing: border-box !important;
+  }
+  html[data-spicychat-qol-android="1"] .ds-memory-pack-panel {
+    box-sizing: border-box !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-height: calc(var(--ds-android-memory-pack-visible-height, 100dvh) - 16px) !important;
+    padding: 10px !important;
+    overflow-y: auto !important;
+    overscroll-behavior: contain !important;
+  }
+  html[data-spicychat-qol-android="1"] .ds-memory-pack-fields,
+  html[data-spicychat-qol-android="1"] .ds-memory-pack-card {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  html[data-spicychat-qol-android="1"] .ds-memory-pack-panel :is(input,textarea,select) {
+    box-sizing: border-box !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+  }
+}
+''';
+
+  // No polling or MutationObserver. Closed windows trigger no measurements.
+  static const _androidV067MemoryPackViewportScript = r'''
+(() => {
+  "use strict";
+  if (window.__dsAndroidV067MemoryPackViewportInstalled) return;
+  window.__dsAndroidV067MemoryPackViewportInstalled = true;
+  let scheduled = false;
+  const update = () => {
+    scheduled = false;
+    const screen = document.getElementById("ds-memory-pack-screen");
+    if (!screen || !window.visualViewport ||
+        !window.matchMedia("(max-width: 760px), (pointer: coarse)").matches) return;
+    const vp = window.visualViewport;
+    const height = Math.max(160, Math.round(vp.height || innerHeight));
+    const top = Math.max(0, Math.round(vp.offsetTop || 0));
+    screen.style.setProperty("--ds-android-memory-pack-visible-height", `${height}px`);
+    screen.style.setProperty("top", `${top}px`, "important");
+    screen.style.setProperty("bottom", "auto", "important");
+  };
+  const schedule = () => {
+    if (!document.getElementById("ds-memory-pack-screen") || scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(update);
+  };
+  window.visualViewport?.addEventListener("resize", schedule, { passive: true });
+  window.visualViewport?.addEventListener("scroll", schedule, { passive: true });
+  document.addEventListener("focusin", event => {
+    if (event.target?.closest?.(".ds-memory-pack-panel")) schedule();
+  }, true);
+  document.addEventListener("focusout", event => {
+    if (event.target?.closest?.(".ds-memory-pack-panel")) schedule();
+  }, true);
+})();
+''';
+
   Future<void> loadAssets() async {
     final remoteActive = qolUpdates.hasDownloadedBundle;
 
@@ -607,6 +677,10 @@ class JsBundleService extends ChangeNotifier {
         : _bundledCssFiles.any((p) => p.endsWith('/chat-continuation.css'));
     if (hasChatContinuation) cssChunks.add(_androidTransferMobileCss);
     cssChunks.add(_androidV064ImportMobileCss);
+    final hasMemoryPacks = remoteActive
+        ? qolUpdates.runtimeJsPaths.any((p) => p.endsWith('/memory-packs.js'))
+        : _bundledJsFiles.any((p) => p.endsWith('/memory-packs.js'));
+    if (hasMemoryPacks) cssChunks.add(_androidV067MemoryPackMobileCss);
     _cssContent = cssChunks.join('\n\n');
 
     _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
@@ -952,6 +1026,12 @@ $earlyMainSource
       ..writeln()
       ..writeln('// === Android verified text downloads (v0.2.64) ===')
       ..writeln(_androidV064VerifiedTextDownloadScript);
+    if (hasMemoryPacks) {
+      buffer
+        ..writeln()
+        ..writeln('// === Android Memory Packs viewport (v0.2.67) ===')
+        ..writeln(_androidV067MemoryPackViewportScript);
+    }
     _jsBundle = buffer.toString();
     await _loadOptions(remoteActive: remoteActive);
     notifyListeners();
