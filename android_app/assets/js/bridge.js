@@ -224,7 +224,11 @@
     // Requested diagnostics are read-only. Prefer the latest diagnostic
     // listener so earlier async listeners cannot stall the Settings reply.
     // Keep all other message ordering, writes and controls unchanged.
-    if (message?.type === 'DS_GET_PAGE_DIAGNOSTICS') listeners.reverse();
+    // DS_ANDROID_V072_DIAGNOSTIC_DISPATCH: these read-only diagnostic probes
+    // are owned by the latest QoL content runtime. Do not serially wait for
+    // unrelated earlier listeners before checking readiness.
+    if (message?.type === 'DS_GET_PAGE_DIAGNOSTICS' ||
+        message?.type === 'DS_GET_PAGE_DIAGNOSTICS_LIGHT') listeners.reverse();
     for (const listener of listeners) {
       const result = await invokeRuntimeListener(listener, message, sender);
       if (result.handled) return result.value;

@@ -274,7 +274,9 @@
       value = value.response;
     }
 
-    if (!value || typeof value !== "object") return null;
+    // Native dispatch failures and lightweight probes are not full
+    // runtime snapshots. Never mark them as live performance data.
+    if (!value || typeof value !== "object" || value.ok === false || value.error) return null;
 
     return {
       ...value,
@@ -295,18 +297,47 @@
     return null;
   }
 
+  // DS_ANDROID_V072_LIGHT_DIAGNOSTIC_PROBE: one cheap readiness check, then
+  // at most one explicitly requested full snapshot. Old shared bundles that
+  // predate the light protocol get one legacy full request. Never keep
+  // retrying a heavy snapshot while the Android renderer is struggling.
   async function queryAndroidPageDiagnosticsWithRetry() {
-    const delays = [0, 80, 180, 320];
-    for (const delay of delays) {
-      if (delay) await wait(delay);
-      const response = normalizePageDiagnostics(
-        await sendAndroidMainTabMessage({
-          type: "DS_GET_PAGE_DIAGNOSTICS"
-        })
-      );
-      if (response) return response;
+    const rawLight = await sendAndroidMainTabMessage({
+      type: "DS_GET_PAGE_DIAGNOSTICS_LIGHT"
+    });
+    const light = normalizePageDiagnostics(rawLight);
+    const lightweight = light?.ok === true && light.sampleKind === "lightweight-no-dom"
+      ? {
+          sampleKind: "lightweight-no-dom",
+          sampleAt: Number(light.sampleAt || 0),
+          runtimeReady: light.runtimeReady === true,
+          paused: light.paused === true
+        }
+      : null;
+
+    const releaseVersion = String(window.__spicyChatQolBundledVersion || "");
+    const version = releaseVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+    const supportsLight = !!version &&
+      (Number(version[1]) > 0 || Number(version[2]) > 2 ||
+        (Number(version[2]) === 2 && Number(version[3]) >= 72));
+    if (!lightweight && supportsLight) {
+      return { full: null, lightweight: null, status: "light-probe-unreachable" };
     }
-    return null;
+    if (lightweight && !lightweight.runtimeReady) {
+      return { full: null, lightweight, status: "runtime-initializing" };
+    }
+
+    const full = normalizePageDiagnostics(await sendAndroidMainTabMessage({
+      type: "DS_GET_PAGE_DIAGNOSTICS"
+    }));
+    if (full?.ok === true && full.androidPartialDiagnostics !== true &&
+        full.sampleKind !== "lightweight-no-dom") {
+      return { full, lightweight, status: "full-runtime-snapshot" };
+    }
+    return {
+      full: null, lightweight,
+      status: lightweight ? "full-snapshot-unreachable" : "legacy-runtime-unreachable"
+    };
   }
 
   function partialAndroidPageDiagnostics(tab) {
@@ -362,20 +393,25 @@
             };
           }
 
-          const liveDiagnostics =
-            await queryAndroidPageDiagnosticsWithRetry();
+          const result = await queryAndroidPageDiagnosticsWithRetry();
+          const liveDiagnostics = result?.full || null;
           const pageDiagnostics =
             liveDiagnostics || partialAndroidPageDiagnostics(tab);
 
           return {
             ok: true,
-            runtimeAvailable: !!liveDiagnostics && liveDiagnostics.androidPartialDiagnostics !== true,
+            // Neither a timeout nor a partial sample implies QoL is disabled.
+            runtimeAvailable: !!liveDiagnostics,
+            runtimeProbeAvailable: !!result?.lightweight,
+            runtimeStatus: result?.status || "snapshot-unavailable",
+            runtimeProbeReady: result?.lightweight?.runtimeReady ?? null,
+            runtimeProbePaused: result?.lightweight?.paused ?? null,
+            androidDiagnosticMode: result?.status || "unavailable",
             url: tab.url || "",
             title: tab.title || "",
             pageDiagnostics,
             androidNativeBridge: true,
-            androidPartialDiagnostics: !liveDiagnostics ||
-              liveDiagnostics.androidPartialDiagnostics === true
+            androidPartialDiagnostics: !liveDiagnostics
           };
         }
 

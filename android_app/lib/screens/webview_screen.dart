@@ -1094,22 +1094,28 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessResponsive: (controller, url) async {
+                  // DS_ANDROID_V072_RECOVERY_CAPTURE: native WebView can
+                  // issue responsive callbacks without a paired start. Such
+                  // events are not timed stalls and need no snapshot/log.
                   final stallStart = _rendererUnresponsiveSince;
                   _rendererUnresponsiveSince = null;
-                  final stallMs = stallStart == null
-                      ? null
-                      : DateTime.now().difference(stallStart).inMilliseconds;
+                  if (stallStart == null) return null;
+                  final stallMs = DateTime.now()
+                      .difference(stallStart).inMilliseconds;
                   unawaited(
                     _appLog.log(
                       'Renderer',
                       'Android WebView renderer responsive again; '
-                      'stallMs=${stallMs ?? "unknown"}; url=${url ?? _lastKnownUrl}',
+                      'stallMs=$stallMs; url=${url ?? _lastKnownUrl}',
                     ),
                   );
-                  if (_shouldPersistDiagnostic(
-                    'renderer-recovery-context',
-                    cooldown: const Duration(minutes: 2),
-                  )) {
+                  // Post-stall JavaScript competes with chat input. Only
+                  // capture sustained, paired stalls while the app is visible.
+                  if (stallMs >= 2000 && _appIsResumed &&
+                      !_isLoading && _shouldPersistDiagnostic(
+                        'renderer-recovery-context',
+                        cooldown: const Duration(minutes: 2),
+                      )) {
                     unawaited(_logRecoveredRendererSnapshot(controller));
                   }
                   return null;
@@ -2034,7 +2040,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       if (!await _isCurrentUrlTrusted(controller)) return null;
 
       final encodedMessage = jsonEncode(message);
-      final rawResult = await controller.evaluateJavascript(
+      final rawResultFuture = controller.evaluateJavascript(
         source: '''(async () => {
           const dispatch = window.__dsAndroidDispatchRuntimeMessage;
           if (typeof dispatch !== "function") {
@@ -2076,6 +2082,15 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           }
         })()''',
       );
+      // DS_ANDROID_V072_NATIVE_DIAGNOSTIC_GUARD: never wait indefinitely
+      // for an already busy renderer. A timeout ends this native request,
+      // but does not reload the page or cancel an in-flight JS operation.
+      final type = message is Map ? (message['type'] ?? '').toString() : '';
+      final rawResult = type == 'DS_GET_PAGE_DIAGNOSTICS_LIGHT'
+          ? await rawResultFuture.timeout(const Duration(milliseconds: 1500))
+          : type == 'DS_GET_PAGE_DIAGNOSTICS'
+              ? await rawResultFuture.timeout(const Duration(milliseconds: 4500))
+              : await rawResultFuture;
 
       // Android WebView can return either JSON text or a JSON-quoted
       // string containing JSON. Decode no more than twice and never treat a
@@ -2097,43 +2112,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         }
         return decoded['response'];
       }
-      // Only after a requested diagnostic dispatch fails: return a clearly
-      // marked partial snapshot. Never read or export chat text.
-      if (message is Map && message['type'] == 'DS_GET_PAGE_DIAGNOSTICS') {
-        final partial = await controller.evaluateJavascript(
-          source: r'''(() => {
-            const DS = window.DragonScriptQoL;
-            // The APK diagnostic hook may still be alive when the shared QoL
-            // runtime has not initialized. Report a *partial* result then.
-            const counters = DS?.state?.runtimePerformance || {};
-            let snapshot = null;
-            try {
-              const value = window.__dsAndroidChatPerformanceSnapshot?.();
-              if (typeof value === 'string') snapshot = JSON.parse(value);
-            } catch (_) {}
-            return JSON.stringify({
-              androidPartialDiagnostics: true,
-              androidNativeBridge: true,
-              runtimePerformance: { ...counters },
-              performance: [],
-              androidEnvironment: { android: true, webview: true, dedicatedApp: true },
-              runtimeContext: { visibilityState: document.visibilityState,
-                focused: document.hasFocus?.() ?? null },
-              androidRendererSnapshot: snapshot
-            });
-          })()''',
-        );
-        if (partial is String && partial.isNotEmpty) {
-          try {
-            final data = jsonDecode(partial);
-            if (data is Map) {
-              unawaited(_appLog.log('AndroidDiagnostics',
-                  'On-demand partial renderer snapshot returned; shared QoL runtime not confirmed'));
-              return data;
-            }
-          } catch (_) {}
-        }
-      }
+      // A failed full snapshot is not a reason to evaluate JavaScript again.
+      // Options constructs an explicitly labeled partial result instead.
       return null;
     } catch (e, stackTrace) {
       if (_shouldPersistDiagnostic('android-options-main-runtime-message')) {
@@ -3111,6 +3091,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   };
 
   const fullSweep = reason => {
+    syncObserver();
     pendingRoots.clear();
     scheduled = false;
     let anchors = Array.from(document.querySelectorAll(LINK_SELECTOR));
@@ -3161,6 +3142,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   window.__dsAndroidListingIdentityRun = fullSweep;
   window.__dsAndroidListingIdentitySchedule = reason => {
+    syncObserver();
     if (reason === "load-stop" || reason === "spa-route" || reason === "recheck") {
       fullSweep(reason);
       return;
@@ -3183,10 +3165,26 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (added) schedule("mutation");
   });
 
-  const observeRoot = document.documentElement || document.body;
-  if (observeRoot) {
-    observer.observe(observeRoot, { childList: true, subtree: true });
-  }
+  // DS_ANDROID_V072_LISTING_OBSERVER_SCOPE: no subtree observer on
+  // active chats. Native React message churn otherwise wakes it constantly.
+  // SPA route callbacks already call fullSweep(), which reconnects it when
+  // returning to listings. No new polling, observer or background timer.
+  let observerActive = false;
+  const syncObserver = () => {
+    const shouldWatch = !isSingleChatRoute();
+    if (!shouldWatch && observerActive) {
+      observer.disconnect();
+      observerActive = false;
+      pendingRoots.clear();
+    } else if (shouldWatch && !observerActive) {
+      const root = document.documentElement || document.body;
+      if (root) {
+        observer.observe(root, { childList: true, subtree: true });
+        observerActive = true;
+      }
+    }
+  };
+  syncObserver();
 
   window[STATE_KEY] = {
     stats,
@@ -4421,7 +4419,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (!mounted ||
         !_appIsResumed ||
         _recoveringWebView ||
-        controller == null) {
+        controller == null ||
+        // A periodic probe should not compete with a confirmed stall or
+        // the one-time full script injection on a freshly loaded document.
+        _rendererUnresponsiveSince != null ||
+        _injectionInProgressToken != null) {
       return;
     }
 
