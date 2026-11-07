@@ -1344,7 +1344,19 @@
       const oldValue = data[info.storage];
       const oldIds = listIds(oldValue, scope);
       const nextIds = Object.keys(best).filter(id => Number(best[id]?.[1]) === 1).sort();
-      if (JSON.stringify(oldIds) === JSON.stringify(nextIds)) continue;
+      // DS_ANDROID_V073_BLOCKED_MIRROR_PARITY: QoL 0.2.73's blocked-list
+      // fallback repair is APK-owned on Android, in both WebView bridges.
+      const listUnchanged = JSON.stringify(oldIds) === JSON.stringify(nextIds);
+      let mirror = null;
+      if (listUnchanged && scope === "blockedBots") {
+        // Repair stale granular fallbacks even if the primary list matches.
+        // Only read these small keys when the primary list is current.
+        mirror = await storageGet([`${GRANULAR_PREFIX}blockedBotIds`, `${GRANULAR_PREFIX}blockedBotNames`, INDEX_KEY]);
+        const index = Array.isArray(mirror[INDEX_KEY]) ? mirror[INDEX_KEY] : [];
+        const mirrorIds = listIds({ ids: mirror[`${GRANULAR_PREFIX}blockedBotIds`], names: mirror[`${GRANULAR_PREFIX}blockedBotNames`] }, scope);
+        if (index.includes("blockedBotIds") && index.includes("blockedBotNames") &&
+            JSON.stringify(mirrorIds) === JSON.stringify(nextIds)) continue;
+      } else if (listUnchanged) continue;
       if (scope === "blockedBots") {
         // A remote unblock must not immediately be undone by local auto-block
         // matching on a word or tag card. Grant the same rule-scoped exemption
@@ -1358,7 +1370,22 @@
         ...(scope === "blockedBots" ? { names: nextIds.filter(id => id.startsWith("name:")).map(id => id.slice(5)) } : {})
       };
       expectedListWrites.set(scope, JSON.stringify(nextIds));
-      const saved = await storageSet({ [info.storage]: value });
+      const payload = { [info.storage]: value };
+      if (scope === "blockedBots") {
+        // Keep older QoL granular blocked-ID fallbacks aligned so an
+        // unblocked bot is not re-blocked after the next page load.
+        const prior = mirror || await storageGet([INDEX_KEY]);
+        const index = new Set(Array.isArray(prior[INDEX_KEY]) ? prior[INDEX_KEY] : []);
+        const idsKey = `${GRANULAR_PREFIX}blockedBotIds`;
+        const namesKey = `${GRANULAR_PREFIX}blockedBotNames`;
+        payload[idsKey] = value.ids;
+        payload[namesKey] = value.names;
+        if (!index.has("blockedBotIds") || !index.has("blockedBotNames")) {
+          index.add("blockedBotIds"); index.add("blockedBotNames");
+          payload[INDEX_KEY] = [...index].sort();
+        }
+      }
+      const saved = await storageSet(payload);
       if (!saved) {
         expectedListWrites.delete(scope);
         throw new Error(`Could not merge ${scope} into local storage`);
