@@ -1,0 +1,5549 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:file_picker/file_picker.dart';
+import '../services/settings_service.dart';
+import '../services/js_bundle_service.dart';
+import '../services/app_log_service.dart';
+import '../services/android_tabs_service.dart';
+import '../services/android_ui_service.dart';
+import '../models/android_chat_tab.dart';
+import 'options_screen.dart';
+import 'android_settings_screen.dart';
+
+class _AndroidOptionsRouteGate {
+  static bool _openOrOpening = false;
+  static DateTime? _lastRequestAt;
+
+  static bool tryAcquire() {
+    final now = DateTime.now();
+    final last = _lastRequestAt;
+
+    // A process-wide guard prevents duplicate Options routes even if a laggy
+    // WebView dispatches the same request through more than one bridge path or
+    // WebViewScreen instance. Keep a tiny cooldown for delayed duplicate taps.
+    if (_openOrOpening ||
+        (last != null &&
+            now.difference(last) < const Duration(milliseconds: 750))) {
+      return false;
+    }
+
+    _openOrOpening = true;
+    _lastRequestAt = now;
+    return true;
+  }
+
+  static void release() {
+    _openOrOpening = false;
+  }
+}
+
+class _NativeFilePayload {
+  final String filename;
+  final Uint8List bytes;
+
+  const _NativeFilePayload({required this.filename, required this.bytes});
+}
+
+class WebViewScreen extends StatefulWidget {
+  final JsBundleService bundleService;
+
+  const WebViewScreen({super.key, required this.bundleService});
+
+  @override
+  State<WebViewScreen> createState() => _WebViewScreenState();
+}
+
+class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserver {
+  InAppWebViewController? _webController;
+  bool _isLoading = true;
+  double _progress = 0;
+  bool _optionsPageOpen = false;
+  bool _quickMenuOpen = false;
+  Key _webViewKey = UniqueKey();
+  WebUri _initialWebUri = WebUri('https://spicychat.ai/');
+  Timer? _healthTimer;
+  DateTime? _loadStartedAt;
+  DateTime? _lastLoadStopAt;
+  DateTime? _lastRecoveryAt;
+  DateTime? _lastSpaRouteAt;
+  DateTime? _lastVisualGuardAt;
+  String _lastKnownUrl = 'https://spicychat.ai/';
+  String? _lastSpaRouteUrl;
+  String? _lastInjectedDocumentToken;
+  String? _injectionInProgressToken;
+  int _blankHealthFailures = 0;
+  int _routeHealthGeneration = 0;
+  int _visualGuardGeneration = 0;
+  int _lastProgressPercent = -1;
+  bool _recoveringWebView = false;
+  // DS_ANDROID_V062_VERIFIED_EXPORT / lifecycle attribution. No polling.
+  bool _nativeSaveBusy = false;
+  DateTime? _lastBackgroundAt;
+  int _navigationSequence = 0;
+  String _lastNavigationCause = 'initial';
+  // DS_ANDROID_PERF59_DIAGNOSTICS: time renderer stalls without extra probes.
+  DateTime? _rendererUnresponsiveSince;
+  bool _appIsResumed = true;
+  bool _messageLongPressMenuOpen = false;
+  String? _androidMessageLongPressSource;
+  double _lastScrollY = 0;
+  final Map<String, double> _scrollByUrl = <String, double>{};
+  String? _pendingTabSwitchId;
+  double? _pendingTabRestoreScrollY;
+  bool _switchingAndroidTab = false;
+  bool _tabsEnabledAtSettingsOpen = false;
+
+  // Native top-bar cog geometry. Sample only on load/route/settings changes;
+  // normal chat/list DOM churn never repositions or rescans it.
+  double _androidTopBarGearLeft = 0;
+  double _androidTopBarGearTop = 9;
+  bool _androidTopBarGearPositionReady = false;
+  int _androidTopBarGearPositionGeneration = 0;
+
+  // Android Save & Stay history repair.
+  DateTime? _androidSaveStayStartedAt;
+  String? _androidSaveStayEditorId;
+  bool _androidSaveStayBackRepairArmed = false;
+  bool _androidSaveStayBackRepairInProgress = false;
+  bool _androidSaveStayBackSawNonEditor = false;
+  Timer? _androidSaveStayBackRepairTimer;
+
+  final Map<String, DateTime> _diagnosticCooldowns = <String, DateTime>{};
+  final AppLogService _appLog = AppLogService.instance;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    final androidUi = Provider.of<AndroidUiService>(
+      context,
+      listen: false,
+    );
+    _lastKnownUrl = androidUi.defaultStartUrl;
+    _initialWebUri = WebUri(androidUi.defaultStartUrl);
+
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (tabsService.enabled &&
+        tabsService.restoreAfterRestart &&
+        tabsService.activeTab != null) {
+      final restored = tabsService.activeTab!;
+      _lastKnownUrl = restored.url;
+      _initialWebUri = WebUri(restored.url);
+      _pendingTabSwitchId = restored.id;
+      _pendingTabRestoreScrollY = restored.scrollY;
+    }
+
+    unawaited(_appLog.log('WebView', 'WebView screen created'));
+    // Fallback watchdog only. Route/resume checks handle the fast path.
+    // The old 20-second probe also walked body.innerText, which gets expensive
+    // in long chats.
+    _healthTimer = Timer.periodic(
+      const Duration(seconds: 90),
+      (_) => unawaited(_runWebViewHealthCheck(trigger: 'periodic')),
+    );
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _healthTimer?.cancel();
+    _androidSaveStayBackRepairTimer?.cancel();
+    unawaited(_appLog.log('WebView', 'WebView screen disposed; nav=$_navigationSequence; lastCause=$_lastNavigationCause; url=$_lastKnownUrl'));
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appIsResumed = state == AppLifecycleState.resumed;
+    final elapsed = _lastBackgroundAt == null ? -1 :
+        DateTime.now().difference(_lastBackgroundAt!).inMilliseconds;
+    if (_appIsResumed) {
+      unawaited(_appLog.log('Lifecycle',
+          'App resumed after ${elapsed}ms; nav=$_navigationSequence; '
+          'webViewPresent=${_webController != null}; loading=$_isLoading; '
+          'recovering=$_recoveringWebView; url=$_lastKnownUrl'));
+      _lastBackgroundAt = null;
+    } else {
+      _lastBackgroundAt ??= DateTime.now();
+      unawaited(_appLog.log('Lifecycle',
+          'App lifecycle $state; nav=$_navigationSequence; '
+          'webViewPresent=${_webController != null}; url=$_lastKnownUrl'));
+      unawaited(_appLog.flush());
+    }
+    if (_appIsResumed) {
+      _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
+      // A surviving WebView does not need two full avatar/layout sweeps just
+      // because Android resumed the Activity. Keep the existing guard for
+      // real page loads, SPA route changes and renderer recovery.
+      if (_isLoading || _recoveringWebView) {
+        _scheduleVisualGuardForCurrentPage('app-resumed');
+      }
+    } else {
+      _routeHealthGeneration++;
+      _visualGuardGeneration++;
+      unawaited(_saveActiveAndroidTabState());
+    }
+  }
+
+  void _scheduleHealthCheck(
+    String trigger, {
+    Duration delay = const Duration(seconds: 5),
+  }) {
+    final generation = ++_routeHealthGeneration;
+    Future<void>.delayed(delay, () async {
+      if (!mounted ||
+          !_appIsResumed ||
+          generation != _routeHealthGeneration) {
+        return;
+      }
+      await _runWebViewHealthCheck(trigger: trigger);
+    });
+  }
+
+  bool _shouldPersistDiagnostic(
+    String key, {
+    Duration cooldown = const Duration(seconds: 30),
+  }) {
+    final now = DateTime.now();
+    final previous = _diagnosticCooldowns[key];
+    if (previous != null && now.difference(previous) < cooldown) {
+      return false;
+    }
+    _diagnosticCooldowns[key] = now;
+
+    if (_diagnosticCooldowns.length > 120) {
+      final cutoff = now.subtract(const Duration(minutes: 10));
+      _diagnosticCooldowns.removeWhere((_, value) => value.isBefore(cutoff));
+    }
+    return true;
+  }
+
+  static String _normalizedSpicyChatPath(String raw) {
+    final uri = Uri.tryParse(raw);
+    if (uri == null) return '';
+
+    var path = uri.path.replaceAll(RegExp(r'/+$'), '');
+    path = path.replaceFirst(
+      RegExp(r'^/[a-z]{2}(?=/)', caseSensitive: false),
+      '',
+    );
+    return path.isEmpty ? '/' : path;
+  }
+
+  static String? _botEditorIdFromUrl(String raw) {
+    final uri = Uri.tryParse(raw);
+    if (uri == null || !_isSpicyChat(uri)) return null;
+
+    final path = _normalizedSpicyChatPath(raw);
+
+    var match = RegExp(
+      r'^/chatbot/([^/]+)/edit$',
+      caseSensitive: false,
+    ).firstMatch(path);
+    if (match != null) {
+      final value = Uri.decodeComponent(match.group(1) ?? '').trim();
+      return value.isEmpty ? null : value.toLowerCase();
+    }
+
+    match = RegExp(
+      r'^/chatbot/edit/([^/]+)$',
+      caseSensitive: false,
+    ).firstMatch(path);
+    if (match != null) {
+      final value = Uri.decodeComponent(match.group(1) ?? '').trim();
+      return value.isEmpty ? null : value.toLowerCase();
+    }
+
+    if (path == '/chatbot/edit') {
+      final value = (
+        uri.queryParameters['id'] ??
+        uri.queryParameters['chatbotId'] ??
+        uri.queryParameters['characterId'] ??
+        ''
+      ).trim();
+      return value.isEmpty ? null : value.toLowerCase();
+    }
+
+    return null;
+  }
+
+  void _clearAndroidSaveStayBackRepair() {
+    _androidSaveStayBackRepairTimer?.cancel();
+    _androidSaveStayBackRepairTimer = null;
+    _androidSaveStayStartedAt = null;
+    _androidSaveStayEditorId = null;
+    _androidSaveStayBackRepairArmed = false;
+    _androidSaveStayBackRepairInProgress = false;
+    _androidSaveStayBackSawNonEditor = false;
+  }
+
+  void _armAndroidSaveStayBackRepair() {
+    final editorId = _botEditorIdFromUrl(_lastKnownUrl);
+    if (editorId == null) return;
+
+    _androidSaveStayBackRepairTimer?.cancel();
+    _androidSaveStayStartedAt = DateTime.now();
+    _androidSaveStayEditorId = editorId;
+    _androidSaveStayBackRepairArmed = true;
+    _androidSaveStayBackRepairInProgress = false;
+    _androidSaveStayBackSawNonEditor = false;
+
+    unawaited(
+      _appLog.log(
+        'AndroidNavigation',
+        'Save & Stay armed Android Back history repair for editor=$editorId',
+      ),
+    );
+  }
+
+  void _observeAndroidSaveStayNavigation(
+    String previousUrl,
+    String nextUrl,
+  ) {
+    final editorId = _androidSaveStayEditorId;
+    if (editorId == null) return;
+
+    final nextEditorId = _botEditorIdFromUrl(nextUrl);
+
+    if (_androidSaveStayBackRepairInProgress) {
+      if (nextEditorId == null) {
+        _androidSaveStayBackSawNonEditor = true;
+        return;
+      }
+
+      if (
+        nextEditorId == editorId &&
+        _androidSaveStayBackSawNonEditor
+      ) {
+        unawaited(_finishAndroidSaveStayDuplicateBack());
+        return;
+      }
+
+      if (nextEditorId != editorId) {
+        _clearAndroidSaveStayBackRepair();
+      }
+      return;
+    }
+
+    if (!_androidSaveStayBackRepairArmed) return;
+
+    if (nextEditorId != null && nextEditorId != editorId) {
+      _clearAndroidSaveStayBackRepair();
+      return;
+    }
+
+    final started = _androidSaveStayStartedAt;
+    final withinSaveWindow = started != null &&
+        DateTime.now().difference(started) < const Duration(seconds: 12);
+
+    final previousEditorId = _botEditorIdFromUrl(previousUrl);
+    if (
+      previousEditorId == editorId &&
+      nextEditorId == null &&
+      !withinSaveWindow
+    ) {
+      _clearAndroidSaveStayBackRepair();
+    }
+  }
+
+  Future<void> _finishAndroidSaveStayDuplicateBack() async {
+    if (!_androidSaveStayBackRepairInProgress) return;
+
+    final controller = _webController;
+    final editorId = _androidSaveStayEditorId;
+    if (controller == null || editorId == null) {
+      _clearAndroidSaveStayBackRepair();
+      return;
+    }
+
+    _androidSaveStayBackRepairTimer?.cancel();
+    _androidSaveStayBackRepairTimer = null;
+
+    try {
+      final current = await controller.getUrl();
+      final currentEditorId =
+          current == null ? null : _botEditorIdFromUrl(current.toString());
+
+      if (currentEditorId == editorId && await controller.canGoBack()) {
+        unawaited(
+          _appLog.log(
+            'AndroidNavigation',
+            'Save & Stay duplicate editor history detected; applying second Back',
+          ),
+        );
+        await controller.goBack();
+      }
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('save-stay-back-repair')) {
+        unawaited(
+          _appLog.log(
+            'AndroidNavigation',
+            'Save & Stay Back repair failed',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    } finally {
+      _clearAndroidSaveStayBackRepair();
+    }
+  }
+
+  Future<void> _handleAndroidSaveStayBack(
+    InAppWebViewController controller,
+  ) async {
+    final editorId = _androidSaveStayEditorId;
+    if (
+      !_androidSaveStayBackRepairArmed ||
+      _androidSaveStayBackRepairInProgress ||
+      editorId == null ||
+      _botEditorIdFromUrl(_lastKnownUrl) != editorId
+    ) {
+      await controller.goBack();
+      return;
+    }
+
+    _androidSaveStayBackRepairArmed = false;
+    _androidSaveStayBackRepairInProgress = true;
+    _androidSaveStayBackSawNonEditor = false;
+
+    _androidSaveStayBackRepairTimer?.cancel();
+    _androidSaveStayBackRepairTimer = Timer(
+      const Duration(milliseconds: 1200),
+      () => unawaited(_finishAndroidSaveStayDuplicateBack()),
+    );
+
+    await controller.goBack();
+  }
+
+  static bool _isChatUrl(String raw) {
+    final uri = Uri.tryParse(raw);
+    return uri != null &&
+        _isSpicyChat(uri) &&
+        (uri.path == '/chat' || uri.path.startsWith('/chat/'));
+  }
+
+  /// Check whether the URL is a SpicyChat domain (for script injection)
+  static bool _isSpicyChat(Uri url) {
+    final host = url.host.toLowerCase();
+    return host == 'spicychat.ai' || host.endsWith('.spicychat.ai');
+  }
+
+  /// Check whether the URL is an authentication provider (for navigation)
+  static bool _isAuthDomain(Uri url) {
+    final host = url.host.toLowerCase();
+    bool isDomain(String d) => host == d || host.endsWith('.$d');
+
+    return isDomain('kinde.com') ||
+        isDomain('accounts.google.com') ||
+        isDomain('apple.com') ||
+        (isDomain('discord.com') && url.path.contains('oauth2'));
+  }
+
+  /// Verify the current WebView URL is allowed to access the native JS bridge.
+  ///
+  /// Most bridge calls originate from scripts that are already running inside
+  /// the current SpicyChat document. Use the Flutter-side route cache first so
+  /// opening a native control does not have to wait for WebView.getUrl().
+  /// Long active chats can keep the renderer busy enough for getUrl() to take
+  /// noticeably longer than it does on lightweight pages.
+  Future<bool> _isCurrentUrlTrusted(InAppWebViewController controller) async {
+    final cached = Uri.tryParse(_lastKnownUrl);
+    if (cached != null && _isSpicyChat(cached)) {
+      return true;
+    }
+
+    final url = await controller.getUrl();
+    if (url == null || !_isSpicyChat(url)) {
+      return false;
+    }
+
+    _lastKnownUrl = url.toString();
+    return true;
+  }
+
+  Future<void> _syncAndroidChatHeaderGear() async {
+    final controller = _webController;
+    if (controller == null) return;
+
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+          document.getElementById("ds-android-native-header-settings")?.remove();
+          document.getElementById("ds-android-native-cog-appearance")?.remove();
+
+          for (const key of [
+            "__dsAndroidTopBarOverlayState",
+            "__dsAndroidHeaderGearState",
+            "__dsAndroidTopBarGearState"
+          ]) {
+            const state = window[key];
+            state?.observer?.disconnect?.();
+            if (state?.resizeHandler) {
+              window.removeEventListener("resize", state.resizeHandler, true);
+            }
+            if (state?.scrollHandler) {
+              window.removeEventListener("scroll", state.scrollHandler, true);
+            }
+            try { delete window[key]; } catch {}
+          }
+
+          return true;
+        })()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-topbar-overlay-cleanup')) {
+        unawaited(
+          _appLog.log(
+            'AndroidUI',
+            'Could not clean up legacy DOM top-bar QoL button',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+
+  void _scheduleAndroidTopBarGearPosition({String reason = 'route'}) {
+    final generation = ++_androidTopBarGearPositionGeneration;
+
+    // The native control is deliberately not tied to a MutationObserver.
+    // Retry a few bounded times because SpicyChat's header can mount after the
+    // route callback, then leave the position alone until the next route/load.
+    for (final delay in const <Duration>[
+      Duration(milliseconds: 60),
+      Duration(milliseconds: 280),
+      Duration(milliseconds: 900),
+    ]) {
+      Future<void>.delayed(delay, () {
+        if (!mounted || generation != _androidTopBarGearPositionGeneration) {
+          return;
+        }
+        unawaited(_refreshAndroidTopBarGearPosition(reason: reason));
+      });
+    }
+  }
+
+  Future<void> _refreshAndroidTopBarGearPosition({
+    String reason = 'route',
+  }) async {
+    final controller = _webController;
+    if (controller == null || !mounted) return;
+
+    final androidUi = Provider.of<AndroidUiService>(
+      context,
+      listen: false,
+    );
+    if (!androidUi.controlsInSpicyChatTopBar) return;
+
+    try {
+      final value = await controller.evaluateJavascript(
+        source: r'''(() => {
+          const visible = element => {
+            if (!(element instanceof HTMLElement)) return false;
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== "none" &&
+              style.visibility !== "hidden";
+          };
+
+          const path = String(location.pathname || "");
+          const isChat = path === "/chat" || path.startsWith("/chat/");
+          let anchor = null;
+          let kind = "fallback";
+
+          if (isChat) {
+            const rating = document.querySelector(
+              'button[aria-label="ThumbsUp-button"]'
+            );
+            if (visible(rating)) {
+              anchor = rating;
+              kind = "rating";
+            }
+          }
+
+          if (!anchor) {
+            const avatar = document.querySelector('a[aria-label="avatar"]');
+            if (visible(avatar)) {
+              anchor = avatar;
+              kind = "avatar";
+            }
+          }
+
+          if (!anchor) {
+            const locale = document.querySelector('[data-testid="LocaleSelector"]');
+            if (visible(locale)) {
+              anchor = locale;
+              kind = "locale";
+            }
+          }
+
+          const size = 40;
+          const gap = 8;
+          const viewportWidth = Math.max(1, window.innerWidth || 1);
+          let left = Math.max(8, viewportWidth - size - 60);
+          let top = 9;
+
+          if (anchor) {
+            const rect = anchor.getBoundingClientRect();
+            left = rect.left - size - gap;
+            top = rect.top + ((rect.height - size) / 2);
+          }
+
+          left = Math.max(8, Math.min(left, viewportWidth - size - 8));
+          top = Math.max(4, Math.min(top, 140));
+
+          return JSON.stringify({
+            left,
+            top,
+            kind,
+            isChat,
+            reason: __REASON__
+          });
+        })()'''.replaceFirst(
+          '__REASON__',
+          jsonEncode(reason),
+        ),
+      );
+
+      dynamic decoded = value;
+      if (decoded is String) {
+        try {
+          decoded = jsonDecode(decoded);
+          if (decoded is String) decoded = jsonDecode(decoded);
+        } catch (_) {
+          return;
+        }
+      }
+
+      if (decoded is! Map) return;
+      final map = Map<String, dynamic>.from(decoded);
+      final leftValue = map['left'];
+      final topValue = map['top'];
+      if (leftValue is! num || topValue is! num) return;
+
+      final nextLeft = leftValue.toDouble();
+      final nextTop = topValue.toDouble();
+      final changed =
+          !_androidTopBarGearPositionReady ||
+          (_androidTopBarGearLeft - nextLeft).abs() > 0.5 ||
+          (_androidTopBarGearTop - nextTop).abs() > 0.5;
+
+      _androidTopBarGearLeft = nextLeft;
+      _androidTopBarGearTop = nextTop;
+      _androidTopBarGearPositionReady = true;
+
+      if (changed && mounted) setState(() {});
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-topbar-position')) {
+        unawaited(
+          _appLog.log(
+            'AndroidUI',
+            'Could not measure SpicyChat top-bar QoL button position',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+
+  FloatingActionButtonLocation _androidControlsLocation(
+    String position,
+  ) {
+    switch (position) {
+      case AndroidUiService.topRight:
+        return FloatingActionButtonLocation.endTop;
+      case AndroidUiService.topLeft:
+        return FloatingActionButtonLocation.startTop;
+      case AndroidUiService.bottomLeft:
+        return FloatingActionButtonLocation.startFloat;
+      case AndroidUiService.bottomRight:
+      default:
+        return FloatingActionButtonLocation.endFloat;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final androidTabs = context.watch<AndroidTabsService>();
+    final androidUi = context.watch<AndroidUiService>();
+    final currentUri = Uri.tryParse(_lastKnownUrl);
+    final useSpicyChatTopBarGear =
+        androidUi.controlsInSpicyChatTopBar &&
+        currentUri != null &&
+        _isSpicyChat(currentUri);
+
+    return Scaffold(
+      body: SafeArea(
+        child: PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, _) async {
+            if (didPop) return;
+
+            final tabsService = Provider.of<AndroidTabsService>(
+              context,
+              listen: false,
+            );
+            if (tabsService.enabled) {
+              final active = tabsService.activeTab;
+              final previous = tabsService.previousTab;
+              if (active != null && !active.isHome && previous != null) {
+                await _switchToAndroidTab(previous);
+                return;
+              }
+            }
+
+            if (_webController != null) {
+              final canGoBack = await _webController!.canGoBack();
+              if (canGoBack) {
+                await _handleAndroidSaveStayBack(_webController!);
+                return;
+              }
+            }
+            if (context.mounted) {
+              Navigator.of(context).pop();
+            }
+          },
+          child: Stack(
+            children: [
+              InAppWebView(
+                key: _webViewKey,
+                initialUrlRequest: URLRequest(url: _initialWebUri),
+                // DS_ANDROID_V065_EARLY_ACCOUNT_OBSERVER: the shared MAIN-world
+                // listener must precede SpicyChat's early XHR, not onLoadStop.
+                // On WebViews without document-start support the plugin uses
+                // its earliest available injection; it cannot guarantee order.
+                initialUserScripts: UnmodifiableListView<UserScript>([
+                  UserScript(
+                    source: widget.bundleService.earlyCardTokenMainScript,
+                    injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+                    forMainFrameOnly: true,
+                  ),
+                ]),
+                initialSettings: InAppWebViewSettings(
+                  javaScriptEnabled: true,
+                  javaScriptCanOpenWindowsAutomatically: true,
+                  supportMultipleWindows: true,
+                  useShouldOverrideUrlLoading: true,
+                  // Auto Voice / Auto TTS is started by JavaScript after an
+                  // incoming message, not by a direct tap on the audio player.
+                  // Android WebView otherwise treats that as autoplay and can
+                  // silently block playback even though voice generation works.
+                  mediaPlaybackRequiresUserGesture: false,
+                  domStorageEnabled: true,
+                  databaseEnabled: true,
+                  // Only allow HTTPS content — no mixed HTTP resources
+                  mixedContentMode: MixedContentMode.MIXED_CONTENT_NEVER_ALLOW,
+                  // Enable wide viewport for better mobile experience
+                  useWideViewPort: true,
+                  loadWithOverviewMode: true,
+                  // The wrapper should never expose whole-page horizontal
+                  // scrolling. Internal SpicyChat carousels keep their own
+                  // overflow/scroll containers.
+                  horizontalScrollBarEnabled: false,
+                  // Manual page zoom is Android-only and opt-in.
+                  supportZoom: androidUi.zoomEnabled,
+                  builtInZoomControls: androidUi.zoomEnabled,
+                  displayZoomControls: false,
+                  // Keep SpicyChat on its normal mobile-browser UI path.
+                  // A later build exposed the raw Android WebView UA and the
+                  // site's native navigation menu could disappear. QoL itself
+                  // still gets explicit Android-app capability markers below.
+                  userAgent:
+                      'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+                  // Allow file access
+                  allowFileAccess: true,
+                  allowContentAccess: true,
+                  // Cache
+                  cacheEnabled: true,
+                  cacheMode: CacheMode.LOAD_DEFAULT,
+                  // Third-party cookies (needed for auth)
+                  thirdPartyCookiesEnabled: true,
+                ),
+                onPermissionRequest: (controller, request) async {
+                  final origin = Uri.tryParse(request.origin.toString());
+                  if (origin == null || !_isSpicyChat(origin)) {
+                    return PermissionResponse(
+                      resources: request.resources,
+                      action: PermissionResponseAction.DENY,
+                    );
+                  }
+
+                  final wantsMicrophone = request.resources.contains(
+                    PermissionResourceType.MICROPHONE,
+                  );
+                  if (!wantsMicrophone) {
+                    return PermissionResponse(
+                      resources: request.resources,
+                      action: PermissionResponseAction.DENY,
+                    );
+                  }
+
+                  var granted = false;
+                  try {
+                    granted =
+                        await const MethodChannel(
+                          'uk.drache.spicychatqol/app_info',
+                        ).invokeMethod<bool>('requestMicrophonePermission') ??
+                        false;
+                  } catch (e, stackTrace) {
+                    if (_shouldPersistDiagnostic('microphone-permission-failed')) {
+                      unawaited(
+                        _appLog.log(
+                          'Permission',
+                          'Could not request Android microphone permission',
+                          level: 'WARN',
+                          error: e,
+                          stackTrace: stackTrace,
+                        ),
+                      );
+                    }
+                  }
+
+                  if (_shouldPersistDiagnostic(
+                    granted
+                        ? 'microphone-permission-granted'
+                        : 'microphone-permission-denied',
+                    cooldown: const Duration(minutes: 5),
+                  )) {
+                    unawaited(
+                      _appLog.log(
+                        'Permission',
+                        granted
+                            ? 'Microphone permission granted to SpicyChat WebView'
+                            : 'Microphone permission denied for SpicyChat WebView',
+                        level: granted ? 'INFO' : 'WARN',
+                      ),
+                    );
+                  }
+
+                  return PermissionResponse(
+                    resources: <PermissionResourceType>[
+                      PermissionResourceType.MICROPHONE,
+                    ],
+                    action: granted
+                        ? PermissionResponseAction.GRANT
+                        : PermissionResponseAction.DENY,
+                  );
+                },
+                onWebViewCreated: (controller) {
+                  _webController = controller;
+                  unawaited(_appLog.log('Navigation',
+                      'Native WebView created; nav=$_navigationSequence; '
+                      'lastCause=$_lastNavigationCause; resumed=$_appIsResumed; '
+                      'url=$_lastKnownUrl'));
+                  _lastInjectedDocumentToken = null;
+                  _injectionInProgressToken = null;
+                  _lastProgressPercent = -1;
+                  _registerJsHandlers(controller);
+                  unawaited(
+                    _appLog.log(
+                      'WebView',
+                      'Native WebView created for $_lastKnownUrl',
+                    ),
+                  );
+                },
+                onLoadStart: (controller, url) {
+                  _loadStartedAt = DateTime.now();
+                  _navigationSequence++;
+                  _lastNavigationCause = _recoveringWebView
+                      ? 'native-recovery' : _appIsResumed
+                          ? 'webview-or-site-navigation' : 'while-backgrounded';
+                  unawaited(_appLog.log('Navigation',
+                      'Load start #$_navigationSequence; cause=$_lastNavigationCause; '
+                      'url=${url ?? _lastKnownUrl}'));
+                  _rendererUnresponsiveSince = null;
+                  _lastProgressPercent = -1;
+                  _lastSpaRouteUrl = null;
+                  _lastSpaRouteAt = null;
+                  if (url != null) {
+                    final nextUrl = url.toString();
+                    final previousUrl = _lastKnownUrl;
+                    final previousScroll =
+                        _scrollByUrl[previousUrl] ?? _lastScrollY;
+                    _observeAndroidSaveStayNavigation(
+                      previousUrl,
+                      nextUrl,
+                    );
+                    _lastKnownUrl = nextUrl;
+
+                    if (!_switchingAndroidTab && previousUrl != nextUrl) {
+                      unawaited(
+                        _handleAndroidTabRouteChange(
+                          previousUrl: previousUrl,
+                          newUrl: nextUrl,
+                          previousScrollY: previousScroll,
+                        ),
+                      );
+                    }
+                  }
+                  _blankHealthFailures = 0;
+                  unawaited(
+                    _appLog.log(
+                      'Navigation',
+                      'Load started: ${url ?? _lastKnownUrl}',
+                    ),
+                  );
+                  if (mounted) {
+                    setState(() {
+                      _isLoading = true;
+                    });
+                  }
+                },
+                onLoadStop: (controller, url) async {
+                  unawaited(_appLog.log('Navigation',
+                      'Load stop #$_navigationSequence; cause=$_lastNavigationCause; '
+                      'url=${url ?? _lastKnownUrl}'));
+                  if (url != null) {
+                    _lastKnownUrl = url.toString();
+                    _initialWebUri = url;
+                  }
+                  _loadStartedAt = null;
+                  _lastLoadStopAt = DateTime.now();
+                  _blankHealthFailures = 0;
+                  if (mounted && (_isLoading || _progress < 1)) {
+                    setState(() {
+                      _isLoading = false;
+                      _progress = 1;
+                    });
+                  }
+
+                  // Android can fire onLoadStop several times for the same
+                  // document. _injectScripts now skips duplicate documents.
+                  try {
+                    await _injectScripts(controller);
+                  } catch (e, stackTrace) {
+                    unawaited(
+                      _appLog.log(
+                        'Injection',
+                        'QoL injection failed on ${url ?? _lastKnownUrl}',
+                        level: 'ERROR',
+                        error: e,
+                        stackTrace: stackTrace,
+                      ),
+                    );
+                  }
+
+                  _scheduleHealthCheck(
+                    'post-load',
+                    delay: const Duration(seconds: 5),
+                  );
+                  _scheduleVisualGuardForCurrentPage('post-load');
+                  _restorePendingAndroidTabScroll(controller);
+                  _scheduleActiveAndroidTabTitleRefresh();
+                  unawaited(_syncAndroidChatHeaderGear());
+                  _scheduleAndroidTopBarGearPosition(reason: 'navigation');
+                  unawaited(
+                    controller.evaluateJavascript(
+                      source:
+                          'window.__dsAndroidListingIdentitySchedule?.("load-stop");',
+                    ),
+                  );
+                },
+                onUpdateVisitedHistory: (controller, url, androidIsReload) {
+                  final route = url?.toString() ?? _lastKnownUrl;
+                  final previousRoute = _lastKnownUrl;
+                  final previousScroll =
+                      _scrollByUrl[previousRoute] ?? _lastScrollY;
+                  final now = DateTime.now();
+                  final duplicate = _lastSpaRouteUrl == route &&
+                      _lastSpaRouteAt != null &&
+                      now.difference(_lastSpaRouteAt!) <
+                          const Duration(milliseconds: 1200);
+
+                  _observeAndroidSaveStayNavigation(
+                    previousRoute,
+                    route,
+                  );
+                  _lastKnownUrl = route;
+                  _blankHealthFailures = 0;
+                  if (duplicate) return;
+
+                  _lastSpaRouteUrl = route;
+                  _lastSpaRouteAt = now;
+
+                  if (!_switchingAndroidTab && previousRoute != route) {
+                    unawaited(
+                      _handleAndroidTabRouteChange(
+                        previousUrl: previousRoute,
+                        newUrl: route,
+                        previousScrollY: previousScroll,
+                      ),
+                    );
+                  }
+
+                  _scheduleActiveAndroidTabTitleRefresh();
+                  unawaited(_syncAndroidChatHeaderGear());
+                  _scheduleAndroidTopBarGearPosition(reason: 'navigation');
+                  unawaited(
+                    controller.evaluateJavascript(
+                      source:
+                          'window.__dsAndroidListingIdentitySchedule?.("spa-route");',
+                    ),
+                  );
+
+                  if (mounted) {
+                    final ui = Provider.of<AndroidUiService>(
+                      context,
+                      listen: false,
+                    );
+                    if (ui.controlsInSpicyChatTopBar) {
+                      setState(() {});
+                    }
+                  }
+
+                  if (kDebugMode) {
+                    debugPrint(
+                      '[Navigation] SPA route: $route; reload=$androidIsReload',
+                    );
+                  }
+
+                  // SPA navigation keeps the same document/QoL runtime.
+                  _scheduleHealthCheck(
+                    'history-route',
+                    delay: const Duration(seconds: 6),
+                  );
+                  _scheduleVisualGuardForCurrentPage('history-route');
+                },
+                onScrollChanged: (controller, x, y) {
+                  final tabsService = Provider.of<AndroidTabsService>(
+                    context,
+                    listen: false,
+                  );
+                  if (!tabsService.enabled) return;
+
+                  _lastScrollY = y.toDouble();
+                  _scrollByUrl[_lastKnownUrl] = _lastScrollY;
+                },
+                onProgressChanged: (controller, progress) {
+                  // Chromium often emits the same progress value twice.
+                  if (progress == _lastProgressPercent) return;
+                  _lastProgressPercent = progress;
+
+                  final next = progress / 100;
+                  final meaningfulStep =
+                      (next - _progress).abs() >= 0.05 || progress >= 100;
+                  if (mounted && meaningfulStep) {
+                    setState(() {
+                      _progress = next;
+                    });
+                  }
+                },
+                onReceivedError: (controller, request, error) {
+                  final key =
+                      'resource:${request.url.host}:${error.type.toString()}';
+                  if (_shouldPersistDiagnostic(key)) {
+                    unawaited(
+                      _appLog.log(
+                        'WebViewError',
+                        'Resource error: ${request.url} | ${error.type} | ${error.description}',
+                        level: 'WARN',
+                      ),
+                    );
+                  }
+                },
+                onReceivedHttpError: (controller, request, errorResponse) {
+                  final key =
+                      'http:${request.url.host}:${request.url.path}:${errorResponse.statusCode}';
+                  if (_shouldPersistDiagnostic(key)) {
+                    unawaited(
+                      _appLog.log(
+                        'WebViewHttp',
+                        'HTTP error: ${request.url} | status=${errorResponse.statusCode}',
+                        level: 'WARN',
+                      ),
+                    );
+                  }
+                },
+                onRenderProcessUnresponsive: (controller, url) async {
+                  _rendererUnresponsiveSince ??= DateTime.now();
+                  if (_shouldPersistDiagnostic(
+                    'renderer-unresponsive',
+                    cooldown: const Duration(seconds: 45),
+                  )) {
+                    unawaited(
+                      _appLog.log(
+                        'Renderer',
+                        'Android WebView renderer became unresponsive; url=${url ?? _lastKnownUrl}',
+                        level: 'WARN',
+                      ),
+                    );
+                  }
+                  // Do not kill it automatically; SpicyChat/large JS tasks can
+                  // recover on their own and termination would lose page state.
+                  return null;
+                },
+                onRenderProcessResponsive: (controller, url) async {
+                  // DS_ANDROID_V072_RECOVERY_CAPTURE: native WebView can
+                  // issue responsive callbacks without a paired start. Such
+                  // events are not timed stalls and need no snapshot/log.
+                  final stallStart = _rendererUnresponsiveSince;
+                  _rendererUnresponsiveSince = null;
+                  if (stallStart == null) return null;
+                  final stallMs = DateTime.now()
+                      .difference(stallStart).inMilliseconds;
+                  unawaited(
+                    _appLog.log(
+                      'Renderer',
+                      'Android WebView renderer responsive again; '
+                      'stallMs=$stallMs; url=${url ?? _lastKnownUrl}',
+                    ),
+                  );
+                  // Post-stall JavaScript competes with chat input. Only
+                  // capture sustained, paired stalls while the app is visible.
+                  if (stallMs >= 2000 && _appIsResumed &&
+                      !_isLoading && _shouldPersistDiagnostic(
+                        'renderer-recovery-context',
+                        cooldown: const Duration(minutes: 2),
+                      )) {
+                    unawaited(_logRecoveredRendererSnapshot(controller));
+                  }
+                  return null;
+                },
+                onRenderProcessGone: (controller, detail) {
+                  _rendererUnresponsiveSince = null;
+                  unawaited(
+                    _appLog.log(
+                      'Renderer',
+                      'Android WebView renderer exited; didCrash=${detail.didCrash}, priority=${detail.rendererPriorityAtExit}',
+                      level: 'ERROR',
+                    ),
+                  );
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    _recoverWebView(
+                      reason: 'Android WebView renderer exited',
+                      useController: false,
+                    );
+                  });
+                },
+                // Extension helpers sometimes use target="_blank" or window.open()
+                // for bot/profile links. Android WebView treats those as a new
+                // window and can otherwise hand them to the system browser.
+                // Keep SpicyChat-owned destinations inside this same WebView.
+                onCreateWindow: (controller, createWindowAction) async {
+                  final url = createWindowAction.request.url;
+                  if (url == null || url.toString().isEmpty) {
+                    if (_shouldPersistDiagnostic('new-window:no-url')) {
+                      unawaited(
+                        _appLog.log(
+                          'Navigation',
+                          'Blocked empty Android WebView new-window request',
+                          level: 'WARN',
+                        ),
+                      );
+                    }
+                    return false;
+                  }
+
+                  if (_isSpicyChat(url)) {
+                    unawaited(
+                      _appLog.log(
+                        'Navigation',
+                        'Keeping SpicyChat new-window navigation in app: $url',
+                      ),
+                    );
+                    try {
+                      await controller.loadUrl(
+                        urlRequest: URLRequest(url: url),
+                      );
+                    } catch (e, stackTrace) {
+                      unawaited(
+                        _appLog.log(
+                          'Navigation',
+                          'Could not open SpicyChat new-window URL in app: $url',
+                          level: 'ERROR',
+                          error: e,
+                          stackTrace: stackTrace,
+                        ),
+                      );
+                    }
+                    // We intentionally reject creation of a second WebView:
+                    // the destination has already been loaded in the main one.
+                    return false;
+                  }
+
+                  // Authentication and genuinely external popups keep using the
+                  // platform/browser flow instead of spawning hidden WebViews.
+                  unawaited(
+                    _appLog.log(
+                      'Navigation',
+                      'Opening popup/new-window URL outside WebView: $url',
+                    ),
+                  );
+                  try {
+                    await launchUrl(
+                      url,
+                      mode: LaunchMode.externalApplication,
+                    );
+                  } catch (e, stackTrace) {
+                    unawaited(
+                      _appLog.log(
+                        'Navigation',
+                        'Could not launch popup URL externally: $url',
+                        level: 'WARN',
+                        error: e,
+                        stackTrace: stackTrace,
+                      ),
+                    );
+                  }
+                  return false;
+                },
+
+                // Handle navigation — only allow SpicyChat and Auth domains in WebView
+                shouldOverrideUrlLoading:
+                    (controller, navigationAction) async {
+                  final url = navigationAction.request.url;
+                  if (url != null) {
+                    if (_isSpicyChat(url) || _isAuthDomain(url)) {
+                      if (kDebugMode) {
+                        debugPrint('[Navigation] Allow navigation: $url');
+                      }
+                      return NavigationActionPolicy.ALLOW;
+                    }
+                    // Open external links (Google login, etc.) in system browser
+                    unawaited(
+                      _appLog.log(
+                        'Navigation',
+                        'Opening external URL outside WebView: $url',
+                      ),
+                    );
+                    try {
+                      await launchUrl(
+                        url,
+                        mode: LaunchMode.externalApplication,
+                      );
+                    } catch (e) {
+                      debugPrint('[WebView] Could not launch URL: $url — $e');
+                    }
+                    return NavigationActionPolicy.CANCEL;
+                  }
+                  return NavigationActionPolicy.ALLOW;
+                },
+                onConsoleMessage: (controller, consoleMessage) {
+                  final message = consoleMessage.message;
+                  final level = consoleMessage.messageLevel.toString();
+                  if (kDebugMode) {
+                    debugPrint('[WebView Console] $level: $message');
+                  }
+                  final lower = level.toLowerCase();
+                  final noisySiteConsole =
+                      message.contains(
+                        'was preloaded using link preload but not used',
+                      ) ||
+                      message.contains(
+                        'cross-world service worker resource mismatch',
+                      ) ||
+                      message.contains(
+                        'logrocket-react does not work with this version of React',
+                      );
+                  if (noisySiteConsole) return;
+
+                  if (lower.contains('error') ||
+                      lower.contains('warning') ||
+                      message.contains('DragonScript') ||
+                      message.contains('[DS')) {
+                    final normalized = message.length > 180
+                        ? message.substring(0, 180)
+                        : message;
+                    final key = 'console:$level:$normalized';
+                    if (_shouldPersistDiagnostic(key)) {
+                      unawaited(
+                        _appLog.log(
+                          'Console',
+                          '$level: $message',
+                          level: lower.contains('error') ? 'ERROR' : 'WARN',
+                        ),
+                      );
+                    }
+                  }
+                },
+              ),
+
+              // Native Android top-bar QoL button. Unlike the old WebView DOM
+              // overlay this never re-anchors to Search/card/chat controls.
+              if (useSpicyChatTopBarGear)
+                Positioned(
+                  top: _androidTopBarGearTop,
+                  left: _androidTopBarGearPositionReady
+                      ? _androidTopBarGearLeft
+                      : null,
+                  right: _androidTopBarGearPositionReady ? null : 52,
+                  child: FloatingActionButton(
+                    heroTag: 'android-qol-topbar',
+                    mini: true,
+                    backgroundColor: Colors.deepPurple.withValues(alpha: 0.96),
+                    onPressed: () {
+                      unawaited(
+                        _showQuickMenu(
+                          requestedAt: DateTime.now(),
+                          source: 'native-topbar',
+                        ),
+                      );
+                    },
+                    child: const Icon(
+                      Icons.settings,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                  ),
+                ),
+
+              // Loading progress bar
+              if (_isLoading)
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: LinearProgressIndicator(
+                    value: _progress > 0 ? _progress : null,
+                    backgroundColor: Colors.transparent,
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      Colors.deepPurpleAccent,
+                    ),
+                    minHeight: 3,
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+
+      // Floating Android controls. Their location is wrapper-only and can
+      // be customized from Android Settings. Bottom-right remains the default.
+      floatingActionButtonLocation:
+          _androidControlsLocation(
+            useSpicyChatTopBarGear
+                ? AndroidUiService.bottomRight
+                : androidUi.controlsPosition,
+          ),
+      floatingActionButton:
+          (useSpicyChatTopBarGear && !androidTabs.enabled)
+              ? null
+              : Padding(
+        padding: androidUi.controlsAtTop
+            ? const EdgeInsets.only(top: 58)
+            : const EdgeInsets.only(bottom: 100),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (androidTabs.enabled) ...[
+              FloatingActionButton(
+                heroTag: 'android-chat-tabs',
+                mini: true,
+                backgroundColor: Colors.deepPurple.withValues(alpha: 0.9),
+                onPressed: _showAndroidTabs,
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    const Icon(Icons.tab, color: Colors.white, size: 20),
+                    Positioned(
+                      right: -9,
+                      top: -9,
+                      child: Container(
+                        constraints: const BoxConstraints(minWidth: 17),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 1,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black87,
+                          borderRadius: BorderRadius.circular(9),
+                        ),
+                        child: Text(
+                          '${androidTabs.chatTabCount}',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+            if (!useSpicyChatTopBarGear)
+              FloatingActionButton(
+                heroTag: 'android-qol-menu',
+                mini: true,
+                backgroundColor: Colors.deepPurple.withValues(alpha: 0.9),
+                onPressed: () {
+                  unawaited(
+                    _showQuickMenu(
+                      requestedAt: DateTime.now(),
+                      source: 'floating-fab',
+                    ),
+                  );
+                },
+                child: const Icon(Icons.settings, color: Colors.white, size: 20),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<String?> _readAndroidTabTitle() async {
+    final controller = _webController;
+    if (controller == null) return null;
+
+    try {
+      final value = await controller.evaluateJavascript(
+        source: r'''(() => {
+          const title = String(document.title || '').trim();
+          if (!title) return '';
+          return title
+            .replace(/\s*[|–—-]\s*SpicyChat.*$/i, '')
+            .replace(/^SpicyChat\s*[|–—-]\s*/i, '')
+            .trim();
+        })()''',
+      );
+
+      final title = value?.toString().trim() ?? '';
+      if (title.isEmpty || title.toLowerCase() == 'spicychat') {
+        return null;
+      }
+      return title.length > 80 ? title.substring(0, 80) : title;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _saveActiveAndroidTabState() async {
+    if (!mounted) return;
+
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (!tabsService.enabled) return;
+
+    final title = await _readAndroidTabTitle();
+    await tabsService.updateActiveState(
+      url: _lastKnownUrl,
+      scrollY: _scrollByUrl[_lastKnownUrl] ?? _lastScrollY,
+      title: title,
+    );
+  }
+
+  void _scheduleActiveAndroidTabTitleRefresh() {
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (!tabsService.enabled) return;
+
+    Future<void>.delayed(const Duration(milliseconds: 900), () async {
+      if (!mounted || !tabsService.enabled) return;
+      final title = await _readAndroidTabTitle();
+      if (title == null) return;
+      await tabsService.updateActiveState(
+        url: _lastKnownUrl,
+        scrollY: _scrollByUrl[_lastKnownUrl] ?? _lastScrollY,
+        title: title,
+        notify: true,
+      );
+    });
+  }
+
+  Future<void> _handleAndroidTabRouteChange({
+    required String previousUrl,
+    required String newUrl,
+    required double previousScrollY,
+  }) async {
+    if (!mounted) return;
+
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (!tabsService.enabled || _switchingAndroidTab) return;
+
+    final result = tabsService.handleRouteChange(
+      previousUrl: previousUrl,
+      newUrl: newUrl,
+      previousScrollY: previousScrollY,
+    );
+    if (result == null) return;
+
+    if (result.activeTabChanged && !result.created && result.tab.scrollY > 0) {
+      final targetId = result.tab.id;
+      final restoreY = result.tab.scrollY;
+      Future<void>.delayed(const Duration(milliseconds: 850), () async {
+        if (!mounted ||
+            tabsService.activeTabId != targetId ||
+            _switchingAndroidTab) {
+          return;
+        }
+        try {
+          await _webController?.evaluateJavascript(
+            source: 'window.scrollTo(0, ${restoreY.round()});',
+          );
+        } catch (_) {}
+      });
+    }
+  }
+
+  void _restorePendingAndroidTabScroll(
+    InAppWebViewController controller,
+  ) {
+    final tabId = _pendingTabSwitchId;
+    final restoreY = _pendingTabRestoreScrollY;
+    if (tabId == null) return;
+
+    _pendingTabSwitchId = null;
+    _pendingTabRestoreScrollY = null;
+
+    Future<void>.delayed(const Duration(milliseconds: 700), () async {
+      if (!mounted) return;
+
+      final tabsService = Provider.of<AndroidTabsService>(
+        context,
+        listen: false,
+      );
+      if (!tabsService.enabled || tabsService.activeTabId != tabId) {
+        _switchingAndroidTab = false;
+        return;
+      }
+
+      if (restoreY != null && restoreY > 0) {
+        try {
+          await controller.evaluateJavascript(
+            source: 'window.scrollTo(0, ${restoreY.round()});',
+          );
+        } catch (_) {}
+      }
+
+      _lastScrollY = restoreY ?? 0;
+      _scrollByUrl[_lastKnownUrl] = _lastScrollY;
+      _switchingAndroidTab = false;
+      _scheduleActiveAndroidTabTitleRefresh();
+    });
+  }
+
+  Future<void> _switchToAndroidTab(
+    AndroidChatTab tab, {
+    bool alreadyActivated = false,
+  }) async {
+    if (!mounted) return;
+
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (!tabsService.enabled) return;
+
+    final controller = _webController;
+    if (controller == null) return;
+
+    if (!alreadyActivated &&
+        tabsService.activeTabId == tab.id &&
+        AndroidTabsService.normalizedRoute(_lastKnownUrl) ==
+            AndroidTabsService.normalizedRoute(tab.url)) {
+      return;
+    }
+
+    if (!alreadyActivated) {
+      await _saveActiveAndroidTabState();
+    }
+
+    final target = alreadyActivated
+        ? tabsService.tabById(tab.id)
+        : tabsService.activateTab(tab.id);
+    if (target == null) return;
+
+    _switchingAndroidTab = true;
+    _pendingTabSwitchId = target.id;
+    _pendingTabRestoreScrollY = target.scrollY;
+    _lastKnownUrl = target.url;
+    _initialWebUri = WebUri(target.url);
+    _lastScrollY = 0;
+
+    try {
+      await controller.loadUrl(
+        urlRequest: URLRequest(url: WebUri(target.url)),
+      );
+    } catch (e, stackTrace) {
+      _switchingAndroidTab = false;
+      _pendingTabSwitchId = null;
+      _pendingTabRestoreScrollY = null;
+      unawaited(
+        _appLog.log(
+          'AndroidTabs',
+          'Could not switch to ${target.url}',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  Future<void> _adoptCurrentPageIntoAndroidTabs() async {
+    if (!mounted) return;
+
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (!tabsService.enabled) return;
+
+    final title = await _readAndroidTabTitle();
+    tabsService.adoptCurrentPage(
+      url: _lastKnownUrl,
+      scrollY: _scrollByUrl[_lastKnownUrl] ?? _lastScrollY,
+      title: title,
+    );
+  }
+
+  Future<void> _applyAndroidZoomPreference() async {
+    final controller = _webController;
+    if (controller == null || !mounted) return;
+
+    final androidUi = Provider.of<AndroidUiService>(
+      context,
+      listen: false,
+    );
+
+    try {
+      await controller.setSettings(
+        settings: InAppWebViewSettings(
+          supportZoom: androidUi.zoomEnabled,
+          builtInZoomControls: androidUi.zoomEnabled,
+          displayZoomControls: false,
+        ),
+      );
+
+      if (_shouldPersistDiagnostic('android-zoom-setting')) {
+        unawaited(
+          _appLog.log(
+            'AndroidUI',
+            androidUi.zoomEnabled
+                ? 'Manual WebView zoom enabled'
+                : 'Manual WebView zoom disabled',
+          ),
+        );
+      }
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-zoom-setting-failed')) {
+        unawaited(
+          _appLog.log(
+            'AndroidUI',
+            'Could not apply Android zoom preference',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+
+  void _openAndroidSettingsPage() {
+    if (!mounted) return;
+
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    _tabsEnabledAtSettingsOpen = tabsService.enabled;
+
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute(
+            builder: (_) => const AndroidSettingsScreen(),
+          ),
+        )
+        .whenComplete(() async {
+          if (!mounted) return;
+
+          final current = Provider.of<AndroidTabsService>(
+            context,
+            listen: false,
+          );
+
+          if (!_tabsEnabledAtSettingsOpen && current.enabled) {
+            await _adoptCurrentPageIntoAndroidTabs();
+          }
+
+          if (_tabsEnabledAtSettingsOpen && !current.enabled) {
+            _pendingTabSwitchId = null;
+            _pendingTabRestoreScrollY = null;
+            _switchingAndroidTab = false;
+          }
+
+          await _applyAndroidZoomPreference();
+          await _syncAndroidChatHeaderGear();
+    _scheduleAndroidTopBarGearPosition(reason: 'settings');
+          if (mounted) setState(() {});
+        });
+  }
+
+  void _showAndroidTabs() {
+    final tabsService = Provider.of<AndroidTabsService>(
+      context,
+      listen: false,
+    );
+    if (!tabsService.enabled) return;
+
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A2E),
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return Consumer<AndroidTabsService>(
+          builder: (context, tabs, _) {
+            final entries = tabs.tabs;
+            return SafeArea(
+              top: false,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.78,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 0, 18, 8),
+                      child: Row(
+                        children: [
+                          const Expanded(
+                            child: Text(
+                              'Android Chat Tabs',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            '${tabs.chatTabCount}/${tabs.maxChatTabs}',
+                            style: const TextStyle(color: Colors.white54),
+                          ),
+                        ],
+                      ),
+                    ),
+                    ListTile(
+                      leading: const Icon(
+                        Icons.add_circle_outline,
+                        color: Colors.deepPurpleAccent,
+                      ),
+                      title: const Text(
+                        'Browse for another chat',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      subtitle: const Text(
+                        'Returns to Home. Opening a chat creates or activates '
+                        'its Android tab.',
+                      ),
+                      onTap: () {
+                        final home = tabs.tabById(AndroidTabsService.homeId);
+                        Navigator.pop(sheetContext);
+                        if (home != null) {
+                          _switchToAndroidTab(home);
+                        }
+                      },
+                    ),
+                    const Divider(height: 1),
+                    Flexible(
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: entries.length,
+                        itemBuilder: (context, index) {
+                          final tab = entries[index];
+                          final active = tab.id == tabs.activeTabId;
+                          final uri = Uri.tryParse(tab.url);
+                          final subtitle = tab.isHome
+                              ? ((uri?.path.isNotEmpty ?? false)
+                                  ? uri!.path
+                                  : '/')
+                              : (uri?.path ?? tab.url);
+
+                          return ListTile(
+                            selected: active,
+                            leading: Icon(
+                              tab.isHome
+                                  ? Icons.home_outlined
+                                  : Icons.chat_bubble_outline,
+                              color: active
+                                  ? Colors.deepPurpleAccent
+                                  : Colors.white70,
+                            ),
+                            title: Text(
+                              tab.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight:
+                                    active ? FontWeight.w700 : FontWeight.w400,
+                              ),
+                            ),
+                            subtitle: Text(
+                              subtitle,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            trailing: tab.isHome
+                                ? (active
+                                    ? const Icon(
+                                        Icons.check,
+                                        color: Colors.deepPurpleAccent,
+                                      )
+                                    : null)
+                                : IconButton(
+                                    tooltip: 'Close tab',
+                                    icon: const Icon(Icons.close),
+                                    onPressed: () {
+                                      final wasActive =
+                                          tabs.activeTabId == tab.id;
+                                      final next = tabs.closeTab(tab.id);
+
+                                      if (wasActive && next != null) {
+                                        Navigator.pop(sheetContext);
+                                        _switchToAndroidTab(
+                                          next,
+                                          alreadyActivated: true,
+                                        );
+                                      }
+                                    },
+                                  ),
+                            onTap: () {
+                              Navigator.pop(sheetContext);
+                              _switchToAndroidTab(tab);
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    ListTile(
+                      leading: const Icon(Icons.filter_1_outlined),
+                      title: const Text('Close other chat tabs'),
+                      subtitle: const Text('Home is always kept'),
+                      onTap: () {
+                        tabs.closeOtherChatTabs(tabs.activeTabId);
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.settings_outlined),
+                      title: const Text('Android tab settings'),
+                      onTap: () {
+                        Navigator.pop(sheetContext);
+                        _openAndroidSettingsPage();
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _openAndroidCommandPalette() async {
+    final controller = _webController;
+    if (controller == null || !mounted) return;
+
+    try {
+      final rawResult = await controller.evaluateJavascript(
+        source: r'''(async () => {
+          const visiblePalette = () => !!document.querySelector(
+            '#ds-command-palette:not([hidden]), ' +
+            '.ds-command-palette:not([hidden]), ' +
+            '[data-ds-command-palette]:not([hidden]), ' +
+            '[role=\"dialog\"][data-ds-palette-open=\"1\"]'
+          );
+
+          if (visiblePalette()) {
+            return JSON.stringify({ ok: true, via: \"already-open\" });
+          }
+
+          const DS = window.DragonScriptQoL;
+          const directAttempts = [
+            [\"DS.openCommandPalette\", () => DS?.openCommandPalette?.()],
+            [\"DS.showCommandPalette\", () => DS?.showCommandPalette?.()],
+            [\"DS.commandPalette.open\", () => DS?.commandPalette?.open?.()],
+            [\"DS.commandPalette.show\", () => DS?.commandPalette?.show?.()]
+          ];
+
+          for (const [name, fn] of directAttempts) {
+            try {
+              if (typeof fn !== \"function\") continue;
+              const result = fn();
+              if (result && typeof result.then === \"function\") await result;
+              await new Promise(resolve => setTimeout(resolve, 30));
+              if (visiblePalette()) return JSON.stringify({ ok: true, via: name });
+            } catch {}
+          }
+
+          const shortcuts = [
+            { key: \"k\", code: \"KeyK\", ctrlKey: true, metaKey: false, shiftKey: false, altKey: false },
+            { key: \"k\", code: \"KeyK\", ctrlKey: true, metaKey: false, shiftKey: true, altKey: false },
+            { key: \"k\", code: \"KeyK\", ctrlKey: false, metaKey: false, shiftKey: false, altKey: true },
+            { key: \"k\", code: \"KeyK\", ctrlKey: false, metaKey: true, shiftKey: false, altKey: false },
+            { key: \"k\", code: \"KeyK\", ctrlKey: false, metaKey: true, shiftKey: true, altKey: false }
+          ];
+
+          for (const init of shortcuts) {
+            try {
+              document.dispatchEvent(new KeyboardEvent(\"keydown\", { ...init, bubbles: true, cancelable: true }));
+              window.dispatchEvent(new KeyboardEvent(\"keydown\", { ...init, bubbles: true, cancelable: true }));
+              await new Promise(resolve => setTimeout(resolve, 45));
+              if (visiblePalette()) return JSON.stringify({ ok: true, via: \"shortcut\" });
+            } catch {}
+          }
+
+          try {
+            window.dispatchEvent(new CustomEvent(\"spicychat-qol:open-command-palette\"));
+            document.dispatchEvent(new CustomEvent(\"spicychat-qol:open-command-palette\"));
+            await new Promise(resolve => setTimeout(resolve, 50));
+            if (visiblePalette()) return JSON.stringify({ ok: true, via: \"custom-event\" });
+          } catch {}
+
+          return JSON.stringify({ ok: false });
+        })()''',
+      );
+
+      var opened = false;
+      if (rawResult is String && rawResult.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(rawResult);
+          opened = decoded is Map && decoded['ok'] == true;
+        } catch (_) {}
+      } else if (rawResult is Map) {
+        opened = rawResult['ok'] == true;
+      }
+
+      if (!opened && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Command Palette could not be opened. Make sure it is enabled in QoL Settings.',
+            ),
+          ),
+        );
+      }
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'AndroidOptions',
+          'Could not open QoL Command Palette from Android',
+          level: 'WARN',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>?> _queryAndroidMainTab() async {
+    final controller = _webController;
+    if (controller == null) return null;
+
+    try {
+      // _lastKnownUrl is updated by both full navigation and SPA route
+      // changes. Prefer it here so opening Diagnostics/Performance does not
+      // wait for WebView.getUrl() while a large chat renderer is busy.
+      var currentUrl = _lastKnownUrl;
+      var parsed = Uri.tryParse(currentUrl);
+
+      if (parsed == null || !_isSpicyChat(parsed)) {
+        final current = await controller
+            .getUrl()
+            .timeout(const Duration(milliseconds: 650));
+        if (current == null || !_isSpicyChat(current)) return null;
+
+        currentUrl = current.toString();
+        _lastKnownUrl = currentUrl;
+      }
+
+      // The title is cosmetic for the synthetic one-tab bridge. Do not call
+      // WebView.getTitle() here: that can stall behind long-chat main-thread
+      // work and used to make Android Options report the live page as unknown.
+      var title = 'SpicyChat';
+      try {
+        if (!mounted) return null;
+        final tabsService = Provider.of<AndroidTabsService>(
+          context,
+          listen: false,
+        );
+        final tabTitle = tabsService.activeTab?.title.trim() ?? '';
+        if (tabTitle.isNotEmpty) title = tabTitle;
+      } catch (_) {}
+
+      return <String, dynamic>{
+        'id': 1,
+        'index': 0,
+        'windowId': 1,
+        'active': true,
+        'highlighted': true,
+        'pinned': false,
+        'audible': false,
+        'discarded': false,
+        'autoDiscardable': true,
+        'status': 'complete',
+        'url': currentUrl,
+        'title': title,
+        'lastAccessed': DateTime.now().millisecondsSinceEpoch,
+        '__spicyChatQolAndroidSynthetic': true,
+      };
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-options-main-tab-query')) {
+        unawaited(
+          _appLog.log(
+            'AndroidDiagnostics',
+            'Could not describe the live SpicyChat WebView for Options',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+      return null;
+    }
+  }
+
+  Future<dynamic> _sendAndroidMainTabMessage(dynamic message) async {
+    final controller = _webController;
+    if (controller == null) return null;
+
+    try {
+      if (!await _isCurrentUrlTrusted(controller)) return null;
+
+      final encodedMessage = jsonEncode(message);
+      final rawResultFuture = controller.evaluateJavascript(
+        source: '''(async () => {
+          const dispatch = window.__dsAndroidDispatchRuntimeMessage;
+          if (typeof dispatch !== "function") {
+            return JSON.stringify({
+              ok: false,
+              error: "runtime-dispatch-unavailable"
+            });
+          }
+
+          const sender = {
+            id: "spicychat-qol-android",
+            url: location.href,
+            tab: {
+              id: 1,
+              index: 0,
+              windowId: 1,
+              active: true,
+              highlighted: true,
+              pinned: false,
+              discarded: false,
+              status: "complete",
+              url: location.href,
+              title: document.title || "SpicyChat",
+              __spicyChatQolAndroidSynthetic: true
+            }
+          };
+
+          try {
+            const response = await dispatch($encodedMessage, sender);
+            return JSON.stringify({
+              ok: true,
+              response: response === undefined ? null : response
+            });
+          } catch (error) {
+            return JSON.stringify({
+              ok: false,
+              error: String(error?.message || error || "runtime-message-failed")
+            });
+          }
+        })()''',
+      );
+      // DS_ANDROID_V072_NATIVE_DIAGNOSTIC_GUARD: never wait indefinitely
+      // for an already busy renderer. A timeout ends this native request,
+      // but does not reload the page or cancel an in-flight JS operation.
+      final type = message is Map ? (message['type'] ?? '').toString() : '';
+      final rawResult = type == 'DS_GET_PAGE_DIAGNOSTICS_LIGHT'
+          ? await rawResultFuture.timeout(const Duration(milliseconds: 1500))
+          : type == 'DS_GET_PAGE_DIAGNOSTICS'
+              ? await rawResultFuture.timeout(const Duration(milliseconds: 4500))
+              : await rawResultFuture;
+
+      // Android WebView can return either JSON text or a JSON-quoted
+      // string containing JSON. Decode no more than twice and never treat a
+      // failed dispatch as a successful full QoL runtime response.
+      dynamic decoded = rawResult;
+      for (var attempt = 0; attempt < 2 && decoded is String; attempt++) {
+        try {
+          decoded = jsonDecode(decoded);
+        } catch (_) {
+          break;
+        }
+      }
+
+      if (decoded is Map && decoded['ok'] == true &&
+          decoded['response'] != null) {
+        if (message is Map && message['type'] == 'DS_GET_PAGE_DIAGNOSTICS') {
+          unawaited(_appLog.log('AndroidDiagnostics',
+              'On-demand QoL runtime diagnostics answered through active WebView'));
+        }
+        return decoded['response'];
+      }
+      // A failed full snapshot is not a reason to evaluate JavaScript again.
+      // Options constructs an explicitly labeled partial result instead.
+      return null;
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-options-main-runtime-message')) {
+        unawaited(
+          _appLog.log(
+            'AndroidDiagnostics',
+            'Could not relay Options runtime message to live SpicyChat WebView',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+      return null;
+    }
+  }
+
+  bool _requestOpenOptionsPage() {
+    if (!mounted || _optionsPageOpen) return false;
+    if (!_AndroidOptionsRouteGate.tryAcquire()) {
+      if (_shouldPersistDiagnostic('android-options-duplicate-open')) {
+        unawaited(
+          _appLog.log(
+            'AndroidOptions',
+            'Ignored duplicate Android Options open request',
+          ),
+        );
+      }
+      return false;
+    }
+
+    // Lock synchronously before Navigator can push anything. Repeated taps
+    // during a UI/WebView stall therefore collapse into one Options route.
+    _optionsPageOpen = true;
+    unawaited(_openOptionsPageLocked());
+    return true;
+  }
+
+  Future<void> _openOptionsPageLocked() async {
+    String? requestedSpicyChatUrl;
+
+    try {
+      requestedSpicyChatUrl = await Navigator.of(context).push<String>(
+        MaterialPageRoute<String>(
+          builder: (_) => OptionsScreen(
+            onSettingsChanged: _pushSettingsToWebView,
+            extensionVersion: widget.bundleService.extensionVersion,
+            bundleService: widget.bundleService,
+            onQueryMainTab: _queryAndroidMainTab,
+            onSendMainTabMessage: _sendAndroidMainTabMessage,
+          ),
+        ),
+      );
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'AndroidOptions',
+          'Android Options route failed to open',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    } finally {
+      _optionsPageOpen = false;
+      _AndroidOptionsRouteGate.release();
+      if (mounted) {
+        try {
+          await _pushSettingsToWebView();
+        } catch (e, stackTrace) {
+          unawaited(
+            _appLog.log(
+              'AndroidOptions',
+              'Could not refresh settings after Android Options closed',
+              level: 'WARN',
+              error: e,
+              stackTrace: stackTrace,
+            ),
+          );
+        }
+      }
+    }
+
+    if (!mounted ||
+        requestedSpicyChatUrl == null ||
+        requestedSpicyChatUrl.trim().isEmpty) {
+      return;
+    }
+
+    if (requestedSpicyChatUrl == 'ds-action:command-palette') {
+      await _openAndroidCommandPalette();
+      return;
+    }
+
+    final target = WebUri(requestedSpicyChatUrl);
+    if (!_isSpicyChat(target)) return;
+
+    final controller = _webController;
+    if (controller == null) return;
+
+    unawaited(
+      _appLog.log(
+        'Navigation',
+        'Opening SpicyChat URL from Android Options inside app: $target',
+      ),
+    );
+
+    try {
+      await controller.loadUrl(
+        urlRequest: URLRequest(url: target),
+      );
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'Navigation',
+          'Could not open SpicyChat URL returned by Android Options: $target',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleAndroidFocusMode() async {
+    final controller = _webController;
+    if (!mounted || controller == null) return;
+
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r"""(() => {
+  const DS = window.DragonScriptQoL;
+  if (!DS?.toggleFocusMode || !DS?.isFocusModeActive) {
+    return JSON.stringify({ ok: false, error: "focus-mode-unavailable" });
+  }
+
+  const settings = DS.state?.settings || {};
+  const onChat = !!DS.isSingleChatPage?.();
+  const enabled = !!settings.enabled && !!settings.enableFocusMode && onChat;
+
+  DS.toggleFocusMode();
+  window.__dsAndroidFocusSafety?.refresh?.();
+
+  return JSON.stringify({
+    ok: true,
+    enabled,
+    onChat,
+    active: !!DS.isFocusModeActive?.()
+  });
+})()""",
+      );
+
+      dynamic decoded = raw;
+      if (raw is String && raw.isNotEmpty) {
+        try {
+          decoded = jsonDecode(raw);
+        } catch (_) {}
+      }
+
+      if (!mounted) return;
+
+      if (decoded is! Map || decoded['ok'] != true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Focus Mode is not available in this QoL build.'),
+          ),
+        );
+        return;
+      }
+
+      if (decoded['enabled'] != true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Enable Focus / Immersive Mode in QoL Options first.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final active = decoded['active'] == true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(active ? 'Focus Mode enabled' : 'Focus Mode disabled'),
+          duration: const Duration(seconds: 1),
+        ),
+      );
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'AndroidFocusMode',
+          'Could not toggle Focus / Immersive Mode from Android',
+          level: 'WARN',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  void _registerJsHandlers(InAppWebViewController controller) {
+    final settingsService = Provider.of<SettingsService>(
+      context,
+      listen: false,
+    );
+
+    // Handle chrome.storage.local.get()
+    controller.addJavaScriptHandler(
+      handlerName: 'storageGet',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return '{}';
+        try {
+          final keys = args.isNotEmpty ? jsonDecode(args[0].toString()) : null;
+          final result = await settingsService.storageGet(keys);
+          return jsonEncode(result);
+        } catch (e) {
+          debugPrint('[Bridge] storageGet error: $e');
+          return '{}';
+        }
+      },
+    );
+
+    // DS_ANDROID_V061_KEYLIST: getKeys() returns names only, not stored values.
+    controller.addJavaScriptHandler(
+      handlerName: 'storageGetKeys',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return <String>[];
+        try {
+          return await settingsService.storageGetKeys();
+        } catch (e) {
+          debugPrint('[Bridge] storageGetKeys error: $e');
+          return <String>[];
+        }
+      },
+    );
+
+    // Handle chrome.storage.local.set()
+    controller.addJavaScriptHandler(
+      handlerName: 'storageSet',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return null;
+        try {
+          final obj = jsonDecode(args[0].toString()) as Map<String, dynamic>;
+          await settingsService.storageSet(obj);
+        } catch (e) {
+          debugPrint('[Bridge] storageSet error: $e');
+        }
+        return null;
+      },
+    );
+
+    // DS_ANDROID_STORAGE_FASTPATH_V060: one WebView/native call performs the
+    // storage write and returns a verified onChanged delta. The existing
+    // storageSet handler stays for Android Settings and older bridge callers.
+    controller.addJavaScriptHandler(
+      handlerName: 'storageSetWithChanges',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) {
+          return jsonEncode({'ok': false});
+        }
+        try {
+          final obj = jsonDecode(args[0].toString()) as Map<String, dynamic>;
+          final changes = await settingsService.storageSetWithChanges(obj);
+          return jsonEncode({'ok': true, 'changes': changes});
+        } catch (e) {
+          debugPrint('[Bridge] storageSetWithChanges error: $e');
+          return jsonEncode({'ok': false});
+        }
+      },
+    );
+
+    // Handle chrome.storage.local.remove()
+    controller.addJavaScriptHandler(
+      handlerName: 'storageRemove',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return null;
+        try {
+          final rawKeys = args.isNotEmpty ? args[0].toString() : '[]';
+          await settingsService.storageRemove(jsonDecode(rawKeys));
+        } catch (e) {
+          debugPrint('[Bridge] storageRemove error: $e');
+        }
+        return null;
+      },
+    );
+
+    // Handle chrome.storage.local.getBytesInUse()
+    controller.addJavaScriptHandler(
+      handlerName: 'storageGetBytesInUse',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return 0;
+        try {
+          final rawKeys = args.isNotEmpty ? args[0].toString() : 'null';
+          return await settingsService.storageGetBytesInUse(
+            jsonDecode(rawKeys),
+          );
+        } catch (e) {
+          debugPrint('[Bridge] storageGetBytesInUse error: $e');
+          return 0;
+        }
+      },
+    );
+
+    controller.addJavaScriptHandler(
+      handlerName: 'storageClear',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return null;
+        try {
+          await settingsService.storageClear();
+        } catch (e) {
+          debugPrint('[Bridge] storageClear error: $e');
+        }
+        return null;
+      },
+    );
+
+    // Handle chrome.runtime.sendMessage()
+    controller.addJavaScriptHandler(
+      handlerName: 'runtimeMessage',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return jsonEncode({'ok': false});
+        try {
+          final message = jsonDecode(args[0].toString());
+          // Android v0.2.49 HTTPS background image bridge: native HTTPS fetch
+          // with per-host user consent; other runtime messages are untouched.
+          final type = message is Map ? (message['type'] ?? '').toString() : '';
+          if (type == 'DS_BG_FETCH_IMAGE_URL' ||
+              type == 'DS_BG_REQUEST_IMAGE_PERMISSION') {
+            return jsonEncode(await _androidBgRuntimeMessage(message));
+          }
+          return jsonEncode(_handleRuntimeMessage(message));
+        } catch (e) {
+          debugPrint('[Bridge] runtimeMessage error: $e');
+          return jsonEncode({'ok': false});
+        }
+      },
+    );
+
+    // Android-only chat-header gear.
+    controller.addJavaScriptHandler(
+      handlerName: 'androidOpenQuickMenu',
+      callback: (args) async {
+        final bridgeReceivedAt = DateTime.now();
+        DateTime? tappedAt;
+        String reportedRoute = _normalizedSpicyChatPath(_lastKnownUrl);
+        String reportedKind = _isChatUrl(_lastKnownUrl) ? 'chat' : 'other';
+
+        if (args.isNotEmpty && args.first is Map) {
+          final payload = Map<String, dynamic>.from(args.first as Map);
+          final tappedAtRaw = payload['tappedAt'];
+          final tappedAtMs = tappedAtRaw is num
+              ? tappedAtRaw.toInt()
+              : int.tryParse(tappedAtRaw?.toString() ?? '');
+
+          if (tappedAtMs != null && tappedAtMs > 0) {
+            tappedAt = DateTime.fromMillisecondsSinceEpoch(tappedAtMs);
+          }
+
+          final route = (payload['route'] ?? '').toString().trim();
+          if (route.isNotEmpty) {
+            reportedRoute = route;
+          }
+
+          final kind = (payload['kind'] ?? '').toString().trim();
+          if (kind.isNotEmpty) {
+            reportedKind = kind;
+          }
+        }
+
+        if (!mounted || !await _isCurrentUrlTrusted(controller)) {
+          return false;
+        }
+
+        final tapToBridgeMs = tappedAt == null
+            ? null
+            : bridgeReceivedAt.millisecondsSinceEpoch -
+                tappedAt.millisecondsSinceEpoch;
+
+        unawaited(
+          _appLog.log(
+            'QuickMenuTiming',
+            'Native gear bridge received: '
+                'route=$reportedRoute kind=$reportedKind '
+                'tapToBridgeMs=${tapToBridgeMs ?? 'unknown'}',
+          ),
+        );
+
+        // Do not wait for another Flutter frame before starting the native
+        // route. The old post-frame hop was unnecessary and made a busy chat
+        // page feel even slower.
+        unawaited(
+          _showQuickMenu(
+            requestedAt: tappedAt ?? bridgeReceivedAt,
+            bridgeReceivedAt: bridgeReceivedAt,
+            source: 'header-gear',
+          ),
+        );
+        return true;
+      },
+    );
+
+    // Android-only Save & Stay history repair marker.
+    controller.addJavaScriptHandler(
+      handlerName: 'androidSaveStayStarted',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller) || !mounted) {
+          return false;
+        }
+        _armAndroidSaveStayBackRepair();
+        return true;
+      },
+    );
+
+    // Handle opening options/settings page
+    controller.addJavaScriptHandler(
+      handlerName: 'openOptions',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) return null;
+        _requestOpenOptionsPage();
+        return null;
+      },
+    );
+
+    // Handle chat export (file download)
+    controller.addJavaScriptHandler(
+      handlerName: 'exportChat',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) {
+          return {'ok': false, 'error': 'untrusted URL'};
+        }
+        try {
+          final data = jsonDecode(args[0].toString());
+          final text = (data['text'] ?? data['content'] ?? '').toString();
+          final filename = (data['filename'] ?? data['fileName'] ??
+              'spicychat-chat.txt').toString();
+          final supplied = (data['mimeType'] ?? '').toString().trim();
+          return await _exportChatText(
+            text, filename,
+            mimeType: supplied.isNotEmpty ? supplied : _nativeTextMime(filename),
+          );
+        } catch (e) {
+          debugPrint('[Bridge] exportChat error: $e');
+          return {'ok': false, 'error': e.toString()};
+        }
+      },
+    );
+
+    // Generic Android file saver for extension features that normally use
+    // browser-only <a download> / Blob downloads.
+    controller.addJavaScriptHandler(
+      handlerName: 'saveFile',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) {
+          return {'ok': false, 'error': 'untrusted URL'};
+        }
+        try {
+          final data = _decodeNativeFilePayload(args);
+          if (data == null) {
+            return {'ok': false, 'error': 'invalid payload'};
+          }
+
+          return await _saveNativeFile(
+            bytes: data.bytes,
+            filename: data.filename,
+            dialogTitle: 'Save File',
+            mimeType: 'application/octet-stream',
+          );
+        } catch (e) {
+          debugPrint('[Bridge] saveFile error: $e');
+          return {'ok': false, 'error': e.toString()};
+        }
+      },
+    );
+
+    // Native Android clipboard bridge. navigator.clipboard / execCommand can
+    // silently fail in WebView even when the long-press action itself worked.
+    controller.addJavaScriptHandler(
+      handlerName: 'copyToClipboard',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller)) {
+          return {'ok': false, 'error': 'untrusted URL'};
+        }
+
+        final text = args.isNotEmpty ? args.first.toString() : '';
+        if (text.isEmpty) {
+          return {'ok': false, 'error': 'empty text'};
+        }
+
+        try {
+          await Clipboard.setData(ClipboardData(text: text));
+          return {'ok': true};
+        } catch (e) {
+          debugPrint('[Bridge] native clipboard error: $e');
+          return {'ok': false, 'error': e.toString()};
+        }
+      },
+    );
+
+    // Android-only long-hold message menu. The WebView script sends only the
+    // available action labels; message text never crosses this handler.
+    controller.addJavaScriptHandler(
+      handlerName: 'androidMessageLongPress',
+      callback: (args) async {
+        if (!await _isCurrentUrlTrusted(controller) ||
+            !mounted ||
+            _messageLongPressMenuOpen) {
+          return null;
+        }
+
+        try {
+          final raw = args.isNotEmpty ? args[0].toString() : '{}';
+          final decoded = jsonDecode(raw);
+          if (decoded is! Map) return null;
+
+          const allowedActions = <String>{
+            'Copy',
+            'Edit',
+            'Report',
+            'Resend',
+            'Remove Image',
+            'Select text',
+          };
+
+          final requested = decoded['actions'];
+          if (requested is! List) return null;
+
+          final actions = <String>[];
+          for (final value in requested) {
+            final action = value.toString();
+            if (allowedActions.contains(action) && !actions.contains(action)) {
+              actions.add(action);
+            }
+          }
+          if (actions.isEmpty) return null;
+
+          _messageLongPressMenuOpen = true;
+          await HapticFeedback.mediumImpact();
+
+          if (!mounted) return null;
+          final selected = await showModalBottomSheet<String>(
+            context: context,
+            useRootNavigator: true,
+            useSafeArea: true,
+            showDragHandle: true,
+            builder: (sheetContext) {
+              IconData iconFor(String action) {
+                switch (action) {
+                  case 'Copy':
+                    return Icons.copy_outlined;
+                  case 'Edit':
+                    return Icons.edit_outlined;
+                  case 'Report':
+                    return Icons.flag_outlined;
+                  case 'Resend':
+                    return Icons.replay_outlined;
+                  case 'Remove Image':
+                    return Icons.image_not_supported_outlined;
+                  case 'Select text':
+                    return Icons.text_fields_outlined;
+                  default:
+                    return Icons.more_horiz;
+                }
+              }
+
+              return SafeArea(
+                top: false,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(20, 4, 20, 8),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Message actions',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                    for (final action in actions) ...[
+                      if (action == 'Select text')
+                        const Divider(height: 1),
+                      ListTile(
+                        leading: Icon(iconFor(action)),
+                        title: Text(action),
+                        onTap: () => Navigator.of(sheetContext).pop(action),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                  ],
+                ),
+              );
+            },
+          );
+
+          return selected;
+        } catch (e, stackTrace) {
+          unawaited(
+            _appLog.log(
+              'AndroidGesture',
+              'Message long-press menu failed',
+              level: 'ERROR',
+              error: e,
+              stackTrace: stackTrace,
+            ),
+          );
+          return null;
+        } finally {
+          _messageLongPressMenuOpen = false;
+        }
+      },
+    );
+  }
+
+  Map<String, dynamic> _handleRuntimeMessage(dynamic message) {
+    if (message is! Map) return {'ok': false};
+
+    final type = message['type'];
+
+    switch (type) {
+      case 'DS_OPEN_OPTIONS':
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _requestOpenOptionsPage();
+        });
+        return {'ok': true};
+
+      case 'DS_LOAD_ALL_CHATS_START':
+      case 'DS_LOAD_ALL_CHATS_STOP':
+      case 'DS_LOAD_ALL_CHATS_RESCHEDULE':
+      case 'DS_LOAD_ALL_CHATS_DONE':
+        // These are handled by the JS-side loop in WebView
+        return {'ok': true};
+
+      // DS_ANDROID_V057_BINARY_RESOURCE_FIX: desktop writer actions fail closed.
+      // Native Android has no extension service worker or hidden helper tabs.
+      // Never claim a protected Lorebook/Archive write succeeded when the
+      // authenticated desktop background writer did not actually run.
+      case 'DS_PRIVATE_ARCHIVE_SETUP_WRITE':
+      case 'DS_PRIVATE_LOREBOOK_ENTRY_CREATE':
+      case 'DS_BOT_EXPORT_HELPER':
+        return {
+          'ok': false,
+          'android': true,
+          'status': 'android-background-writer-unavailable',
+          'ambiguous': false,
+          'error': 'This desktop background/helper-tab action is not '
+              'implemented by the Android single-WebView bridge.',
+        };
+
+      case 'DS_LOREBOOK_EXPORT_HELPER':
+        // The desktop exporter opens the opposite Lorebook page in a
+        // background browser tab. Android intentionally owns one live WebView.
+        // Return a useful capability error instead of pretending a hidden tab
+        // exists or leaving the shared feature with "unknown message type".
+        return {
+          'ok': false,
+          'android': true,
+          'error': 'android-background-tabs-unavailable',
+          'message':
+              'Full Lorebook helper-tab export is not available in the '
+              'single-WebView Android app.',
+        };
+
+      case 'DS_CLOSE_CURRENT_TAB':
+        return {
+          'ok': false,
+          'android': true,
+          'error': 'android-single-webview',
+        };
+
+      default:
+        return {'ok': false, 'error': 'unknown message type'};
+    }
+  }
+
+  Future<void> _logRecoveredRendererSnapshot(
+    InAppWebViewController controller,
+  ) async {
+    // The WebView is responsive again; never evaluate JS on an unresponsive
+    // renderer. Give it a short recovery window and avoid large DOM traversals.
+    await Future<void>.delayed(const Duration(milliseconds: 450));
+    if (!mounted) return;
+    try {
+      final result = await controller.evaluateJavascript(
+        source: r'''(() => {
+          try {
+            const report = window.__dsAndroidChatPerformanceSnapshot?.();
+            if (typeof report === "string" && report.length) return report;
+            return JSON.stringify({
+              available: false,
+              reason: "QoL diagnostic hook not installed",
+              path: location.pathname,
+              mountedMessages: document.querySelectorAll("div[id^='message-']").length,
+              documentElements: document.getElementsByTagName("*").length,
+              pageHidden: document.hidden
+            });
+          } catch (_) {
+            return JSON.stringify({ available: false, reason: "snapshot failed" });
+          }
+        })()''',
+      );
+      if (result is! String || result.trim().isEmpty) return;
+      await _appLog.log(
+        'RendererContext',
+        'Post-freeze Android chat snapshot: $result',
+      );
+    } catch (_) {
+      // The renderer may have navigated or exited during recovery; do not
+      // turn this optional diagnostic into another failure or log storm.
+    }
+  }
+  Future<void> _installAndroidViewportWidthGuard(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+  const STYLE_ID = "ds-android-viewport-width-guard";
+
+  const ensureStyle = () => {
+    let style = document.getElementById(STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = STYLE_ID;
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    style.textContent = `
+      html, body {
+        width: 100% !important;
+        max-width: 100vw !important;
+        overflow-x: hidden !important;
+        overscroll-behavior-x: none !important;
+      }
+    `;
+  };
+
+  const clampOuterX = () => {
+    const root = document.scrollingElement || document.documentElement;
+    if (root && root.scrollLeft !== 0) root.scrollLeft = 0;
+    if (document.documentElement && document.documentElement.scrollLeft !== 0) {
+      document.documentElement.scrollLeft = 0;
+    }
+    if (document.body && document.body.scrollLeft !== 0) {
+      document.body.scrollLeft = 0;
+    }
+  };
+
+  ensureStyle();
+  clampOuterX();
+
+  if (!window.__dsAndroidViewportWidthGuardInstalled) {
+    window.__dsAndroidViewportWidthGuardInstalled = true;
+    window.addEventListener("scroll", clampOuterX, { passive: true });
+    window.addEventListener("resize", clampOuterX, { passive: true });
+    window.visualViewport?.addEventListener(
+      "resize",
+      clampOuterX,
+      { passive: true }
+    );
+  }
+})()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-viewport-width-guard')) {
+        unawaited(
+          _appLog.log(
+            'AndroidLayout',
+            'Could not install Android viewport width guard',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+  Future<void> _installAndroidListingIdentityHelper(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+  const STATE_KEY = "__dsAndroidListingIdentityState";
+  const LINK_SELECTOR = 'a[href*="/chat/"], a[href*="/chatbot/"]';
+
+  if (window[STATE_KEY]?.fullSweep) {
+    window[STATE_KEY].fullSweep("recheck");
+    return;
+  }
+
+  window.__dsAndroidListingIdentityInstalled = true;
+
+  const UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  const normalizeId = value => {
+    const text = String(value || "").trim();
+    return UUID_RE.test(text) ? text.toLowerCase() : "";
+  };
+
+  const idFromHref = href => {
+    try {
+      const url = new URL(href, location.href);
+      if (!/(^|\.)spicychat\.ai$/i.test(url.hostname)) return "";
+
+      const parts = url.pathname
+        .split("/")
+        .map(part => decodeURIComponent(part || "").trim())
+        .filter(Boolean);
+
+      if (parts[0] === "chatbot" && parts[1]) return normalizeId(parts[1]);
+      if (parts[0] === "chat" && parts[1]) return normalizeId(parts[1]);
+    } catch {}
+    return "";
+  };
+
+  const likelyCardRoot = anchor => {
+    const selectors = [
+      '[data-testid*="Chatbot"]',
+      '[data-testid*="chatbot"]',
+      '[data-chatbot-id]',
+      '[data-bot-id]',
+      'article',
+      'li',
+      '[class*="chatbot-card"]',
+      '[class*="ChatbotCard"]',
+      '[class*="character-card"]',
+      '[class*="CharacterCard"]'
+    ];
+
+    for (const selector of selectors) {
+      const node = anchor.closest?.(selector);
+      if (node) return node;
+    }
+
+    let node = anchor.parentElement;
+    for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+      const linkCount = node.querySelectorAll?.(LINK_SELECTOR).length || 0;
+      const imageCount = node.querySelectorAll?.("img").length || 0;
+      if (linkCount >= 1 && imageCount >= 1) return node;
+    }
+    return null;
+  };
+
+  const normalizedPath = () =>
+    String(location.pathname || "/").replace(/^\/[a-z]{2}(?=\/)/i, "");
+
+  const isSingleChatRoute = () =>
+    /^\/chat\/[0-9a-f-]{20,}(?:\/|$)/i.test(normalizedPath());
+
+  const stats = {
+    fullSweeps: 0,
+    incrementalBatches: 0,
+    anchorsVisited: 0,
+    normalizedAnchors: 0,
+    normalizedRoots: 0,
+    lastReason: "",
+    lastAt: 0
+  };
+
+  let scheduled = false;
+  let pendingReason = "mutation";
+  const pendingRoots = new Set();
+
+  const normalizeAnchor = anchor => {
+    if (!(anchor instanceof HTMLAnchorElement)) {
+      return { usable: false, anchorChanged: false, rootChanged: false };
+    }
+
+    const id =
+      normalizeId(anchor.dataset?.chatbotId) ||
+      normalizeId(anchor.dataset?.botId) ||
+      normalizeId(anchor.getAttribute?.("data-chatbot-id")) ||
+      normalizeId(anchor.getAttribute?.("data-bot-id")) ||
+      idFromHref(anchor.href);
+
+    if (!id) {
+      return { usable: false, anchorChanged: false, rootChanged: false };
+    }
+
+    let anchorChanged = false;
+    if (!anchor.getAttribute("data-chatbot-id")) {
+      anchor.setAttribute("data-chatbot-id", id);
+      anchorChanged = true;
+    }
+    if (!anchor.getAttribute("data-bot-id")) {
+      anchor.setAttribute("data-bot-id", id);
+    }
+    if (anchor.getAttribute("data-ds-android-chatbot-id") !== id) {
+      anchor.setAttribute("data-ds-android-chatbot-id", id);
+      anchorChanged = true;
+    }
+
+    let rootChanged = false;
+    const root = likelyCardRoot(anchor);
+    if (root) {
+      const before =
+        root.getAttribute("data-chatbot-id") ||
+        root.getAttribute("data-bot-id");
+
+      if (!root.getAttribute("data-chatbot-id")) {
+        root.setAttribute("data-chatbot-id", id);
+      }
+      if (!root.getAttribute("data-bot-id")) {
+        root.setAttribute("data-bot-id", id);
+      }
+      if (root.getAttribute("data-ds-android-chatbot-id") !== id) {
+        root.setAttribute("data-ds-android-chatbot-id", id);
+      }
+      if (!before) rootChanged = true;
+    }
+
+    return { usable: true, anchorChanged, rootChanged };
+  };
+
+  const emitReady = (reason, uniqueIds) => {
+    try {
+      window.dispatchEvent(
+        new CustomEvent("spicychat-qol:android-identities-ready", {
+          detail: { reason, uniqueIds }
+        })
+      );
+    } catch {}
+  };
+
+  const processAnchors = (anchors, reason, full) => {
+    let usableAnchors = 0;
+    let normalizedAnchors = 0;
+    let normalizedRoots = 0;
+    const uniqueIds = new Set();
+
+    for (const anchor of anchors) {
+      const result = normalizeAnchor(anchor);
+      if (!result.usable) continue;
+      usableAnchors++;
+      const id =
+        normalizeId(anchor.getAttribute("data-chatbot-id")) ||
+        normalizeId(anchor.getAttribute("data-bot-id"));
+      if (id) uniqueIds.add(id);
+      if (result.anchorChanged) normalizedAnchors++;
+      if (result.rootChanged) normalizedRoots++;
+    }
+
+    if (full) stats.fullSweeps++;
+    else stats.incrementalBatches++;
+    stats.anchorsVisited += anchors.length;
+    stats.normalizedAnchors += normalizedAnchors;
+    stats.normalizedRoots += normalizedRoots;
+    stats.lastReason = reason;
+    stats.lastAt = Date.now();
+
+    if (normalizedAnchors || normalizedRoots) emitReady(reason, uniqueIds.size);
+
+    // Full route/install checks are useful breadcrumbs. Virtualized DOM churn
+    // is intentionally silent so it does not become native log/file I/O.
+    if (full) {
+      console.log(
+        "[DS Android Identity] " +
+        JSON.stringify({
+          path: location.pathname,
+          anchors: anchors.length,
+          usableAnchors,
+          uniqueIds: uniqueIds.size,
+          normalizedAnchors,
+          normalizedRoots,
+          incrementalBatches: stats.incrementalBatches
+        })
+      );
+    }
+  };
+
+  const fullSweep = reason => {
+    syncObserver();
+    pendingRoots.clear();
+    scheduled = false;
+    let anchors = Array.from(document.querySelectorAll(LINK_SELECTOR));
+
+    // One chat can contain dozens/hundreds of repeated bot links. Identity
+    // normalization is a listing helper, so one anchor is enough there.
+    if (isSingleChatRoute() && anchors.length > 1) anchors = anchors.slice(0, 1);
+    processAnchors(anchors, reason, true);
+  };
+
+  const collectFromRoot = (root, seen, anchors) => {
+    if (!(root instanceof Element)) return;
+    if (root.matches?.(LINK_SELECTOR) && !seen.has(root)) {
+      seen.add(root);
+      anchors.push(root);
+    }
+    root.querySelectorAll?.(LINK_SELECTOR).forEach(anchor => {
+      if (seen.has(anchor)) return;
+      seen.add(anchor);
+      anchors.push(anchor);
+    });
+  };
+
+  const flushIncremental = () => {
+    scheduled = false;
+    if (isSingleChatRoute()) {
+      pendingRoots.clear();
+      return;
+    }
+
+    const roots = Array.from(pendingRoots);
+    pendingRoots.clear();
+    if (!roots.length) return;
+
+    const seen = new Set();
+    const anchors = [];
+    for (const root of roots) collectFromRoot(root, seen, anchors);
+    if (anchors.length) processAnchors(anchors, pendingReason, false);
+  };
+
+  const schedule = (reason, root = null) => {
+    pendingReason = reason || pendingReason;
+    if (root instanceof Element) pendingRoots.add(root);
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(flushIncremental);
+  };
+
+  window.__dsAndroidListingIdentityRun = fullSweep;
+  window.__dsAndroidListingIdentitySchedule = reason => {
+    syncObserver();
+    if (reason === "load-stop" || reason === "spa-route" || reason === "recheck") {
+      fullSweep(reason);
+      return;
+    }
+    schedule(reason);
+  };
+
+  const observer = new MutationObserver(records => {
+    if (isSingleChatRoute()) return;
+
+    let added = false;
+    for (const record of records) {
+      if (record.type !== "childList") continue;
+      for (const node of record.addedNodes || []) {
+        if (!(node instanceof Element)) continue;
+        pendingRoots.add(node);
+        added = true;
+      }
+    }
+    if (added) schedule("mutation");
+  });
+
+  // DS_ANDROID_V072_LISTING_OBSERVER_SCOPE: no subtree observer on
+  // active chats. Native React message churn otherwise wakes it constantly.
+  // SPA route callbacks already call fullSweep(), which reconnects it when
+  // returning to listings. No new polling, observer or background timer.
+  let observerActive = false;
+  const syncObserver = () => {
+    const shouldWatch = !isSingleChatRoute();
+    if (!shouldWatch && observerActive) {
+      observer.disconnect();
+      observerActive = false;
+      pendingRoots.clear();
+    } else if (shouldWatch && !observerActive) {
+      const root = document.documentElement || document.body;
+      if (root) {
+        observer.observe(root, { childList: true, subtree: true });
+        observerActive = true;
+      }
+    }
+  };
+  syncObserver();
+
+  window[STATE_KEY] = {
+    stats,
+    fullSweep,
+    disconnect() {
+      observer.disconnect();
+      pendingRoots.clear();
+      delete window[STATE_KEY];
+      delete window.__dsAndroidListingIdentityRun;
+      delete window.__dsAndroidListingIdentitySchedule;
+      delete window.__dsAndroidListingIdentityInstalled;
+    }
+  };
+
+  fullSweep("install");
+})()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-listing-identity-helper')) {
+        unawaited(
+          _appLog.log(
+            'AndroidIdentity',
+            'Could not install Android listing identity helper',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+  Future<void> _installAndroidEditableClipboardBridge(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+  const STATE_KEY = "__dsAndroidEditableClipboard";
+  const STYLE_ID = "ds-android-editable-selection-style";
+  const BUTTON_ID = "ds-android-editable-copy-button";
+
+  if (window[STATE_KEY]?.refresh) {
+    window[STATE_KEY].refresh();
+    return;
+  }
+
+  const isEditable = element => {
+    if (!(element instanceof Element)) return false;
+    if (element instanceof HTMLTextAreaElement) return true;
+    if (element instanceof HTMLInputElement) {
+      const type = String(element.type || "text").toLowerCase();
+      return ["", "text", "search", "url", "email", "tel"].includes(type);
+    }
+    return element.isContentEditable ||
+      element.getAttribute("contenteditable") === "true" ||
+      element.getAttribute("contenteditable") === "plaintext-only";
+  };
+
+  const selectedText = element => {
+    if (!isEditable(element)) return "";
+
+    if (
+      element instanceof HTMLTextAreaElement ||
+      element instanceof HTMLInputElement
+    ) {
+      const start = Number(element.selectionStart);
+      const end = Number(element.selectionEnd);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return "";
+      }
+      return String(element.value || "").slice(start, end);
+    }
+
+    try {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount < 1 || selection.isCollapsed) {
+        return "";
+      }
+      const range = selection.getRangeAt(0);
+      if (!element.contains(range.commonAncestorContainer)) return "";
+      return String(selection.toString() || "");
+    } catch {
+      return "";
+    }
+  };
+
+  const nativeCopy = async text => {
+    const value = String(text || "");
+    if (!value) return false;
+
+    try {
+      const result = await window.flutter_inappwebview?.callHandler(
+        "copyToClipboard",
+        value
+      );
+      if (result === true || result?.ok === true) return true;
+    } catch {}
+
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {}
+
+    return false;
+  };
+
+  const ensureStyle = () => {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      textarea,
+      input[type="text"],
+      input[type="search"],
+      input[type="url"],
+      input[type="email"],
+      input[type="tel"],
+      input:not([type]),
+      [contenteditable="true"],
+      [contenteditable="plaintext-only"] {
+        -webkit-user-select: text !important;
+        user-select: text !important;
+      }
+
+      #${BUTTON_ID} {
+        position: fixed !important;
+        right: 12px !important;
+        bottom: max(92px, calc(env(safe-area-inset-bottom) + 72px)) !important;
+        z-index: 2147483647 !important;
+        min-height: 38px !important;
+        padding: 7px 13px !important;
+        border: 1px solid rgba(255,255,255,.30) !important;
+        border-radius: 999px !important;
+        background: rgba(35,35,42,.96) !important;
+        color: white !important;
+        box-shadow: 0 4px 16px rgba(0,0,0,.38) !important;
+        font: 600 13px/1.2 system-ui, sans-serif !important;
+        touch-action: manipulation !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  };
+
+  const removeButton = () => {
+    document.getElementById(BUTTON_ID)?.remove();
+  };
+
+  let hideTimer = 0;
+
+  const refresh = () => {
+    clearTimeout(hideTimer);
+    const active = document.activeElement;
+    const text = selectedText(active);
+
+    if (!text) {
+      removeButton();
+      return;
+    }
+
+    let button = document.getElementById(BUTTON_ID);
+    if (!button) {
+      button = document.createElement("button");
+      button.id = BUTTON_ID;
+      button.type = "button";
+      button.textContent = "Copy";
+      button.setAttribute("aria-label", "Copy selected text");
+
+      button.addEventListener("pointerdown", event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+
+      button.addEventListener("click", async event => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const value = selectedText(document.activeElement);
+        if (!value) {
+          removeButton();
+          return;
+        }
+
+        if (await nativeCopy(value)) {
+          button.textContent = "Copied";
+          hideTimer = setTimeout(removeButton, 700);
+        } else {
+          button.textContent = "Copy failed";
+          hideTimer = setTimeout(removeButton, 1100);
+        }
+      }, true);
+
+      document.documentElement.appendChild(button);
+    }
+
+    hideTimer = setTimeout(removeButton, 10000);
+  };
+
+  const onCopy = event => {
+    const active = document.activeElement;
+    if (!isEditable(active)) return;
+
+    const value = selectedText(active);
+    if (!value) return;
+
+    event.preventDefault();
+    void nativeCopy(value);
+    removeButton();
+  };
+
+  ensureStyle();
+
+  document.addEventListener("copy", onCopy, true);
+  document.addEventListener("selectionchange", refresh, true);
+  document.addEventListener("select", refresh, true);
+  document.addEventListener("pointerup", event => {
+    if (isEditable(event.target) || isEditable(document.activeElement)) {
+      setTimeout(refresh, 0);
+    }
+  }, true);
+  document.addEventListener("keyup", event => {
+    if (isEditable(event.target)) setTimeout(refresh, 0);
+  }, true);
+
+  window[STATE_KEY] = {
+    refresh,
+    copySelection() {
+      const value = selectedText(document.activeElement);
+      return value ? nativeCopy(value) : Promise.resolve(false);
+    }
+  };
+
+  refresh();
+})()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-editable-clipboard-install')) {
+        unawaited(
+          _appLog.log(
+            'AndroidClipboard',
+            'Could not install Android editable clipboard bridge',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+  Future<void> _installAndroidFocusSafetyGuard(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+  const STATE_KEY = "__dsAndroidFocusSafety";
+  const SAFE_HIDE_CLASS = "ds-android-focus-safe-hide";
+  const STYLE_ID = "ds-android-focus-safe-style";
+
+  const ROOT_ACTIVE = "ds-focus-mode-active";
+  const ROOT_HIDE_TOPBAR = "ds-focus-hide-topbar";
+  const ROOT_HIDE_CHAT_HEADER = "ds-focus-hide-chat-header";
+
+  const previous = window[STATE_KEY];
+  if (previous?.refresh) {
+    previous.refresh();
+    return;
+  }
+
+  let applying = false;
+  let observer = null;
+  let nativeObserver = null;
+  let refreshTimer = 0;
+
+  const ensureStyle = () => {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      .${SAFE_HIDE_CLASS} {
+        display: none !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  };
+
+  const clearSafeTargets = () => {
+    document
+      .querySelectorAll(`.${SAFE_HIDE_CLASS}`)
+      .forEach(element => element.classList.remove(SAFE_HIDE_CLASS));
+  };
+
+  const dangerSelector = [
+    "textarea",
+    "[contenteditable='true']",
+    "[contenteditable='plaintext-only']",
+    "button[aria-label='send-message']",
+    "button[aria-label='message-dropdown']",
+    "div[id^='message-']"
+  ].join(",");
+
+  const containsChatContent = element => {
+    if (!(element instanceof Element)) return true;
+    try { return !!element.querySelector(dangerSelector); }
+    catch { return true; }
+  };
+
+  const visibleRect = element => {
+    if (!(element instanceof HTMLElement)) return null;
+    try {
+      const style = getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden") return null;
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 20) return null;
+      return rect;
+    } catch {
+      return null;
+    }
+  };
+
+  const safeHeaderAncestor = (start, requiredSelectors = []) => {
+    if (!(start instanceof Element)) return null;
+
+    let best = null;
+    let bestScore = -1;
+    const viewportWidth = Math.max(1, window.innerWidth || 1);
+
+    for (
+      let node = start;
+      node && node !== document.body && node.id !== "root";
+      node = node.parentElement
+    ) {
+      const rect = visibleRect(node);
+      if (!rect) continue;
+
+      if (
+        rect.top < -8 ||
+        rect.top > 190 ||
+        rect.height > 150 ||
+        rect.width > viewportWidth * 1.08 ||
+        containsChatContent(node)
+      ) {
+        if (rect.height > 220 || containsChatContent(node)) break;
+        continue;
+      }
+
+      let score = 0;
+      for (const selector of requiredSelectors) {
+        try { if (node.querySelector(selector)) score += 2; } catch {}
+      }
+      if (rect.width > viewportWidth * 0.45) score += 3;
+      if (rect.height >= 36 && rect.height <= 110) score += 2;
+
+      if (score > bestScore) {
+        best = node;
+        bestScore = score;
+      }
+    }
+
+    return best;
+  };
+
+  const markSafeGroup = (starts, requiredSelectors) => {
+    for (const selector of starts) {
+      let start = null;
+      try { start = document.querySelector(selector); } catch {}
+      if (!start) continue;
+
+      const target = safeHeaderAncestor(start, requiredSelectors);
+      if (target) {
+        target.classList.add(SAFE_HIDE_CLASS);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const markAll = selectors => {
+    for (const selector of selectors) {
+      try {
+        document.querySelectorAll(selector).forEach(element => {
+          if (!containsChatContent(element)) {
+            element.classList.add(SAFE_HIDE_CLASS);
+          }
+        });
+      } catch {}
+    }
+  };
+
+  const refresh = () => {
+    if (applying) return;
+    applying = true;
+
+    try {
+      const root = document.documentElement;
+      const DS = window.DragonScriptQoL;
+      const settings = DS?.state?.settings || {};
+      const active =
+        root.classList.contains(ROOT_ACTIVE) &&
+        !!DS?.isFocusModeActive?.();
+
+      clearSafeTargets();
+      if (!active) return;
+
+      // Never let shared desktop ancestor targeting hide a mobile chat/page
+      // container. Android supplies safe header targets below.
+      root.classList.remove(ROOT_HIDE_TOPBAR, ROOT_HIDE_CHAT_HEADER);
+
+      if (settings.focusHideTopBar !== false) {
+        const grouped = markSafeGroup(
+          [
+            "a[aria-label='avatar']",
+            "[data-testid='LocaleSelector']",
+            "button[aria-label='notifications']"
+          ],
+          [
+            "a[aria-label='avatar']",
+            "[data-testid='LocaleSelector']"
+          ]
+        );
+
+        if (!grouped) {
+          markAll([
+            "a[aria-label='avatar']",
+            "[data-testid='LocaleSelector']",
+            "button[aria-label='notifications']",
+            "button[aria-label='theme']"
+          ]);
+        }
+      }
+
+      if (settings.focusHideChatHeader !== false) {
+        const grouped = markSafeGroup(
+          [
+            "a[aria-label='chatbot-profile']",
+            "button[aria-label='chat-dropdown']",
+            "button[aria-label='ThumbsUp-button']"
+          ],
+          [
+            "a[aria-label='chatbot-profile']",
+            "button[aria-label='chat-dropdown']"
+          ]
+        );
+
+        if (!grouped) {
+          markAll([
+            "a[aria-label='chatbot-profile']",
+            "button[aria-label='chat-dropdown']",
+            "button[aria-label='ThumbsUp-button']",
+            "[data-testid='ChatModelTierCapabilityGate']"
+          ]);
+        }
+      }
+    } finally {
+      applying = false;
+    }
+  };
+
+  const scheduleRefresh = () => {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, 80);
+  };
+
+  ensureStyle();
+
+  observer = new MutationObserver(records => {
+    if (records.some(record =>
+      record.type === "attributes" &&
+      record.attributeName === "class"
+    )) {
+      queueMicrotask(refresh);
+    }
+  });
+
+  const focusClassRoot = document.documentElement;
+  if (focusClassRoot instanceof Node) {
+    observer.observe(focusClassRoot, {
+      attributes: true,
+      attributeFilter: ["class"]
+    });
+  }
+
+  nativeObserver = new MutationObserver(records => {
+    const DS = window.DragonScriptQoL;
+    if (!DS?.isFocusModeActive?.()) return;
+    if (!records.some(record =>
+      record.addedNodes?.length || record.removedNodes?.length
+    )) return;
+    scheduleRefresh();
+  });
+
+  if (document.body) {
+    nativeObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  window[STATE_KEY] = {
+    refresh,
+    disconnect() {
+      observer?.disconnect();
+      nativeObserver?.disconnect();
+      observer = null;
+      nativeObserver = null;
+      clearTimeout(refreshTimer);
+      clearSafeTargets();
+      document.getElementById(STYLE_ID)?.remove();
+      delete window[STATE_KEY];
+    }
+  };
+
+  refresh();
+})()''',
+      );
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('android-focus-safety-install')) {
+        unawaited(
+          _appLog.log(
+            'AndroidFocusMode',
+            'Could not install Android Focus Mode safety guard',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+  Future<void> _injectScripts(InAppWebViewController controller) async {
+    final url = await controller.getUrl();
+    if (url == null || !_isSpicyChat(url)) return;
+
+    // A page-global document token survives SPA navigation but disappears on
+    // a true reload/new document. This prevents repeated evaluation of the
+    // full 80+ script bundle when Android fires duplicate onLoadStop events.
+    final rawToken = await controller.evaluateJavascript(
+      source: r'''(() => {
+        if (!window.__spicyChatQolAndroidDocumentToken) {
+          const origin = Math.round(
+            performance.timeOrigin ||
+            performance.timing?.navigationStart ||
+            Date.now()
+          );
+          window.__spicyChatQolAndroidDocumentToken =
+            String(origin) + '-' + Math.random().toString(36).slice(2, 9);
+        }
+        const token = window.__spicyChatQolAndroidDocumentToken;
+        return JSON.stringify({
+          token,
+          alreadyInjected: window.__spicyChatQolAndroidInjected === token
+        });
+      })()''',
+    );
+
+    Map<String, dynamic>? tokenInfo;
+    if (rawToken is String && rawToken.isNotEmpty) {
+      final decoded = jsonDecode(rawToken);
+      if (decoded is Map) tokenInfo = Map<String, dynamic>.from(decoded);
+    } else if (rawToken is Map) {
+      tokenInfo = Map<String, dynamic>.from(rawToken);
+    }
+
+    final token = tokenInfo?['token']?.toString() ?? '';
+    if (token.isEmpty) {
+      throw StateError('Could not determine WebView document token');
+    }
+
+    if (tokenInfo?['alreadyInjected'] == true ||
+        _lastInjectedDocumentToken == token ||
+        _injectionInProgressToken == token) {
+      return;
+    }
+
+    _injectionInProgressToken = token;
+    final started = DateTime.now();
+    try {
+      // Publish Android wrapper identity/capabilities before any normal QoL
+      // script executes. The real WebView UA is also left intact.
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+          window.__spicyChatQolAndroidApp = true;
+          window.__spicyChatQolAndroidWebView = true;
+          window.__spicyChatQolAndroidCapabilities = Object.freeze({
+            dedicatedApp: true,
+            singleWebView: true,
+            browserTabs: false,
+            backgroundTabs: false,
+            backgroundAlarms: false,
+            nativeFileSave: true,
+            nativeFilePicker: true,
+            androidChatTabs: true,
+            listingIdentityNormalization: true
+          });
+          try {
+            document.documentElement?.setAttribute(
+              "data-spicychat-qol-android",
+              "1"
+            );
+          } catch {}
+        })();''',
+      );
+
+      await _installAndroidViewportWidthGuard(controller);
+      await _installAndroidListingIdentityHelper(controller);
+
+      // Timing only. Preserve the extension's original script order.
+      final cssStart = DateTime.now();
+      await controller.evaluateJavascript(
+        source: widget.bundleService.cssInjectionScript,
+      );
+      final cssMs = DateTime.now().difference(cssStart).inMilliseconds;
+      final jsStart = DateTime.now();
+      await controller.evaluateJavascript(source: widget.bundleService.jsBundle);
+      final jsMs = DateTime.now().difference(jsStart).inMilliseconds;
+
+      // Shared Focus Mode uses desktop-oriented ancestor targeting. Install a
+      // lightweight Android guard after the shared bundle exists so mobile
+      // Focus Mode cannot hide the entire chat/composer container.
+      await _installAndroidFocusSafetyGuard(controller);
+
+      // Keep normal Android selection UI, but make the final copy operation
+      // use Flutter's native clipboard when System WebView refuses to copy.
+      await _installAndroidEditableClipboardBridge(controller);
+
+      // Android-only Save & Stay marker. Delegated click handling keeps
+      // working when QoL recreates the editor toolbar dynamically.
+      await controller.evaluateJavascript(
+        source: r'''(() => {
+          if (window.__dsAndroidSaveStayHistoryHookInstalled) return;
+          window.__dsAndroidSaveStayHistoryHookInstalled = true;
+
+          document.addEventListener("click", event => {
+            const target =
+              event.target instanceof Element
+                ? event.target
+                : event.target?.parentElement;
+            const button = target?.closest?.(
+              ".ds-bot-editor-save-actions button"
+            );
+            if (!button) return;
+
+            const text = String(button.textContent || "")
+              .replace(/\s+/g, " ")
+              .trim();
+
+            if (!/^Save\s*&\s*Stay$/i.test(text)) return;
+
+            window.flutter_inappwebview
+              ?.callHandler("androidSaveStayStarted")
+              .catch(() => {});
+          }, true);
+        })()''',
+      );
+
+      // Android-owned gesture layer. This stays outside the extension bundle
+      // so desktop releases never need Android-specific touch handling.
+      try {
+        _androidMessageLongPressSource ??= await rootBundle.loadString(
+          'assets/js/android-message-longpress.js',
+        );
+        await controller.evaluateJavascript(
+          source: _androidMessageLongPressSource!,
+        );
+      } catch (e, stackTrace) {
+        unawaited(
+          _appLog.log(
+            'AndroidGesture',
+            'Could not inject Android message long-press support',
+            level: 'ERROR',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+
+      await controller.evaluateJavascript(
+        source:
+            "window.__spicyChatQolAndroidInjected = ${jsonEncode(token)};",
+      );
+
+      _lastInjectedDocumentToken = token;
+      final elapsed = DateTime.now().difference(started).inMilliseconds;
+      // This value is diagnostic-only and is never persisted in website storage.
+      final timing = <String, dynamic>{
+        'totalMs': elapsed,
+        'cssMs': cssMs,
+        'jsMs': jsMs,
+        'sourceChars': widget.bundleService.jsBundle.length,
+        'version': widget.bundleService.extensionVersion,
+      };
+      try {
+        await controller.evaluateJavascript(
+          source: 'window.__dsAndroidQolInjectionMetrics = ${jsonEncode(timing)};',
+        );
+      } catch (_) {
+        // A failed metrics write must never break an otherwise healthy chat.
+      }
+      unawaited(
+        _appLog.log(
+          'Injection',
+          'QoL bundle injected once for document=$token in ${elapsed}ms '
+          '(css=${cssMs}ms, js=${jsMs}ms); url=$url',
+        ),
+      );
+    } finally {
+      if (_injectionInProgressToken == token) {
+        _injectionInProgressToken = null;
+      }
+    }
+  }
+
+  void _scheduleVisualGuardForCurrentPage(String trigger) {
+    if (!_appIsResumed || !_isChatUrl(_lastKnownUrl)) return;
+
+    final now = DateTime.now();
+    if (_lastVisualGuardAt != null &&
+        now.difference(_lastVisualGuardAt!) <
+            const Duration(milliseconds: 900)) {
+      return;
+    }
+    _lastVisualGuardAt = now;
+
+    final generation = ++_visualGuardGeneration;
+    for (final delay in const [
+      Duration(milliseconds: 900),
+      Duration(seconds: 3),
+    ]) {
+      Future<void>.delayed(delay, () async {
+        if (!mounted ||
+            !_appIsResumed ||
+            generation != _visualGuardGeneration ||
+            !_isChatUrl(_lastKnownUrl)) {
+          return;
+        }
+        await _runVisualGuard(trigger: '$trigger-${delay.inMilliseconds}ms');
+      });
+    }
+  }
+
+  Future<void> _runVisualGuard({required String trigger}) async {
+    final controller = _webController;
+    if (controller == null) return;
+
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r'''(() => {
+          const vw = Math.max(1, window.innerWidth || 1);
+          const vh = Math.max(1, window.innerHeight || 1);
+          const all = Array.from(document.querySelectorAll('img[src*="/avatars/"]'));
+          const visible = all.filter(img => {
+            const r = img.getBoundingClientRect();
+            return r.width > 1 && r.height > 1;
+          });
+
+          const suspicious = visible.filter(img => {
+            const r = img.getBoundingClientRect();
+            return r.width > vw * 1.15 ||
+              r.height > Math.max(700, vh * 0.9);
+          });
+
+          const rows = suspicious.slice(0, 6).map(img => {
+            const before = img.getBoundingClientRect();
+            let path = '';
+            try {
+              path = new URL(img.currentSrc || img.src, location.href).pathname;
+            } catch (_) {
+              path = String(img.currentSrc || img.src || '').slice(0, 180);
+            }
+
+            const sameLargeSourceCount = suspicious.filter(other =>
+              (other.currentSrc || other.src) === (img.currentSrc || img.src)
+            ).length;
+
+            // Only clamp clearly impossible avatar geometry. Normal profile
+            // heroes/cards stay untouched.
+            img.dataset.dsAndroidVisualGuard = '1';
+            img.style.setProperty('max-width', 'min(100%, 420px)', 'important');
+            img.style.setProperty('max-height', '55vh', 'important');
+            img.style.setProperty('width', 'auto', 'important');
+            img.style.setProperty('height', 'auto', 'important');
+            img.style.setProperty('object-fit', 'cover', 'important');
+
+            const after = img.getBoundingClientRect();
+            return {
+              path: path.slice(0, 180),
+              beforeWidth: Math.round(before.width),
+              beforeHeight: Math.round(before.height),
+              afterWidth: Math.round(after.width),
+              afterHeight: Math.round(after.height),
+              sameLargeSourceCount
+            };
+          });
+
+          return JSON.stringify({
+            href: location.href,
+            viewportWidth: Math.round(vw),
+            viewportHeight: Math.round(vh),
+            avatarCount: all.length,
+            suspiciousCount: suspicious.length,
+            rows
+          });
+        })()''',
+      );
+
+      Map<String, dynamic>? result;
+      if (raw is String && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) result = Map<String, dynamic>.from(decoded);
+      } else if (raw is Map) {
+        result = Map<String, dynamic>.from(raw);
+      }
+
+      if (result == null) return;
+      final count = result['suspiciousCount'];
+      if (count is num && count > 0) {
+        unawaited(
+          _appLog.log(
+            'VisualGuard',
+            'Oversized avatar geometry detected/fixed ($trigger): ${jsonEncode(result)}',
+            level: 'WARN',
+          ),
+        );
+      }
+    } catch (e, stackTrace) {
+      if (_shouldPersistDiagnostic('visual-guard-error')) {
+        unawaited(
+          _appLog.log(
+            'VisualGuard',
+            'Visual guard check failed ($trigger)',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _pushSettingsToWebView() async {
+    final controller = _webController;
+    if (controller == null) return;
+
+    // The old bridge sent { settings: { newValue: true } }, but QoL expects the
+    // actual settings object. Reload all local state so settings, personas,
+    // local persona copies, blocked/saved lists and other storage stay in sync.
+    try {
+      await controller.evaluateJavascript(
+        source: r'''
+          (async () => {
+            const DS = window.DragonScriptQoL;
+            if (!DS) return;
+            if (typeof DS.loadState === "function") await DS.loadState();
+            DS.state.openedImportRevision = -1;
+            DS.scheduleRun?.({
+              immediate: true,
+              priority: "critical",
+              source: "android-native-storage-sync"
+            });
+          })();
+        ''',
+      );
+    } catch (e) {
+      debugPrint('[Bridge] Could not refresh WebView state: $e');
+    }
+  }
+
+  _NativeFilePayload? _decodeNativeFilePayload(List<dynamic> args) {
+    if (args.isEmpty) return null;
+
+    dynamic raw = args.first;
+    if (raw is String) {
+      try {
+        raw = jsonDecode(raw);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (raw is! Map) return null;
+
+    final data = Map<String, dynamic>.from(raw);
+    final filename = _safeNativeFilename(
+      data['filename'] ?? data['fileName'],
+      fallback: 'spicychat-qol-export.txt',
+    );
+
+    Uint8List bytes;
+    final encoded = data['base64'];
+    if (encoded is String && encoded.trim().isNotEmpty) {
+      try {
+        final clean = encoded.contains(',')
+            ? encoded.substring(encoded.indexOf(',') + 1)
+            : encoded;
+        bytes = Uint8List.fromList(base64Decode(clean));
+      } catch (_) {
+        bytes = Uint8List.fromList(
+          utf8.encode('${data['text'] ?? data['content'] ?? ''}'),
+        );
+      }
+    } else {
+      bytes = Uint8List.fromList(
+        utf8.encode('${data['text'] ?? data['content'] ?? ''}'),
+      );
+    }
+
+    return _NativeFilePayload(filename: filename, bytes: bytes);
+  }
+
+  String _safeNativeFilename(dynamic value, {required String fallback}) {
+    var filename = (value ?? '').toString().trim();
+    if (filename.isEmpty) filename = fallback;
+
+    filename = filename
+        .replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1F]'), '-')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    if (filename.isEmpty) return fallback;
+    if (filename.length > 140) {
+      final dot = filename.lastIndexOf('.');
+      final suffix = dot > 0 && filename.length - dot <= 12
+          ? filename.substring(dot)
+          : '';
+      final keep = 140 - suffix.length;
+      filename = '${filename.substring(0, keep)}$suffix';
+    }
+    return filename;
+  }
+
+  // DS_ANDROID_V062_VERIFIED_EXPORT: same SAF readback path as verified App Logs.
+  Future<Map<String, dynamic>> _saveNativeFile({
+    required Uint8List bytes,
+    required String filename,
+    required String dialogTitle,
+    String mimeType = 'application/octet-stream',
+  }) async {
+    if (_nativeSaveBusy) return {'ok': false, 'error': 'save-busy'};
+    if (bytes.isEmpty) return {'ok': false, 'error': 'empty-file', 'bytes': 0};
+    _nativeSaveBusy = true;
+    try {
+      final safe = _safeNativeFilename(filename, fallback: 'spicychat-qol-export.txt');
+      final lower = safe.toLowerCase();
+      final inferredMime = lower.endsWith('.gz')
+          ? 'application/gzip'
+          : lower.endsWith('.txt') ? 'text/plain'
+          : lower.endsWith('.json') ? 'application/json'
+          : 'application/octet-stream';
+      final mime = mimeType == 'application/octet-stream'
+          ? inferredMime : mimeType;
+      final encodedBytes = bytes.length > 256 * 1024
+          ? await compute(base64Encode, bytes)
+          : base64Encode(bytes);
+      final native = await const MethodChannel('uk.drache.spicychatqol/app_info')
+          .invokeMapMethod<String, dynamic>('saveVerifiedFile', {
+        'filename': safe,
+        'mimeType': mime,
+        'base64': encodedBytes,
+      });
+      if (native?['canceled'] == true) return {'ok': false, 'canceled': true};
+      if (native?['ok'] != true || native?['verified'] != true ||
+          native?['bytes'] != bytes.length) {
+        return {'ok': false, 'error': native?['error'] ?? 'save-unverified',
+            'bytes': native?['bytes'] ?? 0};
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saved $safe (${bytes.length} bytes)')),
+        );
+      }
+      return {
+        'ok': true, 'success': true, 'verified': true,
+        'bytes': bytes.length, 'bytesWritten': bytes.length,
+        'savedBytes': bytes.length, 'fileSize': bytes.length,
+        'filename': safe, 'name': safe,
+        if (native?['uri'] is String) 'uri': native?['uri'],
+      };
+    } catch (e) {
+      debugPrint('[Native Save] Error: $e');
+      return {'ok': false, 'error': e.toString()};
+    } finally {
+      _nativeSaveBusy = false;
+    }
+  }
+
+  // DS_ANDROID_V066_VERIFIED_RESULT: preserve text file MIME for Support,
+  // JSON, HTML, Markdown, and ordinary TXT exports.
+  String _nativeTextMime(String filename) {
+    final lower = filename.toLowerCase();
+    if (lower.endsWith('.json')) return 'application/json;charset=utf-8';
+    if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      return 'text/html;charset=utf-8';
+    }
+    if (lower.endsWith('.md')) return 'text/markdown;charset=utf-8';
+    return 'text/plain;charset=utf-8';
+  }
+
+  Future<Map<String, dynamic>> _exportChatText(
+    String text, String filename, {String? mimeType}
+  ) async {
+    return _saveNativeFile(
+      bytes: Uint8List.fromList(utf8.encode(text)),
+      filename: filename,
+      dialogTitle: 'Save Export',
+      mimeType: mimeType ?? _nativeTextMime(filename),
+    );
+  }
+
+  // ── Backup Import ──────────────────────────────────────────
+
+  Future<void> _restoreBackupText(String content, {required String source}) async {
+    try {
+      final decoded = jsonDecode(content.trim());
+      if (decoded is! Map) {
+        throw const FormatException('The backup must be a JSON object.');
+      }
+
+      final backup = Map<String, dynamic>.from(decoded);
+      final settingsService = Provider.of<SettingsService>(
+        context,
+        listen: false,
+      );
+      await settingsService.importFullBackup(backup);
+      await _pushSettingsToWebView();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Backup restored from $source (${backup.keys.length} keys imported)',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('[Import] Error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Import failed: $e')),
+        );
+      }
+    }
+  }
+
+  // Kept for native file backup import; currently not called by the screen.
+  // ignore: unused_element
+  Future<void> _importBackup() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json', 'txt', 'qol', 'backup'],
+        withData: true,
+      );
+
+      if (result == null || result.files.isEmpty) return;
+
+      final picked = result.files.single;
+      String content;
+      if (picked.bytes != null) {
+        content = utf8.decode(picked.bytes!);
+      } else if (picked.path != null) {
+        content = await File(picked.path!).readAsString();
+      } else {
+        throw const FileSystemException('The selected file could not be read.');
+      }
+
+      await _restoreBackupText(content, source: 'file');
+    } catch (e) {
+      debugPrint('[File Import] Error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('File import failed: $e')),
+        );
+      }
+    }
+  }
+
+  // Kept for native clipboard backup import; currently not called by the screen.
+  // ignore: unused_element
+  Future<void> _pasteBackup() async {
+    final clipboard = await Clipboard.getData(Clipboard.kTextPlain);
+    final controller = TextEditingController(text: clipboard?.text ?? '');
+
+    if (!mounted) return;
+    final pasted = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Paste Backup JSON'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: TextField(
+            controller: controller,
+            minLines: 8,
+            maxLines: 16,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(
+              hintText: 'Paste the full backup JSON here',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+
+    if (pasted == null || pasted.trim().isEmpty) return;
+    await _restoreBackupText(pasted, source: 'pasted text');
+  }
+
+  // Kept for native backup clipboard export; currently not called by the screen.
+  // ignore: unused_element
+  Future<void> _copyFullBackup() async {
+    try {
+      final settingsService = Provider.of<SettingsService>(
+        context,
+        listen: false,
+      );
+      await Clipboard.setData(
+        ClipboardData(text: settingsService.exportFullBackup()),
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Full backup copied to clipboard')),
+        );
+      }
+    } catch (e) {
+      debugPrint('[Backup Copy] Error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Copy failed: $e')),
+        );
+      }
+    }
+  }
+
+  // ── Backup Export ──────────────────────────────────────────
+
+  // Kept for native backup file export; currently not called by the screen.
+  // ignore: unused_element
+  Future<void> _exportFullBackup() async {
+    try {
+      final settingsService = Provider.of<SettingsService>(
+        context,
+        listen: false,
+      );
+      final jsonStr = settingsService.exportFullBackup();
+
+      final timestamp = DateTime.now()
+          .toIso8601String()
+          .replaceAll(':', '-')
+          .split('.')
+          .first;
+      final defaultFilename = 'spicychat-qol-backup-$timestamp.json';
+
+      final outputFile = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save Full Backup',
+        fileName: defaultFilename,
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+        bytes: Uint8List.fromList(utf8.encode(jsonStr)),
+      );
+
+      if (outputFile == null) return; // User canceled
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Backup saved to ${outputFile.split("/").last}')),
+        );
+      }
+    } catch (e) {
+      debugPrint('[Backup Export] Error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Backup export failed: $e')));
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>?> _probeWebView() async {
+    final controller = _webController;
+    if (controller == null) return null;
+
+    final raw = await controller.evaluateJavascript(
+      source: r'''(() => {
+        const body = document.body;
+        const html = document.documentElement;
+        const style = body ? getComputedStyle(body) : null;
+        const bodyRect = body ? body.getBoundingClientRect() : null;
+        const bodyChildren = body ? body.children.length : -1;
+        const hasUi = !!document.querySelector(
+          'main, nav, header, button, input, textarea, img, [role="main"], [role="button"]'
+        );
+        const meaningful = !!body && (bodyChildren > 0 || hasUi);
+        return JSON.stringify({
+          href: location.href,
+          title: document.title || '',
+          readyState: document.readyState,
+          bodyChildren,
+          display: style ? style.display : '',
+          visibility: style ? style.visibility : '',
+          opacity: style ? style.opacity : '',
+          bodyWidth: bodyRect ? Math.round(bodyRect.width) : 0,
+          bodyHeight: bodyRect ? Math.round(bodyRect.height) : 0,
+          htmlWidth: html ? html.scrollWidth : 0,
+          htmlHeight: html ? html.scrollHeight : 0,
+          meaningful
+        });
+      })()''',
+    );
+
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    if (raw is String && raw.trim().isNotEmpty) {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    }
+    return null;
+  }
+
+  Future<void> _runWebViewHealthCheck({String trigger = 'timer'}) async {
+    final controller = _webController;
+    if (!mounted ||
+        !_appIsResumed ||
+        _recoveringWebView ||
+        controller == null ||
+        // A periodic probe should not compete with a confirmed stall or
+        // the one-time full script injection on a freshly loaded document.
+        _rendererUnresponsiveSince != null ||
+        _injectionInProgressToken != null) {
+      return;
+    }
+
+    // Active chats are intentionally protected from destructive watchdog
+    // recovery. Android keyboard/viewport changes, a busy renderer, or a
+    // temporarily unanswered JS probe must never recreate a usable chat.
+    var chatRoute = _isChatUrl(_lastKnownUrl);
+
+    if (_isLoading) {
+      final startedAt = _loadStartedAt;
+      final grace = chatRoute
+          ? const Duration(seconds: 30)
+          : const Duration(seconds: 15);
+      if (startedAt == null || DateTime.now().difference(startedAt) < grace) {
+        return;
+      }
+      // A load that never reaches onLoadStop can still be probed after the
+      // grace period. Chat routes remain non-destructive below.
+    }
+
+    try {
+      final current = await controller.getUrl();
+      if (current != null) {
+        if (!_isSpicyChat(current)) {
+          _blankHealthFailures = 0;
+          return;
+        }
+
+        final currentText = current.toString();
+        if (currentText.isNotEmpty) {
+          _lastKnownUrl = currentText;
+          chatRoute = _isChatUrl(currentText);
+        }
+      }
+    } catch (_) {
+      // A busy renderer can briefly fail getUrl(). Do not interpret that as a
+      // dead active chat; the JS probe below may still answer normally.
+    }
+
+    final stoppedAt = _lastLoadStopAt;
+    final postLoadGrace = chatRoute
+        ? const Duration(seconds: 10)
+        : const Duration(seconds: 5);
+    if (stoppedAt != null &&
+        DateTime.now().difference(stoppedAt) < postLoadGrace) {
+      return;
+    }
+
+    try {
+      final probe = await _probeWebView();
+      if (probe == null) {
+        if (chatRoute) {
+          _blankHealthFailures = 0;
+          unawaited(
+            _appLog.log(
+              'Health',
+              'Chat health probe returned no data ($trigger); destructive recovery suppressed for $_lastKnownUrl',
+              level: 'WARN',
+            ),
+          );
+          return;
+        }
+
+        _blankHealthFailures++;
+        unawaited(
+          _appLog.log(
+            'Health',
+            'WebView health probe returned no data ($trigger), failure=$_blankHealthFailures',
+            level: 'WARN',
+          ),
+        );
+      } else {
+        final href = (probe['href'] ?? '').toString();
+        if (href.isNotEmpty) {
+          _lastKnownUrl = href;
+          chatRoute = _isChatUrl(href);
+        }
+
+        final meaningful = probe['meaningful'] == true;
+        final hidden = probe['display'] == 'none' ||
+            probe['visibility'] == 'hidden' ||
+            probe['opacity'] == '0';
+        final width = probe['htmlWidth'];
+        final height = probe['htmlHeight'];
+        final tinyDocument = (width is num ? width : 0) <= 1 ||
+            (height is num ? height : 0) <= 1;
+        final blank = !meaningful || hidden || tinyDocument;
+
+        if (blank) {
+          if (chatRoute) {
+            _blankHealthFailures = 0;
+            unawaited(
+              _appLog.log(
+                'Health',
+                'Possible blank active chat ($trigger); automatic WebView recreation suppressed, probe=${jsonEncode(probe)}',
+                level: 'WARN',
+              ),
+            );
+            return;
+          }
+
+          _blankHealthFailures++;
+          unawaited(
+            _appLog.log(
+              'Health',
+              'Possible blank WebView ($trigger), failure=$_blankHealthFailures, probe=${jsonEncode(probe)}',
+              level: 'WARN',
+            ),
+          );
+        } else {
+          if (_blankHealthFailures > 0) {
+            unawaited(
+              _appLog.log(
+                'Health',
+                'WebView recovered/healthy after $_blankHealthFailures failed probe(s)',
+              ),
+            );
+          }
+          _blankHealthFailures = 0;
+        }
+      }
+    } catch (e, stackTrace) {
+      if (chatRoute) {
+        _blankHealthFailures = 0;
+        unawaited(
+          _appLog.log(
+            'Health',
+            'Chat health probe threw ($trigger); destructive recovery suppressed',
+            level: 'WARN',
+            error: e,
+            stackTrace: stackTrace,
+          ),
+        );
+        return;
+      }
+
+      _blankHealthFailures++;
+      unawaited(
+        _appLog.log(
+          'Health',
+          'WebView health probe threw ($trigger), failure=$_blankHealthFailures',
+          level: 'WARN',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+
+    // Non-chat pages still retain automatic blank-screen recovery, but require
+    // three consecutive failures instead of two.
+    if (_blankHealthFailures >= 3) {
+      _blankHealthFailures = 0;
+      unawaited(
+        _appLog.log(
+          'Health',
+          'Automatic blank-screen recovery suppressed; trigger=$trigger; url=$_lastKnownUrl',
+          level: 'WARN',
+        ),
+      );
+    }
+  }
+
+  Future<void> _recoverWebView({
+    required String reason,
+    bool useController = true,
+  }) async {
+    if (!mounted || _recoveringWebView) return;
+
+    final previousRecovery = _lastRecoveryAt;
+    if (previousRecovery != null &&
+        DateTime.now().difference(previousRecovery) <
+            const Duration(seconds: 12)) {
+      return;
+    }
+
+    _recoveringWebView = true;
+    _lastRecoveryAt = DateTime.now();
+    _routeHealthGeneration++;
+
+    var target = _lastKnownUrl;
+    final controller = useController ? _webController : null;
+    if (controller != null) {
+      try {
+        final current = await controller.getUrl();
+        if (current != null && current.toString().isNotEmpty) {
+          target = current.toString();
+        }
+      } catch (_) {
+        // A crashed renderer can make getUrl fail; the last known URL is fine.
+      }
+    }
+
+    if (!target.startsWith('https://')) {
+      target = 'https://spicychat.ai/';
+    }
+
+    unawaited(
+      _appLog.log(
+        'Recovery',
+        'Recreating WebView because of $reason; target=$target',
+        level: 'WARN',
+      ),
+    );
+
+    try {
+      try {
+        await controller?.stopLoading();
+      } catch (_) {}
+
+      _webController = null;
+      _blankHealthFailures = 0;
+      _loadStartedAt = null;
+      _lastLoadStopAt = null;
+      _lastInjectedDocumentToken = null;
+      _injectionInProgressToken = null;
+      _lastProgressPercent = -1;
+      _visualGuardGeneration++;
+      _initialWebUri = WebUri(target);
+
+      if (mounted) {
+        setState(() {
+          _webViewKey = UniqueKey();
+          _isLoading = true;
+          _progress = 0;
+        });
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('WebView recovery started'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'Recovery',
+          'Could not recreate WebView',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('WebView recovery failed: $e')),
+        );
+      }
+    } finally {
+      _recoveringWebView = false;
+    }
+  }
+
+  Future<void> _copyDiagnosticLog() async {
+    try {
+      final log = await _appLog.readAll();
+      await Clipboard.setData(
+        ClipboardData(text: log.isEmpty ? 'No app log entries yet.' : log),
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('App diagnostic log copied')),
+        );
+      }
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'Diagnostics',
+          'Copy log failed',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  // The Android Storage Access Framework is used directly. file_picker 8.x can
+  // report a chosen filename even if zero bytes were saved by the provider.
+  Future<void> _exportDiagnosticLog() async {
+    try {
+      final log = await _appLog.readAll();
+      if (log.trim().isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('App Log is empty; nothing to export. Try Copy App Log to investigate.')),
+          );
+        }
+        return;
+      }
+      final timestamp = DateTime.now()
+          .toIso8601String()
+          .replaceAll(':', '-')
+          .split('.')
+          .first;
+      final filename = 'spicychat-qol-android-log-$timestamp.txt';
+      final expectedBytes = utf8.encode(log).length;
+
+      final result = await const MethodChannel('uk.drache.spicychatqol/app_info')
+          .invokeMapMethod<String, dynamic>('exportDiagnosticLog', {
+        'filename': filename,
+        'content': log,
+      });
+      if (result?['cancelled'] == true) return;
+      if (result?['ok'] != true ||
+          result?['verified'] != true ||
+          result?['bytes'] != expectedBytes) {
+        throw StateError('App Log export was not byte-verified (expected $expectedBytes bytes).');
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('App Log exported and verified ($expectedBytes bytes).')),
+        );
+      }
+    } catch (e, stackTrace) {
+      unawaited(
+        _appLog.log(
+          'Diagnostics',
+          'Native App Log export failed; log remains available via Copy App Log',
+          level: 'ERROR',
+          error: e,
+          stackTrace: stackTrace,
+        ),
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('App Log export failed: $e. Try Copy App Log instead.')),
+        );
+      }
+    }
+  }
+
+  Future<void> _clearDiagnosticLog() async {
+    try {
+      await _appLog.clear();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('App diagnostic log cleared')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not clear app log: $e')),
+        );
+      }
+    }
+  }
+
+  // ── Quick Menu ─────────────────────────────────────────────
+
+  // DS_ANDROID_V066_COG_GEOMETRY: log only positions/sizes, never chat text.
+  // This is triggered solely when the user opens/changes the native cog position.
+  Future<void> _logCogComposerGeometry(String phase) async {
+    final controller = _webController;
+    if (controller == null || !_isChatUrl(_lastKnownUrl)) return;
+    try {
+      final data = await controller.evaluateJavascript(source: r'''(() => {
+        const rect = selector => {
+          const el = document.querySelector(selector);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return [Math.round(r.x), Math.round(r.y),
+            Math.round(r.width), Math.round(r.height)];
+        };
+        return JSON.stringify({
+          viewport: [Math.round(window.innerWidth), Math.round(window.innerHeight)],
+          visualViewport: window.visualViewport
+            ? [Math.round(window.visualViewport.width), Math.round(window.visualViewport.height)]
+            : null,
+          textarea: rect('textarea[placeholder], textarea[aria-label]'),
+          send: rect('button[type="submit"], button[aria-label*="send" i]'),
+          ooc: rect('.ds-chat-ooc-shortcut'),
+          attachment: rect('button[aria-label="Plus-button"], button[aria-label="generate-image"]'),
+          visibleMessageEditors: document.querySelectorAll('div[id^="message-"] textarea').length
+        });
+      })()''');
+      final value = data?.toString() ?? '';
+      if (value.isNotEmpty) {
+        await _appLog.log('AndroidUI',
+          'Cog/composer geometry $phase: '
+          '${value.length > 850 ? value.substring(0, 850) : value}');
+      }
+    } catch (_) {
+      // Geometry logging is optional and must never affect the chat UI.
+    }
+  }
+
+  Future<void> _showAndroidCogPositionPicker() async {
+    if (!mounted) return;
+
+    final androidUi = Provider.of<AndroidUiService>(
+      context,
+      listen: false,
+    );
+
+    unawaited(_logCogComposerGeometry('before-picker'));
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      backgroundColor: const Color(0xFF1A1A2E),
+      builder: (sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(
+                title: Text(
+                  'Move Android cog',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                subtitle: Text(
+                  'Choose where the native QoL button should sit.',
+                  style: TextStyle(color: Colors.white60),
+                ),
+              ),
+              RadioGroup<String>(
+                groupValue: androidUi.controlsPosition,
+                onChanged: (next) {
+                  if (next != null) {
+                    Navigator.of(sheetContext).pop(next);
+                  }
+                },
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final value in AndroidUiService.allowedPositions)
+                      RadioListTile<String>(
+                        value: value,
+                        title: Text(
+                          AndroidUiService.labelFor(value),
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (!mounted || selected == null) return;
+
+    await androidUi.setControlsPosition(selected);
+    await _syncAndroidChatHeaderGear();
+    _scheduleAndroidTopBarGearPosition(reason: 'settings');
+    Future<void>.delayed(const Duration(milliseconds: 300), () {
+      if (mounted) {
+        unawaited(_logCogComposerGeometry('after-picker'));
+      }
+    });
+
+    if (mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Android cog: ${AndroidUiService.labelFor(selected)}',
+          ),
+          duration: const Duration(seconds: 1),
+        ),
+      );
+    }
+  }
+  // v0.2.48: Android has no browser-action popup. Reuse the QoL content
+  // script's existing BG dialog via the APK-owned runtime message dispatcher.
+  // No polling, DOM scans, duplicate background controls or new JS observers.
+  Future<void> _openAndroidChatBackgroundMenu() async {
+    final controller = _webController;
+    if (!mounted || controller == null || !_isChatUrl(_lastKnownUrl)) return;
+    if (!await _isCurrentUrlTrusted(controller)) return;
+
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r'''(async () => {
+          try {
+            const dispatch = window.__dsAndroidDispatchRuntimeMessage;
+            if (typeof dispatch !== "function") {
+              return JSON.stringify({ ok: false, reason: "bridge" });
+            }
+            const response = await dispatch({ type: "DS_OPEN_CHAT_BACKGROUND_MENU" });
+            return JSON.stringify({
+              ok: response?.ok === true,
+              reason: response?.ok === true ? "" : "disabled"
+            });
+          } catch (error) {
+            return JSON.stringify({ ok: false, reason: "error" });
+          }
+        })()''',
+      );
+
+      final data = raw is String ? jsonDecode(raw) : raw;
+      if (data is Map && data['ok'] == true) return;
+      if (!mounted) return;
+      final reason = data is Map ? data['reason']?.toString() : null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(reason == 'bridge'
+              ? 'QoL has not loaded yet. Open a chat and retry.'
+              : 'Enable a Custom Pictures feature in QoL Options to use this menu.'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not open Custom Pictures. Try reloading QoL.'),
+          duration: Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
+
+  // Android v0.2.49 HTTPS background image bridge.
+  // Desktop uses optional host permissions in the extension service worker.
+  // The dedicated Android WebView has no service worker, so the app asks the
+  // user for session-only host consent before its native HTTPS image request.
+  final Set<String> _androidBgApprovedHosts = <String>{};
+
+  bool _androidBgIsPublicAddress(InternetAddress address) {
+    if (address.isLoopback || address.isLinkLocal) return false;
+    final text = address.address.toLowerCase();
+    if (address.type == InternetAddressType.IPv6) {
+      // Globally routable IPv6 unicast (2000::/3); no local/mapped addresses.
+      return text.startsWith('2') || text.startsWith('3');
+    }
+    if (address.type != InternetAddressType.IPv4) return false;
+    final parts = text.split('.').map(int.tryParse).toList();
+    if (parts.length != 4 || parts.any((v) => v == null || v < 0 || v > 255)) {
+      return false;
+    }
+    final a = parts[0]!, b = parts[1]!;
+    return a != 0 && a != 10 && a != 127 && a < 224 &&
+        !(a == 100 && b >= 64 && b <= 127) &&
+        !(a == 169 && b == 254) &&
+        !(a == 172 && b >= 16 && b <= 31) &&
+        !(a == 192 && (b == 0 || b == 168)) &&
+        !(a == 198 && (b == 18 || b == 19 || b == 51)) &&
+        !(a == 203 && b == 0);
+  }
+
+  Future<Uri?> _androidBgPublicUrl(String raw) async {
+    final uri = Uri.tryParse(raw.trim());
+    if (uri == null || uri.scheme != 'https' || uri.userInfo.isNotEmpty ||
+        uri.host.isEmpty || uri.toString().length > 2048 ||
+        (uri.hasPort && uri.port != 443)) {
+      return null;
+    }
+    final host = uri.host.toLowerCase();
+    // No numeric/local hosts, intranet names, or nonstandard hostnames.
+    if (InternetAddress.tryParse(host) != null ||
+        !RegExp(r'^[a-z0-9-]+(?:\.[a-z0-9-]+)+$').hasMatch(host) ||
+        host.endsWith('.local') || host.endsWith('.internal') ||
+        host.endsWith('.localhost') || host.endsWith('.test') ||
+        host.endsWith('.example') || host.endsWith('.invalid')) {
+      return null;
+    }
+    try {
+      final addresses = await InternetAddress.lookup(host)
+          .timeout(const Duration(seconds: 8));
+      if (addresses.isEmpty || addresses.any((ip) => !_androidBgIsPublicAddress(ip))) {
+        return null;
+      }
+      return uri;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _androidBgImageType(Uint8List bytes) {
+    if (bytes.length < 12) return null;
+    if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e &&
+        bytes[3] == 0x47 && bytes[4] == 0x0d && bytes[5] == 0x0a) {
+      return 'image/png';
+    }
+    if (bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff) return 'image/jpeg';
+    if (bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 &&
+        bytes[3] == 0x38 && (bytes[4] == 0x37 || bytes[4] == 0x39)) {
+      return 'image/gif';
+    }
+    if (bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 &&
+        bytes[3] == 0x46 && bytes[8] == 0x57 && bytes[9] == 0x45 &&
+        bytes[10] == 0x42 && bytes[11] == 0x50) {
+      return 'image/webp';
+    }
+    if (bytes[0] == 0x42 && bytes[1] == 0x4d) return 'image/bmp';
+    if (bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 &&
+        bytes[7] == 0x70 && bytes[8] == 0x61 && bytes[9] == 0x76 &&
+        bytes[10] == 0x69 && (bytes[11] == 0x66 || bytes[11] == 0x73)) {
+      return 'image/avif';
+    }
+    return null; // In particular never return HTML or SVG as image content.
+  }
+
+  Future<Map<String, dynamic>> _androidBgRuntimeMessage(dynamic message) async {
+    const limit = 8 * 1024 * 1024;
+    if (message is! Map) return {'ok': false, 'error': 'Invalid background request.'};
+    final type = (message['type'] ?? '').toString();
+    final uri = await _androidBgPublicUrl((message['url'] ?? '').toString());
+    if (uri == null) {
+      return {'ok': false, 'error': 'Use a public HTTPS image URL with a valid host.'};
+    }
+    final host = uri.host.toLowerCase();
+    if (type == 'DS_BG_REQUEST_IMAGE_PERMISSION') {
+      if (_androidBgApprovedHosts.contains(host)) return {'ok': true};
+      if (!mounted) return {'ok': false, 'error': 'App is not ready.'};
+      final allowed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Allow background image download?'),
+          content: Text('Allow QoL to download an image from $host? '
+              'Permission lasts until the app closes. No SpicyChat '
+              'account details or cookies will be sent to this site.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Allow this host'),
+            ),
+          ],
+        ),
+      );
+      if (allowed != true) return {'ok': false, 'error': 'Image host permission denied.'};
+      _androidBgApprovedHosts.add(host);
+      return {'ok': true};
+    }
+    if (type != 'DS_BG_FETCH_IMAGE_URL') {
+      return {'ok': false, 'error': 'Unsupported background request.'};
+    }
+    if (!_androidBgApprovedHosts.contains(host)) {
+      return {'ok': false, 'requiresPermission': true, 'origin': 'https://$host/*'};
+    }
+
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client.getUrl(uri).timeout(const Duration(seconds: 12));
+      request.followRedirects = false; // Redirects must not bypass host consent.
+      request.headers.set(HttpHeaders.acceptHeader,
+          'image/png,image/jpeg,image/webp,image/gif,image/avif,image/bmp');
+      final response = await request.close().timeout(const Duration(seconds: 15));
+      if (response.statusCode != HttpStatus.ok) {
+        return {'ok': false, 'error': 'Image server returned HTTP ${response.statusCode}. Redirects are not followed on Android.'};
+      }
+      if (response.contentLength > limit) {
+        return {'ok': false, 'error': 'Image exceeds the 8 MB limit.'};
+      }
+      final contentType = (response.headers.value(HttpHeaders.contentTypeHeader) ?? '')
+          .split(';').first.trim().toLowerCase();
+      if (contentType.isNotEmpty && contentType != 'application/octet-stream' &&
+          !contentType.startsWith('image/')) {
+        return {'ok': false, 'error': 'The URL did not return an image.'};
+      }
+      final buffer = await response.fold<BytesBuilder>(BytesBuilder(copy: false),
+          (builder, chunk) {
+        if (builder.length + chunk.length > limit) {
+          throw const FormatException('Image exceeds the 8 MB limit.');
+        }
+        builder.add(chunk);
+        return builder;
+      }).timeout(const Duration(seconds: 30));
+      final bytes = buffer.takeBytes();
+      final mime = _androidBgImageType(bytes);
+      if (mime == null) {
+        return {'ok': false, 'error': 'Only PNG, JPG, GIF, WebP, AVIF, or BMP images are supported.'};
+      }
+      final lastPath = uri.pathSegments.isNotEmpty ? uri.pathSegments.last : '';
+      final name = lastPath.replaceAll(RegExp(r'[^a-zA-Z0-9._ -]'), '_');
+      return {
+        'ok': true,
+        'dataUrl': 'data:$mime;base64,${base64Encode(bytes)}',
+        'name': name.isEmpty ? 'Background image' : name.substring(0, name.length > 90 ? 90 : name.length),
+      };
+    } on FormatException catch (error) {
+      return {'ok': false, 'error': error.message};
+    } catch (_) {
+      return {'ok': false, 'error': 'Image download failed. Check the URL and connection.'};
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  // DS_ANDROID_NOV08_SCROLL_CACHE: On-demand only. The floating native menu
+  // remains clickable even when the page's scroll container is locked.
+  // Never reload, recreate the WebView or modify a focused editor here.
+  Future<void> _checkAndUnlockChatScroll() async {
+    final controller = _webController;
+    if (!mounted || controller == null || !_isChatUrl(_lastKnownUrl)) return;
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r'''(() => {
+          // No chat text, conversation ID, or private URL enters this report.
+          if (!/^\/chat\/[^/]+/i.test(location.pathname)) {
+            return JSON.stringify({ status: "not-chat" });
+          }
+          try { window.__dsAndroidCancelMessageLongPress?.(); } catch (_) {}
+          const visible = element => {
+            if (!(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            if (style.display === "none" || style.visibility === "hidden" ||
+                Number(style.opacity) === 0) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 2 && rect.height > 2;
+          };
+          // A real open dialog can legitimately lock background scrolling.
+          const dialog = Array.from(document.querySelectorAll(
+            'dialog[open], [role="dialog"], [aria-modal="true"]'
+          )).slice(0, 20).some(visible);
+          const scrollNodes = Array.from(document.querySelectorAll(
+            'main, [role="main"], [class*="overflow-y-auto"], [class*="overflow-auto"]'
+          )).slice(0, 16);
+          const scrollable = scrollNodes.filter(node => {
+            const style = getComputedStyle(node);
+            return /auto|scroll/.test(style.overflowY) &&
+                node.scrollHeight > node.clientHeight + 12;
+          }).length;
+          const changes = [];
+          if (!dialog) {
+            // Remove only obvious *inline* global gesture/overflow locks.
+            // Do not rewrite CSS classes, internal chat containers, scroll
+            // positions, event listeners, native React nodes or editor styles.
+            for (const [name, element] of [
+              ["html", document.documentElement], ["body", document.body]
+            ]) {
+              if (!element) continue;
+              for (const property of ["touch-action", "overflow", "overflow-y"]) {
+                const value = element.style.getPropertyValue(property).trim().toLowerCase();
+                if ((property === "touch-action" && value === "none") ||
+                    (property !== "touch-action" && value === "hidden")) {
+                  element.style.removeProperty(property);
+                  changes.push(name + ":" + property);
+                }
+              }
+            }
+          }
+          const body = document.body;
+          const html = document.documentElement;
+          return JSON.stringify({
+            status: dialog ? "dialog-open" : changes.length ? "inline-locks-cleared" : "no-inline-lock",
+            changed: changes,
+            scrollableCandidates: scrollable,
+            documentCanScroll: !!html && html.scrollHeight > html.clientHeight + 12,
+            bodyCanScroll: !!body && body.scrollHeight > body.clientHeight + 12,
+            bodyOverflow: body ? getComputedStyle(body).overflowY : "unknown",
+            htmlOverflow: html ? getComputedStyle(html).overflowY : "unknown",
+            bodyTouchAction: body ? getComputedStyle(body).touchAction : "unknown"
+          });
+        })()''',
+      ).timeout(const Duration(seconds: 3));
+      dynamic result = raw;
+      if (raw is String) result = jsonDecode(raw);
+      if (result is! Map) throw StateError('scroll diagnosis unavailable');
+      final report = Map<String, dynamic>.from(result);
+      // Only structural flags, never message content or identifiers.
+      unawaited(_appLog.log('ScrollDiagnostic',
+          'Manual chat scroll check: ${jsonEncode(report)}'));
+      if (!mounted) return;
+      final status = report['status']?.toString() ?? '';
+      final message = status == 'inline-locks-cleared'
+          ? 'Removed possible stale page scroll locks. Try scrolling again.'
+          : status == 'dialog-open'
+              ? 'A web dialog is open. Close it before unlocking scrolling.'
+              : status == 'no-inline-lock'
+                  ? 'No inline scroll lock found. A snapshot is in App Log.'
+                  : 'The chat scroll check did not reach a chat page.';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+      );
+    } catch (error) {
+      if (_shouldPersistDiagnostic('android-scroll-manual-check-failed')) {
+        unawaited(_appLog.log('ScrollDiagnostic',
+            'Manual chat scroll check unavailable: $error', level: 'WARN'));
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('WebView did not answer the scroll check. No page changes made.'),
+        duration: Duration(seconds: 4),
+      ));
+    }
+  }
+
+  Future<void> _showQuickMenu({
+    DateTime? requestedAt,
+    DateTime? bridgeReceivedAt,
+    String source = 'native',
+  }) async {
+    if (!mounted || _quickMenuOpen) return;
+
+    final route = _normalizedSpicyChatPath(_lastKnownUrl);
+    final openStartedAt = DateTime.now();
+    _quickMenuOpen = true;
+
+    final requestToOpenMs = requestedAt == null
+        ? null
+        : openStartedAt.millisecondsSinceEpoch -
+            requestedAt.millisecondsSinceEpoch;
+    final bridgeToOpenMs = bridgeReceivedAt == null
+        ? null
+        : openStartedAt.millisecondsSinceEpoch -
+            bridgeReceivedAt.millisecondsSinceEpoch;
+
+    var quickMenuBuildLogged = false;
+
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: const Color(0xFF1A1A2E),
+        isScrollControlled: true,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        builder: (sheetContext) {
+        if (!quickMenuBuildLogged) {
+          quickMenuBuildLogged = true;
+          final sheetBuiltAt = DateTime.now();
+          final openToBuildMs =
+              sheetBuiltAt.millisecondsSinceEpoch -
+              openStartedAt.millisecondsSinceEpoch;
+
+          unawaited(
+            _appLog.log(
+              'QuickMenuTiming',
+              'Native QoL menu built: '
+                  'source=$source route=$route '
+                  'requestToOpenMs=${requestToOpenMs ?? 'unknown'} '
+                  'bridgeToOpenMs=${bridgeToOpenMs ?? 'unknown'} '
+                  'openToBuildMs=$openToBuildMs',
+            ),
+          );
+        }
+
+        final tabsService = Provider.of<AndroidTabsService>(
+          context,
+          listen: false,
+        );
+        return _QuickMenuSheet(
+          tabsEnabled: tabsService.enabled,
+          isChatPage: _isChatUrl(_lastKnownUrl),
+          onAndroidSettings: () {
+          Navigator.pop(sheetContext);
+          _openAndroidSettingsPage();
+        },
+        onMoveCog: () {
+          Navigator.pop(sheetContext);
+          _showAndroidCogPositionPicker();
+        },
+        onChatTabs: () {
+          Navigator.pop(sheetContext);
+          _showAndroidTabs();
+        },
+        onCommandPalette: () {
+          Navigator.pop(sheetContext);
+          _openAndroidCommandPalette();
+        },
+        onFocusMode: () {
+          Navigator.pop(sheetContext);
+          _toggleAndroidFocusMode();
+        },
+        onSettings: () {
+          Navigator.pop(sheetContext);
+          _requestOpenOptionsPage();
+        },
+        onExportChat: () {
+          Navigator.pop(sheetContext);
+          _webController?.evaluateJavascript(
+            source: 'window.DragonScriptQoL?.exportCurrentChat?.();',
+          );
+        },
+        onBlockCurrentBot: () {
+          Navigator.pop(sheetContext);
+          _webController?.evaluateJavascript(
+            source: 'window.DragonScriptQoL?.blockCurrentBot?.();',
+          );
+        },
+        onChatBackground: () {
+          Navigator.pop(sheetContext);
+          unawaited(_openAndroidChatBackgroundMenu());
+        },
+        onReloadScripts: () async {
+          final messenger = ScaffoldMessenger.of(context);
+          Navigator.pop(sheetContext);
+          if (_webController != null) {
+            await _injectScripts(_webController!);
+            messenger.showSnackBar(
+              const SnackBar(
+                content: Text('Scripts re-injected'),
+                duration: Duration(seconds: 1),
+              ),
+            );
+          }
+        },
+        onCheckChatScroll: () {
+          Navigator.pop(sheetContext);
+          unawaited(_checkAndUnlockChatScroll());
+        },
+        onRecoverWebView: () {
+          Navigator.pop(sheetContext);
+          _recoverWebView(reason: 'manual quick-menu recovery');
+        },
+        onCopyLog: () {
+          Navigator.pop(sheetContext);
+          _copyDiagnosticLog();
+        },
+        onExportLog: () {
+          Navigator.pop(sheetContext);
+          _exportDiagnosticLog();
+        },
+        onClearLog: () {
+          Navigator.pop(sheetContext);
+          _clearDiagnosticLog();
+        },
+        onRefresh: () {
+          Navigator.pop(sheetContext);
+          _webController?.reload();
+        },
+      );
+        },
+      );
+    } finally {
+      _quickMenuOpen = false;
+    }
+  }
+}
+
+class _QuickMenuSheet extends StatelessWidget {
+  final bool tabsEnabled;
+  final bool isChatPage;
+  final VoidCallback onAndroidSettings;
+  final VoidCallback onMoveCog;
+  final VoidCallback onChatTabs;
+  final VoidCallback onCommandPalette;
+  final VoidCallback onFocusMode;
+  final VoidCallback onSettings;
+  final VoidCallback onExportChat;
+  final VoidCallback onBlockCurrentBot;
+  final VoidCallback onChatBackground;
+  final VoidCallback onReloadScripts;
+  final VoidCallback onCheckChatScroll;
+  final VoidCallback onRecoverWebView;
+  final VoidCallback onCopyLog;
+  final VoidCallback onExportLog;
+  final VoidCallback onClearLog;
+  final VoidCallback onRefresh;
+
+  const _QuickMenuSheet({
+    required this.tabsEnabled,
+    required this.isChatPage,
+    required this.onAndroidSettings,
+    required this.onMoveCog,
+    required this.onChatTabs,
+    required this.onCommandPalette,
+    required this.onFocusMode,
+    required this.onSettings,
+    required this.onExportChat,
+    required this.onBlockCurrentBot,
+    required this.onChatBackground,
+    required this.onReloadScripts,
+    required this.onCheckChatScroll,
+    required this.onRecoverWebView,
+    required this.onCopyLog,
+    required this.onExportLog,
+    required this.onClearLog,
+    required this.onRefresh,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+          // Drag handle
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.white24,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'SpicyChat QOL',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          _QuickMenuItem(
+            icon: Icons.phone_android,
+            label: 'Android Settings',
+            onTap: onAndroidSettings,
+          ),
+          _QuickMenuItem(
+            icon: Icons.open_with,
+            label: 'Move Android cog',
+            onTap: onMoveCog,
+          ),
+          if (tabsEnabled)
+            _QuickMenuItem(
+              icon: Icons.tab,
+              label: 'Android Chat Tabs',
+              onTap: onChatTabs,
+            ),
+          _QuickMenuItem(
+            icon: Icons.search,
+            label: 'Command Palette',
+            onTap: onCommandPalette,
+          ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.center_focus_strong,
+              label: 'Focus / Immersive Mode',
+              onTap: onFocusMode,
+            ),
+          _QuickMenuItem(
+            icon: Icons.settings,
+            label: 'QOL Options',
+            onTap: onSettings,
+          ),
+          _QuickMenuItem(
+            icon: Icons.download,
+            label: 'Export Chat',
+            onTap: onExportChat,
+          ),
+          _QuickMenuItem(
+            icon: Icons.block,
+            label: 'Block Current Bot',
+            onTap: onBlockCurrentBot,
+          ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.image_outlined,
+              label: 'Custom Pictures',
+              onTap: onChatBackground,
+            ),
+          _QuickMenuItem(
+            icon: Icons.code,
+            label: 'Re-inject Scripts',
+            onTap: onReloadScripts,
+          ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.touch_app,
+              label: 'Check / unlock chat scrolling',
+              onTap: onCheckChatScroll,
+            ),
+          _QuickMenuItem(
+            icon: Icons.healing,
+            label: 'Recover Black Screen',
+            onTap: onRecoverWebView,
+          ),
+          _QuickMenuItem(
+            icon: Icons.copy,
+            label: 'Copy App Log',
+            onTap: onCopyLog,
+          ),
+          _QuickMenuItem(
+            icon: Icons.description_outlined,
+            label: 'Export App Log',
+            onTap: onExportLog,
+          ),
+          _QuickMenuItem(
+            icon: Icons.delete_sweep_outlined,
+            label: 'Clear App Log',
+            onTap: onClearLog,
+          ),
+          _QuickMenuItem(
+            icon: Icons.refresh,
+            label: 'Refresh Page',
+            onTap: onRefresh,
+          ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _QuickMenuItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  const _QuickMenuItem({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Icon(icon, color: Colors.deepPurpleAccent),
+      title: Text(label, style: const TextStyle(color: Colors.white)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      onTap: onTap,
+    );
+  }
+}

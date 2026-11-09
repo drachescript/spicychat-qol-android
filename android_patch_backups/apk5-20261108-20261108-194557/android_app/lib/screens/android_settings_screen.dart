@@ -1,0 +1,860 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:provider/provider.dart';
+
+import '../services/android_tabs_service.dart';
+import '../services/android_ui_service.dart';
+import '../services/android_update_service.dart';
+import '../services/qol_update_service.dart';
+import '../services/js_bundle_service.dart';
+
+class AndroidSettingsScreen extends StatelessWidget {
+  const AndroidSettingsScreen({super.key});
+
+  Future<bool> _confirmEnable(BuildContext context) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Enable Android Chat Tabs?'),
+            content: const Text(
+              'This experimental Android-only feature keeps several chats as '
+              'lightweight tabs while still using a single WebView. Inactive '
+              'tabs store only their URL and scroll position.\n\n'
+              'When disabled, the app keeps its normal single-page navigation '
+              'and no chat-tab state is used.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: const Text('Enable'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  String _formatLastChecked(DateTime? value) {
+    if (value == null) return 'Never';
+
+    final local = value.toLocal();
+    final now = DateTime.now();
+    final difference = now.difference(local);
+
+    if (difference.inSeconds < 60) return 'Just now';
+    if (difference.inMinutes < 60) {
+      final minutes = difference.inMinutes;
+      return '$minutes minute${minutes == 1 ? '' : 's'} ago';
+    }
+    if (difference.inHours < 24) {
+      final hours = difference.inHours;
+      return '$hours hour${hours == 1 ? '' : 's'} ago';
+    }
+
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)} '
+        '${two(local.hour)}:${two(local.minute)}';
+  }
+
+  String _updateStatusText(AndroidUpdateService updates) {
+    if (updates.downloading) {
+      final progress = updates.downloadProgress;
+      if (progress == null) return 'Downloading update inside the app…';
+      final percent = (progress * 100).round().clamp(0, 100);
+      return 'Downloading update… $percent%';
+    }
+
+    if (updates.installMessage?.trim().isNotEmpty == true) {
+      return updates.installMessage!;
+    }
+
+    if (updates.checking) return 'Checking for updates…';
+
+    switch (updates.status) {
+      case AndroidUpdateStatus.updateAvailable:
+        final latest = updates.latest;
+        return latest == null
+            ? 'A newer Android app version is available.'
+            : 'Update available: v${latest.versionName}';
+      case AndroidUpdateStatus.upToDate:
+        return 'You are up to date.';
+      case AndroidUpdateStatus.error:
+        return updates.errorMessage ?? 'The update check failed.';
+      case AndroidUpdateStatus.checking:
+        return 'Checking for updates…';
+      case AndroidUpdateStatus.idle:
+        return updates.lastCheckedAt == null
+            ? 'No update check has been run yet.'
+            : 'Automatic update checks are on.';
+    }
+  }
+
+  Future<void> _downloadAndInstallUpdate(
+    BuildContext context,
+    AndroidUpdateService updates,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = updates.hasDownloadedApk
+        ? await updates.installDownloadedUpdate()
+        : await updates.downloadAndInstallLatestApk();
+
+    if (!context.mounted) return;
+
+    if (ok) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Android installer opened. Confirm the update to finish.',
+          ),
+          duration: Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    if (updates.installMessage?.trim().isNotEmpty == true) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(updates.installMessage!),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+      return;
+    }
+
+    if (updates.errorMessage?.trim().isNotEmpty == true) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(updates.errorMessage!),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    }
+  }
+
+  Future<void> _runManualUpdateCheck(
+    BuildContext context,
+    AndroidUpdateService updates,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    await updates.checkForUpdates(manual: true);
+
+    if (!context.mounted) return;
+
+    if (updates.updateAvailable) {
+      final latest = updates.latest;
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            latest == null
+                ? 'Android update available.'
+                : 'Android update available: v${latest.versionName}',
+          ),
+          action: SnackBarAction(
+            label: 'DOWNLOAD',
+            onPressed: () {
+              unawaited(_downloadAndInstallUpdate(context, updates));
+            },
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (updates.status == AndroidUpdateStatus.upToDate) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('You already have the latest Android app version.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    if (updates.status == AndroidUpdateStatus.error) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(updates.errorMessage ?? 'Update check failed.'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+  }
+
+  // DS_ANDROID_NOV08_SCROLL_CACHE: This API clears WebView HTTP resources,
+  // never app settings, QoL storage, IndexedDB, cookies or chat history.
+  Future<void> _clearWebViewResourceCache(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Clear WebView resource cache?'),
+        content: const Text(
+          'Removes cached website resources (images, scripts and other HTTP '
+          'responses) used by this app. It will not clear accounts, cookies, '
+          'local QoL settings, backups or downloaded QoL bundles. '
+          'Some website resources may download again. The current chat is not reloaded.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Clear resource cache'),
+          ),
+        ],
+      ),
+    ) ?? false;
+    if (!confirmed) return;
+    try {
+      await InAppWebViewController.clearAllCache(includeDiskFiles: true);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('WebView resource cache cleared. Stored data was not touched.'),
+      ));
+    } catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not clear resource cache: $error'),
+      ));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tabs = context.watch<AndroidTabsService>();
+    final androidUi = context.watch<AndroidUiService>();
+    final updates = context.watch<AndroidUpdateService>();
+    final qolUpdates = context.watch<QolUpdateService>();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Android Settings'),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.only(bottom: 32),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+            child: Text(
+              'ANDROID-ONLY FEATURES',
+              style: TextStyle(
+                color: Colors.deepPurpleAccent.withValues(alpha: 0.85),
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.1,
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(
+                        Icons.extension,
+                        color: Colors.deepPurpleAccent,
+                      ),
+                      SizedBox(width: 10),
+                      Text(
+                        'QoL updates',
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    qolUpdates.hasDownloadedBundle
+                        ? 'Downloaded QoL bundle: v${qolUpdates.activeVersion}'
+                        : 'QoL APK fallback: v${JsBundleService.bundledExtensionVersion}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'An already-open chat may still run the version injected on '
+                    'its last full page load. The App Log records that version.',
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Source: ${qolUpdates.updateChannel}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Experimental QoL updates'),
+                    subtitle: const Text(
+                      'OFF: published stable releases. ON: untested main branch changes.',
+                    ),
+                    value: qolUpdates.experimentalChannel,
+                    onChanged: qolUpdates.checking
+                        ? null
+                        : (enabled) async {
+                            await qolUpdates.setExperimentalChannel(enabled);
+                          },
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Automatic checks: every 12 hours',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Last checked: '
+                    '${_formatLastChecked(qolUpdates.lastCheckedAt)}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.04),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      qolUpdates.checking
+                          ? 'Checking for QoL updates…'
+                          : qolUpdates.status == QolUpdateStatus.updated
+                              ? 'Newest QoL files downloaded. They are now '
+                                  'the active bundle for new page loads.'
+                              : qolUpdates.status == QolUpdateStatus.upToDate
+                                  ? 'QoL files are up to date.'
+                                  : qolUpdates.status == QolUpdateStatus.error
+                                      ? (qolUpdates.errorMessage ??
+                                          'QoL update check failed.')
+                                      : 'The app automatically downloads '
+                                          'new shared QoL files without an '
+                                          'APK update.',
+                      style: TextStyle(
+                        color: qolUpdates.status == QolUpdateStatus.error
+                            ? Colors.redAccent
+                            : qolUpdates.status == QolUpdateStatus.updated
+                                ? Colors.lightGreenAccent
+                                : Colors.white70,
+                        fontSize: 13,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: qolUpdates.checking
+                        ? null
+                        : () async {
+                            final messenger =
+                                ScaffoldMessenger.of(context);
+                            await qolUpdates.checkForUpdates(manual: true);
+                            if (!context.mounted) return;
+
+                            if (qolUpdates.status ==
+                                QolUpdateStatus.updated) {
+                              messenger.showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'QoL updated to '
+                                    'v${qolUpdates.activeVersion}.',
+                                  ),
+                                ),
+                              );
+                            } else if (qolUpdates.status ==
+                                QolUpdateStatus.upToDate) {
+                              messenger.showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'QoL files are already up to date.',
+                                  ),
+                                  duration: Duration(seconds: 2),
+                                ),
+                              );
+                            } else if (qolUpdates.status ==
+                                QolUpdateStatus.error) {
+                              messenger.showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    qolUpdates.errorMessage ??
+                                        'QoL update check failed.',
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                    icon: qolUpdates.checking
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Icon(Icons.sync),
+                    label: Text(
+                      qolUpdates.checking
+                          ? 'Checking…'
+                          : 'Check QoL updates now',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: qolUpdates.checking ? null : () async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      try {
+                        final oldDownloaded = await qolUpdates.restoreWorkingBundle();
+                        if (!context.mounted) return;
+                        messenger.showSnackBar(SnackBar(content: Text(
+                          oldDownloaded
+                              ? 'Previous QoL bundle restored. Reload SpicyChat to use it.'
+                              : 'APK-bundled QoL fallback restored. Reload SpicyChat to use it.',
+                        )));
+                      } catch (error) {
+                        if (!context.mounted) return;
+                        messenger.showSnackBar(SnackBar(content: Text(
+                          'QoL recovery failed: $error',
+                        )));
+                      }
+                    },
+                    icon: const Icon(Icons.restore),
+                    label: const Text('Restore working QoL version'),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Stable updates follow published QoL releases. '
+                    'It downloads the shared runtime, CSS, Options page and '
+                    'support files into app storage. The APK-owned Android '
+                    'bridge stays bundled for safety. A newly downloaded '
+                    'runtime is used automatically on the next full page load '
+                    'or app restart.',
+                    style: TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          // Resource cache only: deliberately not Android app-data cleanup.
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('WebView resource cache',
+                      style: TextStyle(fontSize: 16)),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Clears only cached website resources. Preserves your '
+                    'signed-in account, QoL settings, blocked/Later lists, '
+                    'local backups and downloaded extensions. No page reload.',
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () => _clearWebViewResourceCache(context),
+                    icon: const Icon(Icons.cleaning_services_outlined),
+                    label: const Text('Clear resource cache only'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(
+                        Icons.system_update_alt,
+                        color: Colors.deepPurpleAccent,
+                      ),
+                      SizedBox(width: 10),
+                      Text(
+                        'Android app updates',
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    updates.currentVersionCode > 0
+                        ? 'Installed: v${updates.currentVersionName} '
+                            '(${updates.currentVersionCode})'
+                        : 'Installed: v${updates.currentVersionName}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Automatic checks: every 12 hours',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Last checked: ${_formatLastChecked(updates.lastCheckedAt)}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.04),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      _updateStatusText(updates),
+                      style: TextStyle(
+                        color: updates.status ==
+                                AndroidUpdateStatus.updateAvailable
+                            ? Colors.amberAccent
+                            : updates.status == AndroidUpdateStatus.error
+                                ? Colors.redAccent
+                                : Colors.white70,
+                        fontSize: 13,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: updates.checking || updates.downloading
+                            ? null
+                            : () => _runManualUpdateCheck(
+                                  context,
+                                  updates,
+                                ),
+                        icon: updates.checking
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.refresh),
+                        label: Text(
+                          updates.checking
+                              ? 'Checking…'
+                              : 'Check for updates now',
+                        ),
+                      ),
+                      if (updates.updateAvailable || updates.hasDownloadedApk)
+                        OutlinedButton.icon(
+                          onPressed: updates.downloading
+                              ? null
+                              : () => _downloadAndInstallUpdate(
+                                    context,
+                                    updates,
+                                  ),
+                          icon: updates.downloading
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : Icon(
+                                  updates.hasDownloadedApk
+                                      ? Icons.install_mobile
+                                      : Icons.download,
+                                ),
+                          label: Text(
+                            updates.downloading
+                                ? 'Downloading…'
+                                : updates.hasDownloadedApk
+                                    ? 'Install downloaded update'
+                                    : 'Download & install',
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'The app checks for Android updates automatically every '
+                    '12 hours. When an update is available, it downloads the '
+                    'APK inside the app and hands it directly to Android’s '
+                    'installer. No GitHub/browser page is opened. Android will '
+                    'still ask you to confirm the install.',
+                    style: TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Native QoL controls position',
+                    style: TextStyle(fontSize: 16),
+                  ),
+                  const SizedBox(height: 5),
+                  const Text(
+                    'Choose where the Android gear sits. SpicyChat top bar '
+                    'places it immediately left of the language/globe control '
+                    'on Home, and immediately left of the rating button in '
+                    'chats. The optional chat-tabs button remains a small '
+                    'floating control.',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                      height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: androidUi.controlsPosition,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Position',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (value) {
+                      if (value != null) {
+                        androidUi.setControlsPosition(value);
+                      }
+                    },
+                    items: AndroidUiService.allowedPositions
+                        .map(
+                          (value) => DropdownMenuItem<String>(
+                            value: value,
+                            child: Text(
+                              AndroidUiService.labelFor(value),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Default page on app launch',
+                    style: TextStyle(fontSize: 16),
+                  ),
+                  const SizedBox(height: 5),
+                  const Text(
+                    'Used when Android is not restoring a saved chat tab. '
+                    'Home is SpicyChat\'s current `/` route.',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                      height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: androidUi.defaultStartPage,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Start page',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (value) {
+                      if (value != null) {
+                        androidUi.setDefaultStartPage(value);
+                      }
+                    },
+                    items: AndroidUiService.startPages.keys
+                        .map(
+                          (value) => DropdownMenuItem<String>(
+                            value: value,
+                            child: Text(
+                              AndroidUiService.labelForStartPage(value),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: SwitchListTile(
+              title: const Text('Allow pinch-to-zoom'),
+              subtitle: const Text(
+                'Let SpicyChat pages be manually zoomed with pinch gestures. '
+                'Disabled by default.',
+              ),
+              value: androidUi.zoomEnabled,
+              onChanged: androidUi.setZoomEnabled,
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: SwitchListTile(
+              title: const Text('Multiple Android chat tabs'),
+              subtitle: const Text(
+                'Opt-in. Keeps one WebView active and stores inactive chats '
+                'as lightweight tab state.',
+              ),
+              value: tabs.enabled,
+              onChanged: (value) async {
+                if (value && !await _confirmEnable(context)) return;
+                await tabs.setEnabled(value);
+              },
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: SwitchListTile(
+              title: const Text('Restore tabs after restart'),
+              subtitle: const Text(
+                'Reopen the saved Android tab list the next time the app starts.',
+              ),
+              value: tabs.restoreAfterRestart,
+              onChanged: tabs.enabled
+                  ? (value) => tabs.setRestoreAfterRestart(value)
+                  : null,
+            ),
+          ),
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: ListTile(
+              enabled: tabs.enabled,
+              title: const Text('Maximum chat tabs'),
+              subtitle: Text(
+                tabs.enabled
+                    ? '${tabs.maxChatTabs} chat tabs + Home'
+                    : 'Enable Multiple Android chat tabs first',
+              ),
+              trailing: DropdownButton<int>(
+                value: tabs.maxChatTabs,
+                onChanged: tabs.enabled
+                    ? (value) {
+                        if (value != null) {
+                          tabs.setMaxChatTabs(value);
+                        }
+                      }
+                    : null,
+                items: const [3, 5, 8, 12]
+                    .map(
+                      (value) => DropdownMenuItem<int>(
+                        value: value,
+                        child: Text('$value'),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          ),
+          if (tabs.enabled)
+            Card(
+              margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              child: ListTile(
+                leading: const Icon(Icons.delete_sweep_outlined),
+                title: const Text('Clear saved chat tabs'),
+                subtitle: Text(
+                  '${tabs.chatTabCount} chat tab'
+                  '${tabs.chatTabCount == 1 ? '' : 's'} currently stored',
+                ),
+                onTap: () async {
+                  final confirmed = await showDialog<bool>(
+                        context: context,
+                        builder: (dialogContext) => AlertDialog(
+                          title: const Text('Clear chat tabs?'),
+                          content: const Text(
+                            'This only clears Android tab state. It does not '
+                            'delete any SpicyChat chats.',
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () =>
+                                  Navigator.of(dialogContext).pop(false),
+                              child: const Text('Cancel'),
+                            ),
+                            FilledButton(
+                              onPressed: () =>
+                                  Navigator.of(dialogContext).pop(true),
+                              child: const Text('Clear'),
+                            ),
+                          ],
+                        ),
+                      ) ??
+                      false;
+
+                  if (confirmed) {
+                    await tabs.clearTabs();
+                  }
+                },
+              ),
+            ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(20, 14, 20, 0),
+            child: Text(
+              'Chat tabs are Android-only and do not change the desktop '
+              'extension. Disabling the feature returns to the normal '
+              'single-WebView behavior.',
+              style: TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

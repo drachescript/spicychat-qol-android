@@ -5121,6 +5121,187 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  // DS_ANDROID_NOV08_SCROLL_CACHE: On-demand only. The floating native menu
+  // remains clickable even when the page's scroll container is locked.
+  // Never reload, recreate the WebView or modify a focused editor here.
+  Future<void> _checkAndUnlockChatScroll() async {
+    final controller = _webController;
+    if (!mounted || controller == null || !_isChatUrl(_lastKnownUrl)) return;
+    try {
+      final raw = await controller.evaluateJavascript(
+        source: r'''(() => {
+          // No chat text, conversation ID, or private URL enters this report.
+          if (!/^\/chat\/[^/]+/i.test(location.pathname)) {
+            return JSON.stringify({ status: "not-chat" });
+          }
+          try { window.__dsAndroidCancelMessageLongPress?.(); } catch (_) {}
+          const visible = element => {
+            if (!(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            if (style.display === "none" || style.visibility === "hidden" ||
+                Number(style.opacity) === 0) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 2 && rect.height > 2;
+          };
+          // A real open dialog can legitimately lock background scrolling.
+          const dialog = Array.from(document.querySelectorAll(
+            'dialog[open], [role="dialog"], [aria-modal="true"]'
+          )).slice(0, 20).some(visible);
+          const scrollNodes = Array.from(document.querySelectorAll(
+            'main, [role="main"], [class*="overflow-y-auto"], [class*="overflow-auto"]'
+          )).slice(0, 16);
+          const scrollable = scrollNodes.filter(node => {
+            const style = getComputedStyle(node);
+            return /auto|scroll/.test(style.overflowY) &&
+                node.scrollHeight > node.clientHeight + 12;
+          }).length;
+          const changes = [];
+          if (!dialog) {
+            // Remove only obvious *inline* global gesture/overflow locks.
+            // Do not rewrite CSS classes, internal chat containers, scroll
+            // positions, event listeners, native React nodes or editor styles.
+            for (const [name, element] of [
+              ["html", document.documentElement], ["body", document.body]
+            ]) {
+              if (!element) continue;
+              for (const property of ["touch-action", "overflow", "overflow-y"]) {
+                const value = element.style.getPropertyValue(property).trim().toLowerCase();
+                if ((property === "touch-action" && value === "none") ||
+                    (property !== "touch-action" && value === "hidden")) {
+                  element.style.removeProperty(property);
+                  changes.push(name + ":" + property);
+                }
+              }
+            }
+          }
+          const body = document.body;
+          const html = document.documentElement;
+          return JSON.stringify({
+            status: dialog ? "dialog-open" : changes.length ? "inline-locks-cleared" : "no-inline-lock",
+            changed: changes,
+            scrollableCandidates: scrollable,
+            documentCanScroll: !!html && html.scrollHeight > html.clientHeight + 12,
+            bodyCanScroll: !!body && body.scrollHeight > body.clientHeight + 12,
+            bodyOverflow: body ? getComputedStyle(body).overflowY : "unknown",
+            htmlOverflow: html ? getComputedStyle(html).overflowY : "unknown",
+            bodyTouchAction: body ? getComputedStyle(body).touchAction : "unknown"
+          });
+        })()''',
+      ).timeout(const Duration(seconds: 3));
+      dynamic result = raw;
+      if (raw is String) result = jsonDecode(raw);
+      if (result is! Map) throw StateError('scroll diagnosis unavailable');
+      final report = Map<String, dynamic>.from(result);
+      // Only structural flags, never message content or identifiers.
+      unawaited(_appLog.log('ScrollDiagnostic',
+          'Manual chat scroll check: ${jsonEncode(report)}'));
+      if (!mounted) return;
+      final status = report['status']?.toString() ?? '';
+      final message = status == 'inline-locks-cleared'
+          ? 'Removed possible stale page scroll locks. Try scrolling again.'
+          : status == 'dialog-open'
+              ? 'A web dialog is open. Close it before unlocking scrolling.'
+              : status == 'no-inline-lock'
+                  ? 'No inline scroll lock found. A snapshot is in App Log.'
+                  : 'The chat scroll check did not reach a chat page.';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+      );
+    } catch (error) {
+      if (_shouldPersistDiagnostic('android-scroll-manual-check-failed')) {
+        unawaited(_appLog.log('ScrollDiagnostic',
+            'Manual chat scroll check unavailable: $error', level: 'WARN'));
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('WebView did not answer the scroll check. No page changes made.'),
+        duration: Duration(seconds: 4),
+      ));
+    }
+  }
+
+
+  // DS_ANDROID_20261108_SCROLL_RECOVERY: manual action; no reload or editor reset.
+  Future<void> _checkUnlockChatScroll() async {
+    final controller = _webController;
+    if (controller == null || !mounted) return;
+    try {
+      final raw = await controller.evaluateJavascript(source: r'''(() => {
+        const html = document.documentElement;
+        const body = document.body;
+        const visible = el => {
+          if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          const css = getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 &&
+            css.display !== "none" && css.visibility !== "hidden";
+        };
+        const hasModal = Array.from(document.querySelectorAll(
+          'dialog[open], [role="dialog"][aria-modal="true"], [aria-modal="true"]'
+        )).some(visible);
+        const describe = el => {
+          if (!el) return null;
+          const css = getComputedStyle(el);
+          return { overflow: css.overflow, overflowY: css.overflowY,
+            touchAction: css.touchAction, position: css.position,
+            scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+            inlineOverflow: el.style.getPropertyValue("overflow"),
+            inlineOverflowY: el.style.getPropertyValue("overflow-y"),
+            inlineTouchAction: el.style.getPropertyValue("touch-action") };
+        };
+        const before = { html: describe(html), body: describe(body) };
+        const repairs = [];
+        if (!hasModal) for (const [name, el] of [["html", html], ["body", body]]) {
+          if (!el) continue;
+          for (const prop of ["overflow", "overflow-y"]) {
+            if (el.style.getPropertyValue(prop).trim().toLowerCase() === "hidden") {
+              el.style.removeProperty(prop);
+              repairs.push(name + "." + prop);
+            }
+          }
+          if (el.style.getPropertyValue("touch-action").trim().toLowerCase() === "none") {
+            el.style.removeProperty("touch-action");
+            repairs.push(name + ".touch-action");
+          }
+        }
+        const scrollables = [];
+        for (const el of Array.from(document.querySelectorAll(
+          "main, [role='main'], [role='log'], [class*='overflow-y-auto'], " +
+          "[class*='overflow-auto'], [class*='overflow-y-scroll']"
+        )).slice(0, 180)) {
+          if (scrollables.length >= 8) break;
+          if (!visible(el) || el.scrollHeight <= el.clientHeight + 24) continue;
+          const css = getComputedStyle(el);
+          scrollables.push({tag: el.tagName.toLowerCase(), overflowY: css.overflowY,
+            touchAction: css.touchAction, scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight});
+        }
+        const hit = document.elementFromPoint(
+          Math.floor(innerWidth / 2), Math.floor(innerHeight * 0.55));
+        return JSON.stringify({chat: location.pathname.startsWith("/chat/"),
+          hasModal, repairs, before, after: {html: describe(html), body: describe(body)},
+          scrollables, hitTag: hit?.tagName?.toLowerCase() || "",
+          viewport: [innerWidth, innerHeight],
+          activeEditor: !!document.querySelector(
+            "textarea:focus, input:focus, [contenteditable='true']:focus")});
+      })()''');
+      final result = raw?.toString() ?? '';
+      await _appLog.log('ScrollRecovery',
+        'Manual check: ${result.length > 3200 ? result.substring(0, 3200) : result}');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Scroll checked. Try swiping again; details in App Log.')));
+    } catch (error, stackTrace) {
+      unawaited(_appLog.log('ScrollRecovery', 'Manual check failed',
+        level: 'WARN', error: error, stackTrace: stackTrace));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Scroll check failed; see App Log.')),
+        );
+      }
+    }
+  }
+
   Future<void> _showQuickMenu({
     DateTime? requestedAt,
     DateTime? bridgeReceivedAt,
@@ -5231,6 +5412,14 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
             );
           }
         },
+        onCheckChatScroll: () {
+          Navigator.pop(sheetContext);
+          unawaited(_checkAndUnlockChatScroll());
+        },
+        onCheckUnlockScroll: () {
+          Navigator.pop(sheetContext);
+          unawaited(_checkUnlockChatScroll());
+        },
         onRecoverWebView: () {
           Navigator.pop(sheetContext);
           _recoverWebView(reason: 'manual quick-menu recovery');
@@ -5273,6 +5462,8 @@ class _QuickMenuSheet extends StatelessWidget {
   final VoidCallback onBlockCurrentBot;
   final VoidCallback onChatBackground;
   final VoidCallback onReloadScripts;
+  final VoidCallback onCheckChatScroll;
+  final VoidCallback onCheckUnlockScroll;
   final VoidCallback onRecoverWebView;
   final VoidCallback onCopyLog;
   final VoidCallback onExportLog;
@@ -5292,6 +5483,8 @@ class _QuickMenuSheet extends StatelessWidget {
     required this.onBlockCurrentBot,
     required this.onChatBackground,
     required this.onReloadScripts,
+    required this.onCheckChatScroll,
+    required this.onCheckUnlockScroll,
     required this.onRecoverWebView,
     required this.onCopyLog,
     required this.onExportLog,
@@ -5382,6 +5575,18 @@ class _QuickMenuSheet extends StatelessWidget {
             label: 'Re-inject Scripts',
             onTap: onReloadScripts,
           ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.touch_app,
+              label: 'Check / unlock chat scrolling',
+              onTap: onCheckChatScroll,
+            ),
+          if (isChatPage)
+            _QuickMenuItem(
+              icon: Icons.swap_vert,
+              label: 'Check / unlock chat scrolling',
+              onTap: onCheckUnlockScroll,
+            ),
           _QuickMenuItem(
             icon: Icons.healing,
             label: 'Recover Black Screen',

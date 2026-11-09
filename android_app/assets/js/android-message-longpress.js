@@ -182,21 +182,23 @@
   function temporarilyDisableSelection(root) {
     if (!root) return () => {};
 
-    const previousUserSelect = root.style.userSelect;
-    const previousWebkitUserSelect = root.style.webkitUserSelect;
+    const previousUserSelect = root.style.getPropertyValue("user-select");
+    const previousUserSelectPriority = root.style.getPropertyPriority("user-select");
+    const previousWebkitUserSelect = root.style.getPropertyValue("-webkit-user-select");
+    const previousWebkitUserSelectPriority = root.style.getPropertyPriority("-webkit-user-select");
 
     root.style.setProperty("user-select", "none", "important");
     root.style.setProperty("-webkit-user-select", "none", "important");
 
     return () => {
       if (previousUserSelect) {
-        root.style.userSelect = previousUserSelect;
+        root.style.setProperty("user-select", previousUserSelect, previousUserSelectPriority);
       } else {
         root.style.removeProperty("user-select");
       }
 
       if (previousWebkitUserSelect) {
-        root.style.webkitUserSelect = previousWebkitUserSelect;
+        root.style.setProperty("-webkit-user-select", previousWebkitUserSelect, previousWebkitUserSelectPriority);
       } else {
         root.style.removeProperty("-webkit-user-select");
       }
@@ -217,6 +219,16 @@
 
     active = null;
   }
+
+  // DS_ANDROID_NOV08_SCROLL_CACHE: Interrupted gestures must not leave
+  // a pending long press or a message's temporary selection lock behind.
+  // No polling, touchmove interception, or navigation/reload is involved.
+  window.__dsAndroidCancelMessageLongPress = cancelActive;
+  window.addEventListener("blur", cancelActive, { passive: true });
+  window.addEventListener("pagehide", cancelActive, { passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) cancelActive();
+  }, { passive: true });
 
   function directMessageText(context) {
     const bodyHost = context?.root?.querySelector?.(
@@ -440,6 +452,17 @@
       );
     }
   }
+
+
+  // DS_ANDROID_20261108_LONGPRESS_RESET: cancel interrupted touch selections.
+  const resetInterruptedPress = () => { if (active) cancelActive(); };
+  window.addEventListener("blur", resetInterruptedPress, true);
+  window.addEventListener("pagehide", resetInterruptedPress, true);
+  window.addEventListener("hashchange", resetInterruptedPress, true);
+  window.addEventListener("popstate", resetInterruptedPress, true);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") resetInterruptedPress();
+  }, true);
 
   document.addEventListener(
     "pointerdown",

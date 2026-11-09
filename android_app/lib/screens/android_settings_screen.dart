@@ -1,12 +1,14 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:provider/provider.dart';
 
 import '../services/android_tabs_service.dart';
 import '../services/android_ui_service.dart';
 import '../services/android_update_service.dart';
 import '../services/qol_update_service.dart';
+import '../services/js_bundle_service.dart';
 
 class AndroidSettingsScreen extends StatelessWidget {
   const AndroidSettingsScreen({super.key});
@@ -36,6 +38,46 @@ class AndroidSettingsScreen extends StatelessWidget {
           ),
         ) ??
         false;
+  }
+
+
+  // DS_ANDROID_20261108_RESOURCE_CACHE: never touch cookies or persisted stores.
+  Future<void> _clearResourceCacheOnly(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Clear resource cache only?'),
+            content: const Text(
+              'Removes WebView cached images/pages, not cookies or logins. '
+              'QoL settings, blocked/opened/Later records, native preferences, '
+              'local storage and backups are kept. Other Android cache may remain.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel')),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Clear cache')),
+            ],
+          ),
+        ) ?? false;
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await InAppWebViewController.clearAllCache(includeDiskFiles: true);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Resource cache cleared; saved data kept.')),
+        );
+      }
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Cache cleanup failed: $error')),
+        );
+      }
+    }
   }
 
   String _formatLastChecked(DateTime? value) {
@@ -185,6 +227,46 @@ class AndroidSettingsScreen extends StatelessWidget {
     }
   }
 
+  // DS_ANDROID_NOV08_SCROLL_CACHE: This API clears WebView HTTP resources,
+  // never app settings, QoL storage, IndexedDB, cookies or chat history.
+  Future<void> _clearWebViewResourceCache(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Clear WebView resource cache?'),
+        content: const Text(
+          'Removes cached website resources (images, scripts and other HTTP '
+          'responses) used by this app. It will not clear accounts, cookies, '
+          'local QoL settings, backups or downloaded QoL bundles. '
+          'Some website resources may download again. The current chat is not reloaded.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Clear resource cache'),
+          ),
+        ],
+      ),
+    ) ?? false;
+    if (!confirmed) return;
+    try {
+      await InAppWebViewController.clearAllCache(includeDiskFiles: true);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('WebView resource cache cleared. Stored data was not touched.'),
+      ));
+    } catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not clear resource cache: $error'),
+      ));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final tabs = context.watch<AndroidTabsService>();
@@ -234,12 +316,25 @@ class AndroidSettingsScreen extends StatelessWidget {
                   const SizedBox(height: 10),
                   Text(
                     qolUpdates.hasDownloadedBundle
-                        ? 'Active QoL: v${qolUpdates.activeVersion}'
-                        : 'Active QoL: bundled fallback',
+                        ? 'Downloaded QoL bundle: v${qolUpdates.activeVersion}'
+                        : 'QoL APK fallback: v${JsBundleService.bundledExtensionVersion}',
                     style: const TextStyle(
                       color: Colors.white70,
                       fontSize: 13,
                     ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'An already-open chat may still run the version injected on '
+                    'its last full page load. The App Log records that version.',
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                  const SizedBox(height: 4),
+                  // DS_ANDROID_20261108_VERSION_DETAIL
+                  Text(
+                    'APK fallback: v${JsBundleService.bundledExtensionVersion}. '
+                    'Already-open pages may still run an older QoL version until a full reload.',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
                   ),
                   const SizedBox(height: 4),
                   Text(
@@ -407,6 +502,45 @@ class AndroidSettingsScreen extends StatelessWidget {
                   ),
                 ],
               ),
+            ),
+          ),
+          // Resource cache only: deliberately not Android app-data cleanup.
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('WebView resource cache',
+                      style: TextStyle(fontSize: 16)),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Clears only cached website resources. Preserves your '
+                    'signed-in account, QoL settings, blocked/Later lists, '
+                    'local backups and downloaded extensions. No page reload.',
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () => _clearWebViewResourceCache(context),
+                    icon: const Icon(Icons.cleaning_services_outlined),
+                    label: const Text('Clear resource cache only'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Resource cache is distinct from all user/app data storage.
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: ListTile(
+              leading: const Icon(Icons.cleaning_services_outlined),
+              title: const Text('Clear resource cache only'),
+              subtitle: const Text(
+                'Only cached web resources. Keeps cookies, logins, QoL data and backups.'),
+              onTap: () => unawaited(_clearResourceCacheOnly(context)),
             ),
           ),
           Card(
