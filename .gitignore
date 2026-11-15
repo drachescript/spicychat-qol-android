@@ -8,6 +8,10 @@
 # copy of that source tree.
 extension/
 
+# Local patch-script snapshots are generated per machine and should not be
+# committed. Older preserved snapshots live in archives/android_patch_backups/.
+/android_patch_backups/
+
 # Build / release output
 archive/
 output/

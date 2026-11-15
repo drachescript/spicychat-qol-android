@@ -338,6 +338,11 @@ The repository `.gitignore` intentionally excludes:
 - IDE files
 - logs
 - generated APK/release output
+- new local patch backups (`android_patch_backups/`)
+
+Older patch backups already committed to Git are retained under
+[`archives/android_patch_backups/`](archives/android_patch_backups/) for reference.
+The ignored `archive/` directory remains reserved for generated output.
 
 The Gradle wrapper files are source and **should be committed**.
 
