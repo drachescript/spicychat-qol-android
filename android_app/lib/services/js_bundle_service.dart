@@ -732,16 +732,27 @@ class JsBundleService extends ChangeNotifier {
       if (paths.isEmpty) {
         throw StateError('Downloaded QoL bundle has no stylesheets.');
       }
-      for (final relative in paths) {
-        final source = await qolUpdates.readDownloadedText(relative);
-        if (source == null) {
-          throw StateError('Downloaded QoL stylesheet missing: $relative');
+      // DS_ANDROID_V144_ORDERED_ASSET_IO: up to eight file reads at
+      // once, but append in manifest order. This reduces startup IO latency
+      // without increasing peak memory to all scripts at once.
+      for (var offset = 0; offset < paths.length; offset += 8) {
+        final batch = paths.skip(offset).take(8).toList(growable: false);
+        final sources = await Future.wait<String?>(
+          batch.map(qolUpdates.readDownloadedText),
+        );
+        for (var i = 0; i < batch.length; i++) {
+          final relative = batch[i];
+          final source = sources[i];
+          if (source == null) {
+            throw StateError('Downloaded QoL stylesheet missing: $relative');
+          }
+          cssChunks.add(source);
         }
-        cssChunks.add(source);
       }
     } else {
-      for (final path in _bundledCssFiles) {
-        cssChunks.add(await rootBundle.loadString(path));
+      for (var offset = 0; offset < _bundledCssFiles.length; offset += 8) {
+        final batch = _bundledCssFiles.skip(offset).take(8).toList(growable: false);
+        cssChunks.addAll(await Future.wait<String>(batch.map(rootBundle.loadString)));
       }
     }
     // Only activate Android Transfer adjustments if shared QoL actually
@@ -1054,37 +1065,50 @@ $earlyMainSource
       ..writeln();
 
     if (remoteActive) {
-      for (final relative in qolUpdates.runtimeJsPaths) {
-        final source = await qolUpdates.readDownloadedText(relative);
-        if (source == null) {
-          throw StateError(
-            'Active QoL update is missing runtime file: $relative',
-          );
-        }
-        final optimized = _androidDesktopOnlySource(
-          relative,
-          relative.endsWith('/composer-control.js')
-              ? _androidOptimizeComposerSource(source)
-              : source,
+      final paths = qolUpdates.runtimeJsPaths;
+      for (var offset = 0; offset < paths.length; offset += 8) {
+        final batch = paths.skip(offset).take(8).toList(growable: false);
+        final sources = await Future.wait<String?>(
+          batch.map(qolUpdates.readDownloadedText),
         );
-        buffer
-          ..writeln('// === downloaded $relative ===')
-          ..writeln(optimized)
-          ..writeln();
+        for (var i = 0; i < batch.length; i++) {
+          final relative = batch[i];
+          final source = sources[i];
+          if (source == null) {
+            throw StateError(
+              'Active QoL update is missing runtime file: $relative',
+            );
+          }
+          final optimized = _androidDesktopOnlySource(
+            relative,
+            relative.endsWith('/composer-control.js')
+                ? _androidOptimizeComposerSource(source)
+                : source,
+          );
+          buffer
+            ..writeln('// === downloaded $relative ===')
+            ..writeln(optimized)
+            ..writeln();
+        }
       }
     } else {
-      for (final path in _bundledJsFiles) {
-        final source = await rootBundle.loadString(path);
-        final optimized = _androidDesktopOnlySource(
-          path,
-          path.endsWith('/composer-control.js')
-              ? _androidOptimizeComposerSource(source)
-              : source,
-        );
-        buffer
-          ..writeln('// === $path ===')
-          ..writeln(optimized)
-          ..writeln();
+      for (var offset = 0; offset < _bundledJsFiles.length; offset += 8) {
+        final batch = _bundledJsFiles.skip(offset).take(8).toList(growable: false);
+        final sources = await Future.wait<String>(batch.map(rootBundle.loadString));
+        for (var i = 0; i < batch.length; i++) {
+          final path = batch[i];
+          final source = sources[i];
+          final optimized = _androidDesktopOnlySource(
+            path,
+            path.endsWith('/composer-control.js')
+                ? _androidOptimizeComposerSource(source)
+                : source,
+          );
+          buffer
+            ..writeln('// === $path ===')
+            ..writeln(optimized)
+            ..writeln();
+        }
       }
     }
 

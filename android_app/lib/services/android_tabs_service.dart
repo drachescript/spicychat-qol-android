@@ -454,21 +454,39 @@ class AndroidTabsService extends ChangeNotifier {
     String? title,
     bool notify = false,
   }) async {
-    if (!_enabled) return;
+    if (!_enabled) {
+      return;
+    }
     final tab = activeTab;
-    if (tab == null || !isSpicyChatUrl(url)) return;
-
-    tab.url = normalizedRoute(url);
-    tab.scrollY = scrollY;
-
-    final cleanedTitle = title?.trim() ?? '';
-    if (!tab.isHome && cleanedTitle.isNotEmpty) {
-      tab.title = cleanedTitle;
+    if (tab == null || !isSpicyChatUrl(url)) {
+      return;
     }
 
-    tab.lastUsedAtMs = DateTime.now().millisecondsSinceEpoch;
+    // DS_ANDROID_V144_TAB_WRITE_DEDUP: multiple callbacks can report the
+    // same state. Preserve route, title and scroll state, but avoid rewriting
+    // SharedPreferences for an unchanged title/position on every callback.
+    final normalized = normalizedRoute(url);
+    final cleanedTitle = title?.trim() ?? '';
+    final titleChanged = !tab.isHome && cleanedTitle.isNotEmpty &&
+        tab.title != cleanedTitle;
+    final changed = tab.url != normalized ||
+        (tab.scrollY - scrollY).abs() > 1 || titleChanged;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final writeNeeded = changed || now - tab.lastUsedAtMs >= 60000;
+    if (!writeNeeded) {
+      return;
+    }
+
+    tab.url = normalized;
+    tab.scrollY = scrollY;
+    if (titleChanged) {
+      tab.title = cleanedTitle;
+    }
+    tab.lastUsedAtMs = now;
     await _persistTabs();
-    if (notify) notifyListeners();
+    if (notify && changed) {
+      notifyListeners();
+    }
   }
 
   AndroidChatTab? activateTab(String id) {

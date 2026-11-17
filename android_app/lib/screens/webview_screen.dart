@@ -97,6 +97,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   String? _androidMessageLongPressSource;
   double _lastScrollY = 0;
   final Map<String, double> _scrollByUrl = <String, double>{};
+  int _tabTitleRefreshGeneration = 0;
   String? _pendingTabSwitchId;
   double? _pendingTabRestoreScrollY;
   bool _switchingAndroidTab = false;
@@ -168,39 +169,49 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // DS_ANDROID_V144_RESUME_IDLE: Android often emits inactive -> hidden ->
+    // paused on one app switch. Do not persist tabs or flush the log three
+    // times, nor run expensive JS health/layout probes on a quick return.
+    final wasResumed = _appIsResumed;
     _appIsResumed = state == AppLifecycleState.resumed;
+    if (_appIsResumed == wasResumed) {
+      return;
+    }
     final elapsed = _lastBackgroundAt == null ? -1 :
         DateTime.now().difference(_lastBackgroundAt!).inMilliseconds;
+    final quickResume = _appIsResumed && elapsed >= 0 && elapsed < 20000 &&
+        !_isLoading && !_recoveringWebView &&
+        _rendererUnresponsiveSince == null &&
+        _injectionInProgressToken == null;
+
     if (_appIsResumed) {
       unawaited(_appLog.log('Lifecycle',
-          'App resumed after ${elapsed}ms; nav=$_navigationSequence; '
-          'webViewPresent=${_webController != null}; loading=$_isLoading; '
-          'recovering=$_recoveringWebView; url=$_lastKnownUrl'));
+          'App resumed after ${elapsed}ms; quick=$quickResume; '
+          'nav=$_navigationSequence; loading=$_isLoading; '
+          'url=$_lastKnownUrl'));
       _lastBackgroundAt = null;
-    } else {
-      _lastBackgroundAt ??= DateTime.now();
-      unawaited(_appLog.log('Lifecycle',
-          'App lifecycle $state; nav=$_navigationSequence; '
-          'webViewPresent=${_webController != null}; url=$_lastKnownUrl'));
-      unawaited(_appLog.flush());
-    }
-    if (_appIsResumed) {
       if (_rendererExitNeedsManualRecovery) {
         _showRendererExitNotice();
-      } else {
-        _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
+      } else if (!quickResume) {
+        _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 3));
       }
-      _scheduleFavoritesLayoutDiagnostic('app-resumed');
-      // A surviving WebView does not need two full avatar/layout sweeps just
-      // because Android resumed the Activity. Keep the existing guard for
-      // real page loads, SPA route changes and renderer recovery.
+      if (!quickResume) {
+        _scheduleFavoritesLayoutDiagnostic('app-resumed');
+      }
+      // Only a real in-progress load/recovery needs another visual sweep.
       if (_isLoading || _recoveringWebView) {
         _scheduleVisualGuardForCurrentPage('app-resumed');
       }
     } else {
+      _lastBackgroundAt ??= DateTime.now();
+      unawaited(_appLog.log('Lifecycle',
+          'App backgrounded; state=$state; nav=$_navigationSequence; '
+          'url=$_lastKnownUrl'));
       _routeHealthGeneration++;
       _visualGuardGeneration++;
-      unawaited(_saveActiveAndroidTabState());
+      unawaited(_saveActiveAndroidTabState(includeTitle: false));
+      // Flush once on leaving the app; ordinary lifecycle messages are batched.
+      unawaited(_appLog.flush());
     }
   }
 
@@ -294,6 +305,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (_diagnosticCooldowns.length > 120) {
       final cutoff = now.subtract(const Duration(minutes: 10));
       _diagnosticCooldowns.removeWhere((_, value) => value.isBefore(cutoff));
+      // High-cardinality resource URLs can all be recent. Cap the map anyway.
+      while (_diagnosticCooldowns.length > 160) {
+        _diagnosticCooldowns.remove(_diagnosticCooldowns.keys.first);
+      }
     }
     return true;
   }
@@ -995,6 +1010,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     });
                   }
 
+                  // DS_ANDROID_V144_STARTUP_DEDUP: avoid repeating native
+                  // layout/diagnostic work for duplicate onLoadStop callbacks.
+                  final injectedTokenAtStop = _lastInjectedDocumentToken;
                   // Android can fire onLoadStop several times for the same
                   // document. _injectScripts now skips duplicate documents.
                   try {
@@ -1011,22 +1029,27 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     );
                   }
 
-                  _scheduleHealthCheck(
-                    'post-load',
-                    delay: const Duration(seconds: 5),
-                  );
-                  _scheduleVisualGuardForCurrentPage('post-load');
-                  _scheduleFavoritesLayoutDiagnostic('post-load');
+                  final duplicateDocumentStop =
+                      injectedTokenAtStop != null &&
+                      injectedTokenAtStop == _lastInjectedDocumentToken;
                   _restorePendingAndroidTabScroll(controller);
-                  _scheduleActiveAndroidTabTitleRefresh();
-                  unawaited(_syncAndroidChatHeaderGear());
-                  _scheduleAndroidTopBarGearPosition(reason: 'navigation');
-                  unawaited(
-                    controller.evaluateJavascript(
-                      source:
-                          'window.__dsAndroidListingIdentitySchedule?.("load-stop");',
-                    ),
-                  );
+                  if (!duplicateDocumentStop) {
+                    _scheduleHealthCheck(
+                      'post-load',
+                      delay: const Duration(seconds: 5),
+                    );
+                    _scheduleVisualGuardForCurrentPage('post-load');
+                    _scheduleFavoritesLayoutDiagnostic('post-load');
+                    _scheduleActiveAndroidTabTitleRefresh();
+                    unawaited(_syncAndroidChatHeaderGear());
+                    _scheduleAndroidTopBarGearPosition(reason: 'navigation');
+                    unawaited(
+                      controller.evaluateJavascript(
+                        source:
+                            'window.__dsAndroidListingIdentitySchedule?.("load-stop");',
+                      ),
+                    );
+                  }
                 },
                 onUpdateVisitedHistory: (controller, url, androidIsReload) {
                   final route = url?.toString() ?? _lastKnownUrl;
@@ -1102,6 +1125,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   if (!tabsService.enabled) return;
 
                   _lastScrollY = y.toDouble();
+                  // Virtual chat tabs retain their own saved positions. This
+                  // in-memory history only needs the most recent routes.
+                  const maxRememberedRoutes = 96;
+                  if (!_scrollByUrl.containsKey(_lastKnownUrl) &&
+                      _scrollByUrl.length >= maxRememberedRoutes) {
+                    _scrollByUrl.remove(_scrollByUrl.keys.first);
+                  }
                   _scrollByUrl[_lastKnownUrl] = _lastScrollY;
                 },
                 onProgressChanged: (controller, progress) {
@@ -1501,7 +1531,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _saveActiveAndroidTabState() async {
+  Future<void> _saveActiveAndroidTabState({bool includeTitle = true}) async {
     if (!mounted) return;
 
     final tabsService = Provider.of<AndroidTabsService>(
@@ -1510,7 +1540,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     );
     if (!tabsService.enabled) return;
 
-    final title = await _readAndroidTabTitle();
+    final title = includeTitle ? await _readAndroidTabTitle() : null;
     await tabsService.updateActiveState(
       url: _lastKnownUrl,
       scrollY: _scrollByUrl[_lastKnownUrl] ?? _lastScrollY,
@@ -1525,10 +1555,22 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     );
     if (!tabsService.enabled) return;
 
+    final generation = ++_tabTitleRefreshGeneration;
+    final tabId = tabsService.activeTabId;
     Future<void>.delayed(const Duration(milliseconds: 900), () async {
-      if (!mounted || !tabsService.enabled) return;
+      // One latest title lookup per active tab/route, not one per history
+      // event. Never run an old lookup after switching apps or tab routes.
+      if (!mounted || !_appIsResumed || !tabsService.enabled ||
+          generation != _tabTitleRefreshGeneration ||
+          tabsService.activeTabId != tabId) {
+        return;
+      }
       final title = await _readAndroidTabTitle();
-      if (title == null) return;
+      if (title == null || !mounted ||
+          generation != _tabTitleRefreshGeneration ||
+          tabsService.activeTabId != tabId) {
+        return;
+      }
       await tabsService.updateActiveState(
         url: _lastKnownUrl,
         scrollY: _scrollByUrl[_lastKnownUrl] ?? _lastScrollY,

@@ -438,6 +438,55 @@ if ($ContentScripts.Count -eq 0) {
     Fail "manifest.json contains no content JavaScript."
 }
 
+# DS_ANDROID_CI_LAZY_LOADER_CONTRACT: verify the upstream loader *before*
+# mirroring any assets, so an incompatible release never silently packages.
+if ($ContentScripts -contains 'content/on-demand-modules.js') {
+    $LoaderSource = Read-Utf8Text (Join-Path $ResolvedSource 'content\on-demand-modules.js')
+    $BundleSource = Read-Utf8Text $BundleService
+    $WebViewSource = Read-Utf8Text (Join-Path $AndroidApp 'lib\screens\webview_screen.dart')
+    $ImportAnchor = '    const promise = import(chrome.runtime.getURL(path)).then(() => {'
+    if (-not $LoaderSource.Contains($ImportAnchor) -or
+        -not $BundleSource.Contains("const anchor = '$ImportAnchor';") -or
+        -not $BundleSource.Contains("file.endsWith('/on-demand-modules.js')") -or
+        -not $BundleSource.Contains('dsLoadOptionalQolModule') -or
+        -not $WebViewSource.Contains("handlerName: 'dsLoadOptionalQolModule'")) {
+        Fail 'QoL on-demand loader changed or Android bridge is absent. Update Android before building.'
+    }
+
+    $ModulesBlock = [regex]::Match($LoaderSource,
+        '(?s)const MODULES\s*=\s*Object\.freeze\(\{(?<items>.*?)\}\);')
+    $AllowedBlock = [regex]::Match($BundleSource,
+        '(?s)static const Set<String> _androidOptionalModules\s*=\s*<String>\s*\{(?<items>.*?)\};')
+    if (-not $ModulesBlock.Success -or -not $AllowedBlock.Success) {
+        Fail 'Cannot audit QoL optional modules against Android allowlist.'
+    }
+    $Modules = [regex]::Matches($ModulesBlock.Groups['items'].Value,
+        '"[^"]+"\s*:\s*"(?<relative>content/[^"]+\.js)"')
+    $AndroidAllowed = @([regex]::Matches($AllowedBlock.Groups['items'].Value,
+        "'(?<relative>content/[^']+\.js)'") | ForEach-Object {
+            $_.Groups['relative'].Value
+        })
+    if ($Modules.Count -eq 0) {
+        Fail 'QoL on-demand loader has no recognizable module declarations.'
+    }
+    foreach ($Entry in $Modules) {
+        $RelativeModule = $Entry.Groups['relative'].Value
+        if ($WebResources -notcontains $RelativeModule) {
+            Fail "QoL optional module not declared as web-accessible: $RelativeModule"
+        }
+        if ($RelativeModule -eq 'content/bulk-chat-research.js') {
+            if (-not $BundleSource.Contains("file.endsWith('/bulk-chat-research.js')")) {
+                Fail 'Android desktop-only Research Export guard is missing.'
+            }
+            continue
+        }
+        if ($AndroidAllowed -notcontains $RelativeModule) {
+            Fail "New/renamed QoL module lacks Android mapping: $RelativeModule"
+        }
+    }
+    Write-Host "Android lazy-module compatibility verified ($($Modules.Count) upstream modules)." -ForegroundColor Green
+}
+
 Write-Host ""
 Write-Host "FULL Android sync: SpicyChat QOL extension -> Android app" -ForegroundColor Cyan
 Write-Host "From: $ResolvedSource"

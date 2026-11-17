@@ -1,27 +1,11 @@
 name: Android Stable Release
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      # Visible version / native Flutter code.
-      - "android_app/pubspec.yaml"
-      - "android_app/lib/**"
-      - "android_app/android/**"
-
-      # APK-owned bridge assets. Normal shared QoL JS/CSS is intentionally
-      # omitted because the Android QoL updater handles those without an APK.
-      - "android_app/assets/js/bridge.js"
-      - "android_app/assets/js/android-message-longpress.js"
-      - "android_app/assets/options/options-bridge.js"
-
-      # Build/release plumbing.
-      - ".github/workflows/android-release.yml"
-      - "tools/check_android_toolchain.py"
-      - "build_android.ps1"
-      - "update_android.ps1"
-
+  # DS_ANDROID_CI_GATE_20261117: publish only the exact validated commit.
+  workflow_run:
+    workflows: ["Android Validate"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       force_same_version_hotfix:
@@ -32,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: android-stable-release
@@ -39,13 +24,22 @@ concurrency:
 
 jobs:
   release:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'push' &&
+           github.event.workflow_run.head_branch == 'main') }}
     runs-on: windows-latest
+    env:
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
     steps:
       - name: Check out Android repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Resolve Android release mode
         id: version
@@ -199,6 +193,53 @@ jobs:
           Write-Host "effective versionCode:$effectiveCode"
           Write-Host "should build:         $shouldBuild"
           Write-Host ""
+
+      - name: Require successful validation for release commit
+        if: steps.version.outputs.should_build == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceSha = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceSha -ne $env:RELEASE_SHA) {
+            throw 'Release checkout does not match the validated source commit.'
+          }
+
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_run') {
+            $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+            $run = $event.workflow_run
+            if ($run.head_sha -ne $sourceSha -or
+                $run.conclusion -ne 'success' -or
+                $run.event -ne 'push' -or
+                $run.head_branch -ne 'main') {
+              throw 'The matching Android Validate run did not succeed on main.'
+            }
+            Write-Host "Android Validate succeeded for $sourceSha (run $($run.id))."
+          } else {
+            # Manual same-version hotfixes also need an exact-SHA green check.
+            $runs = gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/android-validate.yml/runs?head_sha=$sourceSha&event=push&per_page=20" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect validation runs.' }
+            $matched = @($runs.workflow_runs | Where-Object {
+              $_.head_sha -eq $sourceSha -and $_.head_branch -eq 'main' -and
+              $_.status -eq 'completed' -and $_.conclusion -eq 'success'
+            })
+            if ($matched.Count -eq 0) {
+              throw 'No successful Android Validate run for this exact commit.'
+            }
+            Write-Host "Manual release validated by run $($matched[0].id)."
+          }
+
+          # A newer main branch means this APK has become stale; let the next
+          # successful validation trigger the appropriate release instead.
+          $mainRef = & git ls-remote origin refs/heads/main
+          if ($LASTEXITCODE -ne 0 -or -not $mainRef) {
+            throw 'Could not verify current main branch.'
+          }
+          $mainSha = ($mainRef -split '\s+')[0]
+          if ($mainSha -ne $sourceSha) {
+            throw 'A newer main commit exists. Refusing to release stale code.'
+          }
 
       - name: No APK build requested
         if: steps.version.outputs.should_build != 'true'
@@ -386,7 +427,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -a $env:ANDROID_TAG $env:GITHUB_SHA -m "SpicyChat QOL Android $env:ANDROID_TAG"
+          git tag -a $env:ANDROID_TAG $env:RELEASE_SHA -m "SpicyChat QOL Android $env:ANDROID_TAG"
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -534,7 +575,7 @@ jobs:
             --json body | ConvertFrom-Json
 
           $body = [string]$releaseAfter.body
-          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $shortSha = $env:RELEASE_SHA.Substring(0, 7)
           $entry = "- Android build $env:ANDROID_VERSION_CODE from commit ``$shortSha``"
 
           if (-not $body.Contains($entry)) {

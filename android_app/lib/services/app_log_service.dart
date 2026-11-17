@@ -15,10 +15,11 @@ class AppLogService {
 
   static const int _maxBytes = 1024 * 1024;
   static const int _maxBufferedEntries = 200;
-  // DS_ANDROID_LOG_BATCH_V060: routine info messages are appended together.
-  // WARN/ERROR, renderer, recovery and lifecycle records still flush now.
-  static const int _maxBatchEntries = 20;
-  static const Duration _batchDelay = Duration(milliseconds: 250);
+  // DS_ANDROID_V144_QUIET_LOG: keep full logs on disk, but reduce
+  // normal INFO writes and console chatter. WARN/ERROR/renderer/recovery
+  // remain urgent; backgrounding explicitly flushes any pending entries.
+  static const int _maxBatchEntries = 40;
+  static const Duration _batchDelay = Duration(milliseconds: 850);
 
   final List<String> _batch = <String>[];
   Timer? _batchTimer;
@@ -138,7 +139,9 @@ class AppLogService {
     if (stackTrace != null) details.write(' | stack=$stackTrace');
 
     final entry = _line(level, area, details.toString());
-    debugPrint(entry);
+    if (kDebugMode || level != 'INFO') {
+      debugPrint(entry);
+    }
 
     if (!_ready && !_initializing) {
       unawaited(init());
@@ -147,8 +150,7 @@ class AppLogService {
       entry,
       urgent: level != 'INFO' ||
           area == 'Renderer' ||
-          area == 'Recovery' ||
-          area == 'Lifecycle',
+          area == 'Recovery',
     );
   }
 
