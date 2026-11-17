@@ -40,7 +40,12 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: '3.47.9'
           cache: true
+
+      - name: Check pinned Android toolchain compatibility
+        shell: pwsh
+        run: python tools/check_android_toolchain.py --check-flutter
 
       - name: Flutter environment
         shell: pwsh

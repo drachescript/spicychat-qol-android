@@ -278,6 +278,22 @@ Keep secure backups of the signing keystore and credentials. Losing the signing 
 
 GitHub Actions releases should reconstruct the keystore from repository secrets rather than storing it in source control.
 
+
+### Pinned Android CI toolchain
+
+GitHub Actions intentionally uses **Flutter 3.47.9** (rather than the moving
+`stable` release) together with Gradle **8.14**, Android Gradle Plugin
+**8.11.1**, Kotlin Gradle Plugin **2.2.20**, and Java **17**. Flutter 3.50
+raised its Gradle minimum to 9.3.1, which breaks this tested Gradle 8.x
+project configuration. These versions should be upgraded together after an
+APK test, never implicitly when Flutter publishes a new stable release.
+
+Run `python tools/check_android_toolchain.py` to verify the checked-in
+configuration. Both GitHub workflows additionally verify the installed
+Flutter version before compiling. A failed toolchain preflight stops the
+release safely before Android signing/build steps; it does not publish a
+partially built APK.
+
 ## GitHub release model
 
 The stable Android source branch is:
