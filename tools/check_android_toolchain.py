@@ -75,9 +75,16 @@ def check_files(errors: list[str]) -> None:
 
 
 def check_flutter_runtime(errors: list[str]) -> None:
+    # On Windows, Flutter's executable is a .bat launcher. CreateProcess
+    # cannot reliably resolve it from a bare "flutter" without cmd.exe.
+    command = (
+        ["cmd.exe", "/d", "/c", "flutter", "--version"]
+        if sys.platform == "win32"
+        else ["flutter", "--version"]
+    )
     try:
         result = subprocess.run(
-            ["flutter", "--version"],
+            command,
             check=True,
             capture_output=True,
             text=True,
