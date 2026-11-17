@@ -160,6 +160,52 @@ class JsBundleService extends ChangeNotifier {
   // unmodified rather than risk breaking a newer QoL release.
   // Desktop-only policy for Android's one-WebView runtime and Settings.
   // This does not erase synced desktop settings or user lists.
+
+  // DS_ANDROID_V143_LAZY_OPTIONAL_MODULES: only known on-demand assets may
+  // execute. Never accept a URL or arbitrary filesystem path from page JS.
+  static const Set<String> _androidOptionalModules = <String>{
+    'content/soundscapes.js',
+    'content/sidebar.js',
+    'content/quick-panel.js',
+    'content/native-memory-probe.js',
+    'content/memory-manager.js',
+    'content/memory-packs.js',
+    'content/context-keeper.js',
+    'content/creation-audit.js',
+    'content/favorites-recovery.js',
+    'content/lorebook-backup.js',
+    'content/my-creations-backup.js',
+    'content/chat-export.js',
+  };
+
+  Future<String?> readAndroidOptionalModule(String relative) async {
+    if (!_androidOptionalModules.contains(relative)) {
+      return null;
+    }
+    String? source;
+    if (qolUpdates.hasDownloadedBundle) {
+      // The running main script must match the active downloaded version.
+      // A mid-session QoL update should take effect after the next reload.
+      if (qolUpdates.activeVersion != _extensionVersion ||
+          !qolUpdates.webResourcePaths.contains(relative)) {
+        return null;
+      }
+      source = await qolUpdates.readDownloadedText(relative);
+    } else {
+      // Future APK fallback bundles may include these optional assets.
+      final asset = 'assets/js/${relative.substring('content/'.length)}';
+      try {
+        source = await rootBundle.loadString(asset);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (source == null || source.isEmpty || source.length > 2 * 1024 * 1024) {
+      return null;
+    }
+    return _androidDesktopOnlySource(relative, source);
+  }
+
   static String _androidDesktopOnlySource(String path, String source) {
     final file = path.replaceAll('\\', '/');
 
@@ -171,6 +217,31 @@ class JsBundleService extends ChangeNotifier {
         // DS_ANDROID_20261116_DESKTOP_RESEARCH_GUARD: no helper tabs or browser download verification.
         file.endsWith('/bulk-chat-research.js')) {
       return '// Desktop-only module omitted in Android single-WebView build.';
+    }
+
+
+    if (file.endsWith('/on-demand-modules.js')) {
+      const anchor = '    const promise = import(chrome.runtime.getURL(path)).then(() => {';
+      if (!source.contains(anchor)) {
+        return source;
+      }
+      return source.replaceFirst(anchor, r'''
+    const operation = window.__spicyChatQolAndroidApp
+      ? Promise.resolve().then(() => {
+          if (!window.flutter_inappwebview?.callHandler) {
+            throw Error("Android lazy-module bridge unavailable");
+          }
+          return window.flutter_inappwebview.callHandler(
+            "dsLoadOptionalQolModule", path,
+            String(window.__spicyChatQolAndroidDocumentToken || "")
+          );
+        }).then(result => {
+          if (result?.ok !== true) {
+            throw Error(result?.error || "Android optional module failed");
+          }
+        })
+      : import(chrome.runtime.getURL(path));
+    const promise = operation.then(() => {''');
     }
 
     // QoL's common platform layer already hides the other desktop-only

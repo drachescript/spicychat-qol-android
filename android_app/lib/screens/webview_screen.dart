@@ -160,6 +160,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _healthTimer?.cancel();
+    _rendererExitReminder?.cancel();
     _androidSaveStayBackRepairTimer?.cancel();
     unawaited(_appLog.log('WebView', 'WebView screen disposed; nav=$_navigationSequence; lastCause=$_lastNavigationCause; url=$_lastKnownUrl'));
     super.dispose();
@@ -184,7 +185,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       unawaited(_appLog.flush());
     }
     if (_appIsResumed) {
-      _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
+      if (_rendererExitNeedsManualRecovery) {
+        _showRendererExitNotice();
+      } else {
+        _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
+      }
       _scheduleFavoritesLayoutDiagnostic('app-resumed');
       // A surviving WebView does not need two full avatar/layout sweeps just
       // because Android resumed the Activity. Keep the existing guard for
@@ -197,6 +202,67 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       _visualGuardGeneration++;
       unawaited(_saveActiveAndroidTabState());
     }
+  }
+
+
+  // DS_ANDROID_V143_MANUAL_RENDERER_RECOVERY: never recreate a chat merely
+  // because Android backgrounds this Activity or a probe times out.
+  bool _rendererExitNeedsManualRecovery = false;
+  bool _rendererExitNoticeShown = false;
+  DateTime? _rendererExitNextNoticeAfter;
+  Timer? _rendererExitReminder;
+
+  void _showRendererExitNotice() {
+    if (!mounted || !_appIsResumed || !_rendererExitNeedsManualRecovery ||
+        _rendererExitNoticeShown) {
+      return;
+    }
+    final next = _rendererExitNextNoticeAfter;
+    if (next != null && DateTime.now().isBefore(next)) {
+      return;
+    }
+    _rendererExitNoticeShown = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_appIsResumed || !_rendererExitNeedsManualRecovery) {
+        _rendererExitNoticeShown = false;
+        return;
+      }
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.showMaterialBanner(MaterialBanner(
+        content: const Text(
+          'Android stopped the SpicyChat WebView renderer. Your page will not '
+          'reload without your approval. Recover when you are ready.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              messenger.hideCurrentMaterialBanner();
+              unawaited(_recoverWebView(
+                reason: 'user approved recovery after renderer exit',
+                useController: false,
+              ));
+            },
+            child: const Text('Recover'),
+          ),
+          TextButton(
+            onPressed: () {
+              messenger.hideCurrentMaterialBanner();
+              _rendererExitNoticeShown = false;
+              _rendererExitNextNoticeAfter =
+                  DateTime.now().add(const Duration(minutes: 5));
+              _rendererExitReminder?.cancel();
+              _rendererExitReminder = Timer(const Duration(minutes: 5, milliseconds: 150), () {
+                if (mounted && _appIsResumed &&
+                    _rendererExitNeedsManualRecovery) {
+                  _showRendererExitNotice();
+                }
+              });
+            },
+            child: const Text('Later'),
+          ),
+        ],
+      ));
+    });
   }
 
   void _scheduleHealthCheck(
@@ -1125,19 +1191,19 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onRenderProcessGone: (controller, detail) {
                   _rendererUnresponsiveSince = null;
-                  unawaited(
-                    _appLog.log(
-                      'Renderer',
-                      'Android WebView renderer exited; didCrash=${detail.didCrash}, priority=${detail.rendererPriorityAtExit}',
-                      level: 'ERROR',
-                    ),
-                  );
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    _recoverWebView(
-                      reason: 'Android WebView renderer exited',
-                      useController: false,
-                    );
-                  });
+                  _rendererExitNeedsManualRecovery = true;
+                  unawaited(_appLog.log(
+                    'Renderer',
+                    'Android WebView renderer exited; '
+                    'didCrash=${detail.didCrash}; '
+                    'priority=${detail.rendererPriorityAtExit}; '
+                    'appVisible=$_appIsResumed; '
+                    'manual recovery required (no automatic reload)',
+                    level: 'ERROR',
+                  ));
+                  // Foreground: show a non-destructive native notice.
+                  // Background: defer all UI until the Activity is visible.
+                  _showRendererExitNotice();
                 },
                 // Extension helpers sometimes use target="_blank" or window.open()
                 // for bot/profile links. Android WebView treats those as a new
@@ -2322,6 +2388,73 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     final settingsService = Provider.of<SettingsService>(
       context,
       listen: false,
+    );
+
+
+    // DS_ANDROID_V143_LAZY_OPTIONAL_MODULES: evaluate only known, downloaded
+    // modules in the same WebView world as QoL. Never expose their source to
+    // the website as a file URL. Reject requests across document reloads.
+    controller.addJavaScriptHandler(
+      handlerName: 'dsLoadOptionalQolModule',
+      callback: (args) async {
+        if (!mounted || _webController != controller ||
+            !await _isCurrentUrlTrusted(controller)) {
+          return {'ok': false, 'error': 'untrusted or inactive WebView'};
+        }
+        final relative = args.isNotEmpty ? args[0].toString() : '';
+        final requestedToken = args.length > 1 ? args[1].toString() : '';
+        if (requestedToken.isEmpty) {
+          return {'ok': false, 'error': 'missing document token'};
+        }
+        try {
+          final current = await controller.evaluateJavascript(
+            source: 'String(window.__spicyChatQolAndroidDocumentToken || "")',
+          );
+          if (current?.toString() != requestedToken) {
+            return {'ok': false, 'error': 'document changed'};
+          }
+          final source = await widget.bundleService.readAndroidOptionalModule(
+            relative,
+          );
+          if (source == null) {
+            return {'ok': false, 'error': 'module unavailable on Android'};
+          }
+          if (!mounted || _webController != controller ||
+              !await _isCurrentUrlTrusted(controller)) {
+            return {'ok': false, 'error': 'WebView changed'};
+          }
+          // The token is checked again inside the evaluated script: the page
+          // might reload while Flutter is reading this optional module.
+          final result = await controller.evaluateJavascript(source: '''
+(() => {
+  if (String(window.__spicyChatQolAndroidDocumentToken || "") !==
+      ${jsonEncode(requestedToken)}) {
+    return JSON.stringify({ok: false, error: "document changed"});
+  }
+  try {
+$source
+    return JSON.stringify({ok: true});
+  } catch (error) {
+    return JSON.stringify({ok: false,
+      error: String(error?.message || error).slice(0, 240)});
+  }
+})()
+''');
+          if (result is String) {
+            final decoded = jsonDecode(result);
+            if (decoded is Map && decoded['ok'] == true) {
+              return {'ok': true};
+            }
+            if (decoded is Map) {
+              return {'ok': false,
+                'error': (decoded['error'] ?? 'module failed').toString()};
+            }
+          }
+          return {'ok': false, 'error': 'no module execution confirmation'};
+        } catch (error) {
+          return {'ok': false, 'error': error.toString()};
+        }
+      },
     );
 
     // Handle chrome.storage.local.get()
@@ -4497,6 +4630,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (!mounted ||
         !_appIsResumed ||
         _recoveringWebView ||
+        _rendererExitNeedsManualRecovery ||
         controller == null ||
         // A periodic probe should not compete with a confirmed stall or
         // the one-time full script injection on a freshly loaded document.
@@ -4671,12 +4805,20 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (!mounted || _recoveringWebView) return;
 
     final previousRecovery = _lastRecoveryAt;
-    if (previousRecovery != null &&
+    if (!_rendererExitNeedsManualRecovery && previousRecovery != null &&
         DateTime.now().difference(previousRecovery) <
             const Duration(seconds: 12)) {
       return;
     }
 
+    if (_rendererExitNeedsManualRecovery) {
+      _rendererExitNeedsManualRecovery = false;
+      _rendererExitNextNoticeAfter = null;
+      _rendererExitNoticeShown = false;
+      _rendererExitReminder?.cancel();
+      _rendererExitReminder = null;
+      ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+    }
     _recoveringWebView = true;
     _lastRecoveryAt = DateTime.now();
     _routeHealthGeneration++;
