@@ -185,6 +185,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
     if (_appIsResumed) {
       _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 2));
+      _scheduleFavoritesLayoutDiagnostic('app-resumed');
       // A surviving WebView does not need two full avatar/layout sweeps just
       // because Android resumed the Activity. Keep the existing guard for
       // real page loads, SPA route changes and renderer recovery.
@@ -949,6 +950,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     delay: const Duration(seconds: 5),
                   );
                   _scheduleVisualGuardForCurrentPage('post-load');
+                  _scheduleFavoritesLayoutDiagnostic('post-load');
                   _restorePendingAndroidTabScroll(controller);
                   _scheduleActiveAndroidTabTitleRefresh();
                   unawaited(_syncAndroidChatHeaderGear());
@@ -1024,6 +1026,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     delay: const Duration(seconds: 6),
                   );
                   _scheduleVisualGuardForCurrentPage('history-route');
+                  _scheduleFavoritesLayoutDiagnostic('history-route');
                 },
                 onScrollChanged: (controller, x, y) {
                   final tabsService = Provider.of<AndroidTabsService>(
@@ -3896,6 +3899,79 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+
+  // DS_ANDROID_20261116_FAVORITES_GEOMETRY: read-only, route-scoped, one-shot.
+  // No polling, DOM writes, bot names, account IDs or screenshot capture.
+  int _favoritesLayoutDiagnosticGeneration = 0;
+
+  void _scheduleFavoritesLayoutDiagnostic(String trigger) {
+    if (!_appIsResumed || !_lastKnownUrl.contains('/favorite-bots')) {
+      return;
+    }
+    final generation = ++_favoritesLayoutDiagnosticGeneration;
+    Future<void>.delayed(const Duration(milliseconds: 1600), () async {
+      if (!mounted || !_appIsResumed ||
+          generation != _favoritesLayoutDiagnosticGeneration ||
+          !_lastKnownUrl.contains('/favorite-bots')) {
+        return;
+      }
+      final controller = _webController;
+      if (controller == null) {
+        return;
+      }
+      try {
+        final raw = await controller.evaluateJavascript(source: r'''(() => {
+          if (!/^\/favorite-bots(?:\/|$)/.test(location.pathname)) return '{}';
+          const root = document.querySelector('[data-testid="SearchClientCharacterListing"]');
+          if (!root) return JSON.stringify({offscreen:false, listingMounted:false});
+          const vw = Math.max(1, document.documentElement.clientWidth || innerWidth);
+          const rect = el => {
+            const r = el.getBoundingClientRect();
+            return {left:Math.round(r.left),right:Math.round(r.right),
+              width:Math.round(r.width),height:Math.round(r.height)};
+          };
+          const cardLinks = Array.from(root.querySelectorAll(
+            '[data-testid="CharacterCard"],a[href*="/chatbot/"],a[href*="/chat/"]'
+          )).slice(0, 48).map(el => el.getBoundingClientRect())
+            .filter(r => r.width > 12 && r.height > 12);
+          const left = cardLinks.length ? Math.min(...cardLinks.map(r => r.left)) : -1;
+          const right = cardLinks.length ? Math.max(...cardLinks.map(r => r.right)) : -1;
+          const listingRect = rect(root);
+          const overflowing = root.scrollWidth > root.clientWidth + 36 || right > vw + 36;
+          const offscreen = cardLinks.length > 0 && overflowing &&
+            (left > vw * .56 || (right > vw * 1.55 && left > vw * .30));
+          return JSON.stringify({offscreen, listingMounted:true, viewport:vw,
+            root:listingRect, visibleCardsMeasured:cardLinks.length,
+            cardsLeft:Math.round(left), cardsRight:Math.round(right),
+            rootScrollWidth:root.scrollWidth,rootClientWidth:root.clientWidth,
+            nativeMobileCorrection:!!root.querySelector('[data-ds-mobile-listing-fix="1"]') ||
+              root.hasAttribute('data-ds-mobile-listing-fix'),
+            nativeBodyFound:!!root.querySelector('[data-testid="SearchClientCharacterListingBody"]')});
+        })()''');
+        final parsed = raw is String ? jsonDecode(raw) : raw;
+        if (parsed is! Map) {
+          return;
+        }
+        final details = Map<String, dynamic>.from(parsed);
+        if (details['offscreen'] != true) {
+          return;
+        }
+        if (!_shouldPersistDiagnostic('favorites-layout-offscreen')) {
+          return;
+        }
+        unawaited(_appLog.log('FavoritesLayout',
+          'Off-screen Favorites detected ($trigger): ${jsonEncode(details)}',
+          level: 'WARN'));
+      } catch (error, stackTrace) {
+        if (_shouldPersistDiagnostic('favorites-layout-check-failed')) {
+          unawaited(_appLog.log('FavoritesLayout',
+            'Read-only Favorites geometry check failed', level: 'WARN',
+            error: error, stackTrace: stackTrace));
+        }
+      }
+    });
+  }
+
   void _scheduleVisualGuardForCurrentPage(String trigger) {
     if (!_appIsResumed || !_isChatUrl(_lastKnownUrl)) return;
 
@@ -4079,9 +4155,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
             : encoded;
         bytes = Uint8List.fromList(base64Decode(clean));
       } catch (_) {
-        bytes = Uint8List.fromList(
-          utf8.encode('${data['text'] ?? data['content'] ?? ''}'),
-        );
+        // DS_ANDROID_20261116_BINARY_EXPORT_FAIL_CLOSED:
+        // Never write fallback text bytes under a corrupt binary filename.
+        return null;
       }
     } else {
       bytes = Uint8List.fromList(
@@ -4126,7 +4202,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     try {
       final safe = _safeNativeFilename(filename, fallback: 'spicychat-qol-export.txt');
       final lower = safe.toLowerCase();
-      final inferredMime = lower.endsWith('.gz')
+      final inferredMime = lower.endsWith('.zip')
+          ? 'application/zip'
+          : lower.endsWith('.gz')
           ? 'application/gzip'
           : lower.endsWith('.txt') ? 'text/plain'
           : lower.endsWith('.json') ? 'application/json'

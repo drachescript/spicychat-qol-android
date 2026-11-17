@@ -41,44 +41,6 @@ class AndroidSettingsScreen extends StatelessWidget {
   }
 
 
-  // DS_ANDROID_20261108_RESOURCE_CACHE: never touch cookies or persisted stores.
-  Future<void> _clearResourceCacheOnly(BuildContext context) async {
-    final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (dialogContext) => AlertDialog(
-            title: const Text('Clear resource cache only?'),
-            content: const Text(
-              'Removes WebView cached images/pages, not cookies or logins. '
-              'QoL settings, blocked/opened/Later records, native preferences, '
-              'local storage and backups are kept. Other Android cache may remain.'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(dialogContext, false),
-                child: const Text('Cancel')),
-              FilledButton(
-                onPressed: () => Navigator.pop(dialogContext, true),
-                child: const Text('Clear cache')),
-            ],
-          ),
-        ) ?? false;
-    if (!confirmed) {
-      return;
-    }
-    try {
-      await InAppWebViewController.clearAllCache(includeDiskFiles: true);
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Resource cache cleared; saved data kept.')),
-        );
-      }
-    } catch (error) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Cache cleanup failed: $error')),
-        );
-      }
-    }
-  }
 
   String _formatLastChecked(DateTime? value) {
     if (value == null) return 'Never';
@@ -504,7 +466,7 @@ class AndroidSettingsScreen extends StatelessWidget {
               ),
             ),
           ),
-          // Resource cache only: deliberately not Android app-data cleanup.
+          // DS_ANDROID_20261116_MAINTENANCE_CACHE: one resource-only cache control.
           Card(
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             child: Padding(
@@ -532,17 +494,6 @@ class AndroidSettingsScreen extends StatelessWidget {
             ),
           ),
 
-          // Resource cache is distinct from all user/app data storage.
-          Card(
-            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-            child: ListTile(
-              leading: const Icon(Icons.cleaning_services_outlined),
-              title: const Text('Clear resource cache only'),
-              subtitle: const Text(
-                'Only cached web resources. Keeps cookies, logins, QoL data and backups.'),
-              onTap: () => unawaited(_clearResourceCacheOnly(context)),
-            ),
-          ),
           Card(
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             child: Padding(

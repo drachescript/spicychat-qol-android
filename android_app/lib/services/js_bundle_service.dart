@@ -167,7 +167,9 @@ class JsBundleService extends ChangeNotifier {
     // required part of the feature. Do not run them on Android at all.
     if (file.endsWith('/chat-lorebook-manager.js') ||
         file.endsWith('/auto-afk.js') ||
-        file.endsWith('/list-fill.js')) {
+        file.endsWith('/list-fill.js') ||
+        // DS_ANDROID_20261116_DESKTOP_RESEARCH_GUARD: no helper tabs or browser download verification.
+        file.endsWith('/bulk-chat-research.js')) {
       return '// Desktop-only module omitted in Android single-WebView build.';
     }
 
@@ -180,11 +182,12 @@ class JsBundleService extends ChangeNotifier {
     const settingsRules = '''
     showQuickLessLikeButtons: ["helperTabs"],
     showQuickNotInterestedButtons: ["helperTabs"],
-    enableChatLorebookManager: ["helperTabs"],''';
+    enableChatLorebookManager: ["helperTabs"],
+    showBulkChatResearchExport: ["helperTabs", "backgroundWorkers"],''';
     const featureAnchor =
         '    "quick-dislike": { requires: ["helperTabs"], mode: "all" },';
     const featureRule =
-        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },';
+        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },';
     const actionAnchor =
         '    bulkLessLikeBlockedBots: ["bulkOperations", "helperTabs"],';
     const actionRules = '''
