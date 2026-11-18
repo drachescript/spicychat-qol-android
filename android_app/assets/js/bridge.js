@@ -270,17 +270,22 @@
         return;
       }
 
-      window.flutter_inappwebview
+      // DS_ANDROID_V145_287_RUNTIME_PROMISE: support Chrome's Promise-returning
+      // runtime API as well as callback callers. Required for Archive presets.
+      return window.flutter_inappwebview
         .callHandler("runtimeMessage", JSON.stringify(message))
         .then(raw => {
+          let response = null;
           try {
-            const resp = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
-            if (callback) callback(resp);
-          } catch {
-            if (callback) callback(null);
-          }
+            response = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+          } catch {}
+          if (typeof callback === "function") callback(response);
+          return response;
         })
-        .catch(() => { if (callback) callback(null); });
+        .catch(() => {
+          if (typeof callback === "function") callback(null);
+          return null;
+        });
     },
 
     onMessage: {

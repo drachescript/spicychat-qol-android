@@ -161,25 +161,11 @@ class JsBundleService extends ChangeNotifier {
   // Desktop-only policy for Android's one-WebView runtime and Settings.
   // This does not erase synced desktop settings or user lists.
 
-  // DS_ANDROID_V143_LAZY_OPTIONAL_MODULES: only known on-demand assets may
-  // execute. Never accept a URL or arbitrary filesystem path from page JS.
-  static const Set<String> _androidOptionalModules = <String>{
-    'content/soundscapes.js',
-    'content/sidebar.js',
-    'content/quick-panel.js',
-    'content/native-memory-probe.js',
-    'content/memory-manager.js',
-    'content/memory-packs.js',
-    'content/context-keeper.js',
-    'content/creation-audit.js',
-    'content/favorites-recovery.js',
-    'content/lorebook-backup.js',
-    'content/my-creations-backup.js',
-    'content/chat-export.js',
-  };
-
+  // DS_ANDROID_V145_MODULE_POLICY: one allowlist shared with the in-app updater.
+  // The desktop-only Archive Community Themes feature needs a browser worker.
+  // Its saved settings are left untouched on Android.
   Future<String?> readAndroidOptionalModule(String relative) async {
-    if (!_androidOptionalModules.contains(relative)) {
+    if (!QolUpdateService.androidSupportedOptionalModules.contains(relative)) {
       return null;
     }
     String? source;
@@ -209,6 +195,14 @@ class JsBundleService extends ChangeNotifier {
   static String _androidDesktopOnlySource(String path, String source) {
     final file = path.replaceAll('\\', '/');
 
+    // DS_ANDROID_V145_287_CHAT_NUDGES_LOCAL: in-page Chat Nudge UI works on
+    // Android, but its scheduled desktop background worker does not exist.
+    if (file.endsWith('/chat-nudges.js')) {
+      const desktopSync = 'chrome.runtime.sendMessage({ type: "DS_CHAT_NUDGE_SYNC" }, () => void chrome.runtime.lastError);';
+      return source.replaceFirst(desktopSync,
+          '/* Android: nudge state is stored locally; no background worker. */');
+    }
+
     // These modules manage helper/browser tabs, or open another window as a
     // required part of the feature. Do not run them on Android at all.
     if (file.endsWith('/chat-lorebook-manager.js') ||
@@ -221,27 +215,64 @@ class JsBundleService extends ChangeNotifier {
 
 
     if (file.endsWith('/on-demand-modules.js')) {
-      const anchor = '    const promise = import(chrome.runtime.getURL(path)).then(() => {';
-      if (!source.contains(anchor)) {
-        return source;
+      // The upstream source is verified before it is bundled or activated.
+      const importAnchor = '    const promise = import(chrome.runtime.getURL(path)).then(() => {';
+      const ensureAnchor = '  function ensure(name) {';
+      const listAnchor = '    return list;';
+      if (!source.contains(importAnchor) ||
+          !source.contains(ensureAnchor) ||
+          !source.contains(listAnchor)) {
+        // Fail closed for unknown upstream source shapes.
+        return '// Android rejected an unsupported optional-module loader.';
       }
-      return source.replaceFirst(anchor, r'''
+      return source
+          .replaceFirst(ensureAnchor, r''' 
+  // DS_ANDROID_V145_NATIVE_MODULE_QUEUE: cap native bridge requests to two.
+  // Every module still runs only if its route/setting asks for it.
+  const pendingAndroidModules = [];
+  let activeAndroidModules = 0;
+  function pumpAndroidModules() {
+    while (activeAndroidModules < 2 && pendingAndroidModules.length) {
+      const job = pendingAndroidModules.shift();
+      activeAndroidModules++;
+      Promise.resolve().then(() => {
+        if (DS.isQolPausedForTab?.()) throw Error("QoL tab is paused");
+        if (!window.flutter_inappwebview?.callHandler) {
+          throw Error("Android optional-module bridge unavailable");
+        }
+        return window.flutter_inappwebview.callHandler(
+          "dsLoadOptionalQolModule", job.path,
+          String(window.__spicyChatQolAndroidDocumentToken || "")
+        );
+      }).then(result => {
+        if (result?.ok !== true) {
+          throw Error(result?.error || "Android optional module failed");
+        }
+        job.resolve();
+      }).catch(job.reject).finally(() => {
+        activeAndroidModules--;
+        pumpAndroidModules();
+      });
+    }
+  }
+  function androidLoadOptional(path) {
+    return new Promise((resolve, reject) => {
+      pendingAndroidModules.push({path, resolve, reject});
+      pumpAndroidModules();
+    });
+  }
+  function ensure(name) {
+    // Archive's remote matching requires a desktop background service worker.
+    if (window.__spicyChatQolAndroidApp &&
+        name === "archive-community-themes") return Promise.resolve(false);
+''')
+          .replaceFirst(importAnchor, r'''
     const operation = window.__spicyChatQolAndroidApp
-      ? Promise.resolve().then(() => {
-          if (!window.flutter_inappwebview?.callHandler) {
-            throw Error("Android lazy-module bridge unavailable");
-          }
-          return window.flutter_inappwebview.callHandler(
-            "dsLoadOptionalQolModule", path,
-            String(window.__spicyChatQolAndroidDocumentToken || "")
-          );
-        }).then(result => {
-          if (result?.ok !== true) {
-            throw Error(result?.error || "Android optional module failed");
-          }
-        })
+      ? androidLoadOptional(path)
       : import(chrome.runtime.getURL(path));
-    const promise = operation.then(() => {''');
+    const promise = operation.then(() => {''')
+          .replaceFirst(listAnchor,
+              '    return list.filter(name => name !== "archive-community-themes");');
     }
 
     // QoL's common platform layer already hides the other desktop-only
@@ -254,11 +285,12 @@ class JsBundleService extends ChangeNotifier {
     showQuickLessLikeButtons: ["helperTabs"],
     showQuickNotInterestedButtons: ["helperTabs"],
     enableChatLorebookManager: ["helperTabs"],
-    showBulkChatResearchExport: ["helperTabs", "backgroundWorkers"],''';
+    showBulkChatResearchExport: ["helperTabs", "backgroundWorkers"],
+    archiveCommunityThemesEnabled: ["backgroundWorkers"],''';
     const featureAnchor =
         '    "quick-dislike": { requires: ["helperTabs"], mode: "all" },';
     const featureRule =
-        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },';
+        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },\n    "archive-community-themes": { requires: ["backgroundWorkers"], mode: "all" },';
     const actionAnchor =
         '    bulkLessLikeBlockedBots: ["bulkOperations", "helperTabs"],';
     const actionRules = '''

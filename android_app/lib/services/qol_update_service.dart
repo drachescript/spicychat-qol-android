@@ -24,6 +24,257 @@ class QolUpdateService extends ChangeNotifier {
   static const _experimentalKey = 'ds_android_qol_update_experimental';
   // Increment only for an APK change to the native bridge protocol.
   static const int androidBridgeVersion = 1;
+
+  // DS_ANDROID_V145_UPDATE_CONTRACT: the native allowlist is the sole source
+  // of truth for both runtime requests and downloaded QoL verification.
+  static const Set<String> androidSupportedOptionalModules = <String>{
+    'content/soundscapes.js',
+    'content/sidebar.js',
+    'content/quick-panel.js',
+    'content/native-memory-probe.js',
+    'content/memory-manager.js',
+    'content/memory-packs.js',
+    'content/context-keeper.js',
+    'content/creation-audit.js',
+    'content/favorites-recovery.js',
+    'content/lorebook-backup.js',
+    'content/my-creations-backup.js',
+    'content/chat-export.js',
+    'content/persona-full-backup.js',
+    'content/profile-export.js',
+    'content/creator-writing-assistant.js',
+    'content/character-token-optimizer.js',
+    'content/chat-continuation.js',
+    'content/chat-scene-notes.js',
+    'content/lorebook-consistency.js',
+    'content/smart-filter-presets.js',
+    'content/wiki-lorebook-importer.js',
+    'content/persona-organizer.js',
+    'content/private-lorebook-bridge.js',
+    'content/archive-blocking-presets.js',
+    'content/chat-pins.js',
+    'content/chat-smart-folders.js',
+    'content/chat-organizer.js',
+    'content/my-creations-filters.js',
+    'content/bot-editor-snippets.js',
+    'content/bot-editor-history.js',
+    'content/story-day-tracker.js',
+    'content/rp-state-tracker.js',
+    'content/lorebook-connections.js',
+    'content/lorebook-moderation-review.js',
+    'content/moderation-warnings.js',
+    'content/focus-mode.js',
+    'content/lorebook-workflow.js',
+    'content/chat-search.js',
+    'content/chat-nudges.js',
+    'content/selection-memory.js',
+    'content/rulebook-diagnostics.js',
+    'content/saved-snippets.js',
+  };
+  static const Set<String> androidUnavailableOptionalModules = <String>{
+    'content/bulk-chat-research.js',
+    'content/archive-community-themes.js',
+  };
+
+  // DS_ANDROID_V145_287_ARCHIVE_PRESET_NATIVE: public title-only Archive
+  // blocking data. No account information, titles, blocked lists or chats are
+  // uploaded. Native HTTPS fetch/cache replaces the desktop service worker.
+  static const _androidArchivePresetContract = 'spicychat-archive-block-presets-v1';
+  static const _androidArchivePresetManifest =
+      'https://spicychatarchive.drache.uk/data/block-presets/manifest.json';
+  static const _androidArchivePresetCatalog =
+      'https://spicychatarchive.drache.uk/data/block-presets/catalog.json';
+  Map<String, dynamic>? _androidArchivePresetMemory;
+  int _androidArchivePresetCheckedAtMs = 0;
+  Future<Map<String, dynamic>>? _androidArchivePresetPending;
+
+  static bool _isValidAndroidArchiveCatalog(dynamic raw, {int? version}) {
+    if (raw is! Map || raw['schemaVersion'] != 1 ||
+        raw['contract'] != _androidArchivePresetContract ||
+        raw['catalogVersion'] is! int || raw['catalogVersion'] < 1 ||
+        (version != null && raw['catalogVersion'] != version) ||
+        raw['presets'] is! List || (raw['presets'] as List).length > 500 ||
+        raw['characters'] is! List || (raw['characters'] as List).length > 5000 ||
+        raw['groups'] is! List || (raw['groups'] as List).length > 1000) {
+      return false;
+    }
+    return true;
+  }
+
+  Future<Map<String, dynamic>> fetchAndroidArchivePresetCatalog() async {
+    if (_androidArchivePresetPending != null) {
+      return _androidArchivePresetPending!;
+    }
+    final task = _fetchAndroidArchivePresetCatalog();
+    _androidArchivePresetPending = task;
+    try {
+      return await task;
+    } finally {
+      _androidArchivePresetPending = null;
+    }
+  }
+
+  Future<Map<String, dynamic>> _fetchAndroidArchivePresetCatalog() async {
+    final root = _root;
+    if (root == null) {
+      return {'ok': false, 'error': 'Android Archive cache is not initialized.'};
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    const ttlMs = 6 * 60 * 60 * 1000;
+    final file = File('${root.path}${Platform.pathSeparator}archive-block-presets-v1.json');
+    Map<String, dynamic>? saved = _androidArchivePresetMemory;
+    var checkedAt = _androidArchivePresetCheckedAtMs;
+    if (saved == null) {
+      try {
+        if (await file.exists() && await file.length() <= 600000) {
+          final raw = jsonDecode(await file.readAsString());
+          if (raw is Map && _isValidAndroidArchiveCatalog(raw['catalog'])) {
+            saved = Map<String, dynamic>.from(raw['catalog'] as Map);
+            checkedAt = raw['checkedAtMs'] is int ? raw['checkedAtMs'] as int : 0;
+            _androidArchivePresetMemory = saved;
+            _androidArchivePresetCheckedAtMs = checkedAt;
+          }
+        }
+      } catch (_) {
+        // Corrupt cache is ignored. Never affect QoL update data or settings.
+      }
+    }
+    if (saved != null && checkedAt > 0 && checkedAt <= now &&
+        now - checkedAt < ttlMs) {
+      return {'ok': true, 'catalog': saved, 'offline': false};
+    }
+
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 9);
+    try {
+      final manifestText = await _getText(client, _androidArchivePresetManifest)
+          .timeout(const Duration(seconds: 16));
+      if (manifestText.length > 16000) {
+        throw const FormatException('Archive manifest exceeds size limit.');
+      }
+      final manifest = jsonDecode(manifestText);
+      if (manifest is! Map || manifest['schemaVersion'] != 1 ||
+          manifest['contract'] != _androidArchivePresetContract ||
+          manifest['catalogVersion'] is! int || manifest['catalogVersion'] < 1 ||
+          manifest['catalog'] != _androidArchivePresetCatalog) {
+        throw const FormatException('Archive manifest contract changed.');
+      }
+      final version = manifest['catalogVersion'] as int;
+      Map<String, dynamic> catalog;
+      if (saved != null && _isValidAndroidArchiveCatalog(saved, version: version)) {
+        catalog = saved;
+      } else {
+        final body = await _getText(client, _androidArchivePresetCatalog)
+            .timeout(const Duration(seconds: 18));
+        if (body.length > 500000) {
+          throw const FormatException('Archive catalog exceeds size limit.');
+        }
+        final decoded = jsonDecode(body);
+        if (!_isValidAndroidArchiveCatalog(decoded, version: version)) {
+          throw const FormatException('Archive catalog contract changed.');
+        }
+        catalog = Map<String, dynamic>.from(decoded as Map);
+      }
+      _androidArchivePresetMemory = catalog;
+      _androidArchivePresetCheckedAtMs = now;
+      try {
+        await file.writeAsString(jsonEncode({
+          'checkedAtMs': now,
+          'catalog': catalog,
+        }));
+      } catch (_) {
+        // The in-memory catalog still works when disk caching is unavailable.
+      }
+      return {'ok': true, 'catalog': catalog, 'offline': false};
+    } catch (_) {
+      if (saved != null && _isValidAndroidArchiveCatalog(saved)) {
+        // Fail open for blocking when offline: reuse previously verified public
+        // catalog, never mistake a failed refresh for new evidence.
+        return {'ok': true, 'catalog': saved, 'offline': true};
+      }
+      return {'ok': false, 'error': 'Archive preset catalog unavailable.'};
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  static void _checkOptionalLoaderCompatibility(
+    Map<String, dynamic> manifest,
+    String? loaderSource,
+  ) {
+    final groups = manifest['content_scripts'];
+    final scripts = <String>{};
+    if (groups is List) {
+      for (final group in groups) {
+        if (group is! Map) {
+          continue;
+        }
+        final js = group['js'];
+        if (js is List) {
+          for (final path in js) {
+            if (path is String) {
+              scripts.add(path);
+            }
+          }
+        }
+      }
+    }
+    // Older published bundles without an optional loader remain compatible.
+    if (!scripts.contains('content/on-demand-modules.js')) {
+      return;
+    }
+
+    const importAnchor =
+        '    const promise = import(chrome.runtime.getURL(path)).then(() => {';
+    if (loaderSource == null ||
+        !loaderSource.contains(importAnchor) ||
+        !loaderSource.contains('  function ensure(name) {') ||
+        !loaderSource.contains('    return list;') ||
+        !loaderSource.contains('DS.prepareOptionalModules =')) {
+      throw StateError('QoL optional loader changed; Android APK update required.');
+    }
+
+    final resourcePaths = <String>{};
+    final resources = manifest['web_accessible_resources'];
+    if (resources is List) {
+      for (final group in resources) {
+        if (group is! Map) {
+          continue;
+        }
+        final paths = group['resources'];
+        if (paths is List) {
+          for (final path in paths) {
+            if (path is String) {
+              resourcePaths.add(path);
+            }
+          }
+        }
+      }
+    }
+    final block = RegExp(
+      r'const MODULES\s*=\s*Object\.freeze\(\{([\s\S]*?)\}\);',
+    ).firstMatch(loaderSource);
+    if (block == null) {
+      throw StateError('QoL optional-module map is unrecognized on Android.');
+    }
+    final entries = RegExp(
+      r'"[^"]+"\s*:\s*"(content/[A-Za-z0-9_./-]+\.js)"',
+    ).allMatches(block.group(1)!);
+    final seen = <String>{};
+    for (final entry in entries) {
+      final path = entry.group(1)!;
+      if (!seen.add(path) || !resourcePaths.contains(path)) {
+        throw StateError('Invalid or unregistered QoL optional module: $path');
+      }
+      if (!androidSupportedOptionalModules.contains(path) &&
+          !androidUnavailableOptionalModules.contains(path)) {
+        throw StateError('New QoL optional module needs Android support: $path');
+      }
+    }
+    if (seen.isEmpty) {
+      throw StateError('QoL optional-module map was empty or changed format.');
+    }
+  }
+
   static const _repoApi =
       'https://api.github.com/repos/drachescript/spicychat-qol-extension';
   static const _rawBase =
@@ -208,6 +459,21 @@ class QolUpdateService extends ChangeNotifier {
         }
       }
 
+      // Revalidate an existing downloaded bundle after installing a
+      // newer APK; cached updates may predate the stronger contract check.
+      final currentManifestFile = File(_pathFor(current, 'manifest.json'));
+      final currentManifestRaw =
+          jsonDecode(await currentManifestFile.readAsString());
+      if (currentManifestRaw is! Map) {
+        throw const FormatException('Cached QoL manifest is invalid.');
+      }
+      final currentManifest = Map<String, dynamic>.from(currentManifestRaw);
+      final currentLoader = runtimeJs.contains('content/on-demand-modules.js')
+          ? await File(_pathFor(current, 'content/on-demand-modules.js'))
+              .readAsString()
+          : null;
+      _checkOptionalLoaderCompatibility(currentManifest, currentLoader);
+
       _activeVersion = (map['version'] ?? '').toString().trim();
       _activeSha = sha;
       _activeHasHashes = requiresHashes;
@@ -332,6 +598,17 @@ class QolUpdateService extends ChangeNotifier {
         );
       }
 
+      // Check the pinned SHA loader BEFORE staging/activating any new bundle.
+      // This costs one download and reuses those bytes in the staged asset.
+      final String? precheckedLoader =
+          js.contains('content/on-demand-modules.js')
+              ? await _getText(
+                  client,
+                  '$_rawBase/$remoteSha/content/on-demand-modules.js',
+                )
+              : null;
+      _checkOptionalLoaderCompatibility(manifest, precheckedLoader);
+
       final staging = Directory(
         '${_root!.path}${Platform.pathSeparator}'
         'staging-${DateTime.now().millisecondsSinceEpoch}',
@@ -392,7 +669,10 @@ class QolUpdateService extends ChangeNotifier {
                   r'\.(?:js|css|html|json|md|txt|svg|xml)$',
                   caseSensitive: false,
                 ).hasMatch(relative);
-                if (textAsset) {
+                if (relative == 'content/on-demand-modules.js' &&
+                    precheckedLoader != null) {
+                  await save(relative, precheckedLoader);
+                } else if (textAsset) {
                   await save(relative, await _getText(client!, url));
                 } else {
                   await saveBytes(relative, await _getBytes(client!, url));

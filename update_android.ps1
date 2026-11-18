@@ -446,7 +446,7 @@ if ($ContentScripts -contains 'content/on-demand-modules.js') {
     $WebViewSource = Read-Utf8Text (Join-Path $AndroidApp 'lib\screens\webview_screen.dart')
     $ImportAnchor = '    const promise = import(chrome.runtime.getURL(path)).then(() => {'
     if (-not $LoaderSource.Contains($ImportAnchor) -or
-        -not $BundleSource.Contains("const anchor = '$ImportAnchor';") -or
+        -not $BundleSource.Contains("const importAnchor = '$ImportAnchor';") -or
         -not $BundleSource.Contains("file.endsWith('/on-demand-modules.js')") -or
         -not $BundleSource.Contains('dsLoadOptionalQolModule') -or
         -not $WebViewSource.Contains("handlerName: 'dsLoadOptionalQolModule'")) {
@@ -455,17 +455,36 @@ if ($ContentScripts -contains 'content/on-demand-modules.js') {
 
     $ModulesBlock = [regex]::Match($LoaderSource,
         '(?s)const MODULES\s*=\s*Object\.freeze\(\{(?<items>.*?)\}\);')
-    $AllowedBlock = [regex]::Match($BundleSource,
-        '(?s)static const Set<String> _androidOptionalModules\s*=\s*<String>\s*\{(?<items>.*?)\};')
-    if (-not $ModulesBlock.Success -or -not $AllowedBlock.Success) {
-        Fail 'Cannot audit QoL optional modules against Android allowlist.'
+    # DS_ANDROID_V145_SYNC_POLICY_PARITY: Android runtime + updater must agree.
+    $UpdaterSource = Read-Utf8Text (Join-Path $AndroidApp 'lib\services\qol_update_service.dart')
+    $AllowedBlock = [regex]::Match($UpdaterSource,
+        '(?s)static const Set<String> androidSupportedOptionalModules\s*=\s*<String>\s*\{(?<items>.*?)\};')
+    $DesktopBlock = [regex]::Match($UpdaterSource,
+        '(?s)static const Set<String> androidUnavailableOptionalModules\s*=\s*<String>\s*\{(?<items>.*?)\};')
+    if (-not $ModulesBlock.Success -or -not $AllowedBlock.Success -or -not $DesktopBlock.Success) {
+        Fail 'Cannot audit QoL optional-module map against Android runtime policy.'
+    }
+    if (-not $BundleSource.Contains('QolUpdateService.androidSupportedOptionalModules.contains(relative)')) {
+        Fail 'Android optional-module runtime does not use the updater policy.'
     }
     $Modules = [regex]::Matches($ModulesBlock.Groups['items'].Value,
         '"[^"]+"\s*:\s*"(?<relative>content/[^"]+\.js)"')
-    $AndroidAllowed = @([regex]::Matches($AllowedBlock.Groups['items'].Value,
+    $UpdaterAllowed = @([regex]::Matches($AllowedBlock.Groups['items'].Value,
         "'(?<relative>content/[^']+\.js)'") | ForEach-Object {
             $_.Groups['relative'].Value
         })
+    $DesktopExcluded = @([regex]::Matches($DesktopBlock.Groups['items'].Value,
+        "'(?<relative>content/[^']+\.js)'") | ForEach-Object {
+            $_.Groups['relative'].Value
+        })
+    # DS_ANDROID_V145_287_ARCHIVE_PRESET_GUARD: reject a release that contains
+    # the new Archive preset module without the Android-native catalog bridge.
+    if ($WebResources -contains 'content/archive-blocking-presets.js' -and
+        (-not $UpdaterSource.Contains('fetchAndroidArchivePresetCatalog') -or
+         -not $WebViewSource.Contains("type == 'DS_ARCHIVE_BLOCK_PRESET_CATALOG'") -or
+         -not (Read-Utf8Text (Join-Path $AndroidJs 'bridge.js')).Contains('DS_ANDROID_V145_287_RUNTIME_PROMISE'))) {
+        Fail 'Archive Blocking Presets needs its native Android catalog and Promise bridge.'
+    }
     if ($Modules.Count -eq 0) {
         Fail 'QoL on-demand loader has no recognizable module declarations.'
     }
@@ -474,13 +493,20 @@ if ($ContentScripts -contains 'content/on-demand-modules.js') {
         if ($WebResources -notcontains $RelativeModule) {
             Fail "QoL optional module not declared as web-accessible: $RelativeModule"
         }
-        if ($RelativeModule -eq 'content/bulk-chat-research.js') {
-            if (-not $BundleSource.Contains("file.endsWith('/bulk-chat-research.js')")) {
+        if ($DesktopExcluded -contains $RelativeModule) {
+            # Archive Community Themes uses desktop background messaging;
+            # Bulk Research Export relies on real helper/browser tabs.
+            if ($RelativeModule -eq 'content/bulk-chat-research.js' -and
+                -not $BundleSource.Contains("file.endsWith('/bulk-chat-research.js')")) {
                 Fail 'Android desktop-only Research Export guard is missing.'
+            }
+            if ($RelativeModule -eq 'content/archive-community-themes.js' -and
+                -not $BundleSource.Contains('archive-community-themes')) {
+                Fail 'Android Archive Community Themes exclusion is missing.'
             }
             continue
         }
-        if ($AndroidAllowed -notcontains $RelativeModule) {
+        if ($UpdaterAllowed -notcontains $RelativeModule) {
             Fail "New/renamed QoL module lacks Android mapping: $RelativeModule"
         }
     }

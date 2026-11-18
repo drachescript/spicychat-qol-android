@@ -2619,6 +2619,20 @@ $source
           // Android v0.2.49 HTTPS background image bridge: native HTTPS fetch
           // with per-host user consent; other runtime messages are untouched.
           final type = message is Map ? (message['type'] ?? '').toString() : '';
+          // DS_ANDROID_V145_287_ARCHIVE_PRESET_HANDLER: public, opt-in
+          // title-only catalog; fetched and cached by native QoL update service.
+          if (type == 'DS_ARCHIVE_BLOCK_PRESET_CATALOG') {
+            if (message is! Map || message['enabled'] != true) {
+              return jsonEncode({'ok': false, 'error': 'Archive preset feature disabled.'});
+            }
+            final result = await widget.bundleService.qolUpdates
+                .fetchAndroidArchivePresetCatalog();
+            if (!mounted || _webController != controller ||
+                !await _isCurrentUrlTrusted(controller)) {
+              return jsonEncode({'ok': false, 'error': 'WebView changed.'});
+            }
+            return jsonEncode(result);
+          }
           if (type == 'DS_BG_FETCH_IMAGE_URL' ||
               type == 'DS_BG_REQUEST_IMAGE_PERMISSION') {
             return jsonEncode(await _androidBgRuntimeMessage(message));
