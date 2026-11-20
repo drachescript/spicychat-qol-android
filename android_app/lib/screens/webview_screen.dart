@@ -12,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/settings_service.dart';
 import '../services/js_bundle_service.dart';
+import '../services/qol_update_service.dart';
 import '../services/app_log_service.dart';
 import '../services/android_tabs_service.dart';
 import '../services/android_ui_service.dart';
@@ -2459,7 +2460,16 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
             relative,
           );
           if (source == null) {
-            return {'ok': false, 'error': 'module unavailable on Android'};
+            final desktopOnly = QolUpdateService.androidUnavailableOptionalModules
+                .contains(relative);
+            final allowed = QolUpdateService.androidSupportedOptionalModules
+                .contains(relative);
+            return {'ok': false,
+              'error': desktopOnly
+                  ? 'This module requires desktop background/browser tabs: $relative'
+                  : allowed
+                      ? 'Android module asset unavailable: $relative. Check the active QoL update or APK fallback.'
+                      : 'Unsupported Android optional module: $relative. An Android APK update may be required.'};
           }
           if (!mounted || _webController != controller ||
               !await _isCurrentUrlTrusted(controller)) {
@@ -2971,6 +2981,15 @@ $source
           'message':
               'Full Lorebook helper-tab export is not available in the '
               'single-WebView Android app.',
+        };
+
+      // Android receives available counts through its in-page SpicyChat
+      // bridge; the desktop service-worker lookup is not available.
+      case 'DS_EXACT_MESSAGE_COUNTS_FETCH':
+        return {
+          'ok': false,
+          'android': true,
+          'error': 'desktop-background-lookup-unavailable',
         };
 
       case 'DS_CLOSE_CURRENT_TAB':
@@ -4955,8 +4974,38 @@ $source
     }
   }
 
+  // DS_ANDROID_V289_COMPAT_REPORT: run only for user-initiated App Log
+  // copy/export. No observers, timers, network calls or chat content.
+  Future<void> _logAndroidCompatibilitySnapshot() async {
+    final updates = widget.bundleService.qolUpdates;
+    String loader = 'not-available';
+    final controller = _webController;
+    try {
+      if (controller != null && mounted &&
+          await _isCurrentUrlTrusted(controller)) {
+        final raw = await controller.evaluateJavascript(source: r'''(() => {
+  const optional = window.DragonScriptQoL?.optionalModuleLoader;
+  const status = optional?.getStatus?.() || {};
+  return JSON.stringify({
+    present: !!optional,
+    loaded: Array.isArray(status.loaded) ? status.loaded.slice(0, 48) : [],
+    failed: Array.isArray(status.failed) ? status.failed.slice(0, 48) : []
+  });
+})()''').timeout(const Duration(seconds: 2));
+        if (raw is String && raw.isNotEmpty) {
+          loader = raw.length > 1100 ? raw.substring(0, 1100) : raw;
+        }
+      }
+    } catch (_) {
+      loader = 'probe-unavailable';
+    }
+    await _appLog.log('QolCompatibility',
+        '${updates.androidCompatibilityReport}; loader=$loader');
+  }
+
   Future<void> _copyDiagnosticLog() async {
     try {
+      await _logAndroidCompatibilitySnapshot();
       final log = await _appLog.readAll();
       await Clipboard.setData(
         ClipboardData(text: log.isEmpty ? 'No app log entries yet.' : log),
@@ -4983,6 +5032,7 @@ $source
   // report a chosen filename even if zero bytes were saved by the provider.
   Future<void> _exportDiagnosticLog() async {
     try {
+      await _logAndroidCompatibilitySnapshot();
       final log = await _appLog.readAll();
       if (log.trim().isEmpty) {
         if (mounted) {

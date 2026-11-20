@@ -195,6 +195,20 @@ class JsBundleService extends ChangeNotifier {
   static String _androidDesktopOnlySource(String path, String source) {
     final file = path.replaceAll('\\', '/');
 
+    // DS_ANDROID_V289_EXACT_COUNTS_NATIVE_BRIDGE: the existing MAIN-world
+    // SpicyChat data bridge can supply counts. Android has no desktop worker
+    // to query missing counts; do not schedule futile worker requests.
+    if (file.endsWith('/exact-message-counts.js')) {
+      const workerRequest =
+          '    const response = await runtimeMessage({ type: "DS_EXACT_MESSAGE_COUNTS_FETCH", ids });';
+      if (source.contains(workerRequest)) {
+        return source.replaceFirst(workerRequest,
+            '    // Android: use verified in-page counts; no desktop background lookup.\n'
+            '    const response = { ok: true, counts: [], missing: ids };');
+      }
+      return source; // Future source shapes are not altered speculatively.
+    }
+
     // DS_ANDROID_V145_287_CHAT_NUDGES_LOCAL: in-page Chat Nudge UI works on
     // Android, but its scheduled desktop background worker does not exist.
     if (file.endsWith('/chat-nudges.js')) {

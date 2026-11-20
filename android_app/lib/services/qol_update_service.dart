@@ -31,6 +31,9 @@ class QolUpdateService extends ChangeNotifier {
     'content/soundscapes.js',
     'content/sidebar.js',
     'content/quick-panel.js',
+    'content/animation-control.js',
+    'content/exact-message-counts.js',
+    'content/previously-chatted-indicator.js',
     'content/native-memory-probe.js',
     'content/memory-manager.js',
     'content/memory-packs.js',
@@ -267,7 +270,7 @@ class QolUpdateService extends ChangeNotifier {
       }
       if (!androidSupportedOptionalModules.contains(path) &&
           !androidUnavailableOptionalModules.contains(path)) {
-        throw StateError('New QoL optional module needs Android support: $path');
+        throw StateError('Unsupported QoL module $path. Update the Android APK to use this QoL release; your existing bundle is preserved.');
       }
     }
     if (seen.isEmpty) {
@@ -339,6 +342,21 @@ class QolUpdateService extends ChangeNotifier {
   DateTime? get lastCheckedAt => _lastCheckedAt;
   String get activeVersion => _activeVersion;
   String get activeSha => _activeSha;
+  // DS_ANDROID_V289_COMPAT_REPORT: no private URLs or chat content.
+  // Only used when explicitly copying or exporting the local App Log.
+  String get androidCompatibilityReport {
+    final source = hasDownloadedBundle
+        ? 'downloaded QoL $_activeVersion'
+        : 'APK fallback';
+    final shortSha = _activeSha.isEmpty
+        ? 'none'
+        : _activeSha.substring(0, _activeSha.length < 8 ? _activeSha.length : 8);
+    return 'bridge=$androidBridgeVersion; source=$source; '
+        'channel=$updateChannel; sha=$shortSha; '
+        'hashes=${_activeHasHashes ? "verified" : "not-downloaded"}; '
+        'supportedOptional=${androidSupportedOptionalModules.length}; '
+        'desktopOnly=${androidUnavailableOptionalModules.join(",")}';
+  }
   bool get experimentalChannel => _experimentalChannel;
   String get updateChannel => _experimentalChannel
       ? 'Experimental (main)'
