@@ -5035,7 +5035,36 @@ $source
     }
   }
 
+  // DS_ANDROID_COG_CONFIRM_CLEAR_V1: confirm before deleting diagnostic history.
   Future<void> _clearDiagnosticLog() async {
+    if (!mounted) return;
+    final androidUi = Provider.of<AndroidUiService>(context, listen: false);
+    if (androidUi.confirmClearAppLog) {
+      final confirmed = await showDialog<bool>(
+            context: context,
+            builder: (dialogContext) => AlertDialog(
+              title: const Text('Clear App Log?'),
+              content: const Text(
+                'This permanently removes the app diagnostic log stored '
+                'on this device. If you need it for a bug report, copy or '
+                'export it first. This does not delete chats, settings, '
+                'or downloaded QoL backups.'
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(true),
+                  child: const Text('Clear App Log'),
+                ),
+              ],
+            ),
+          ) ??
+          false;
+      if (!confirmed || !mounted) return;
+    }
     try {
       await _appLog.clear();
       if (mounted) {
@@ -5633,6 +5662,7 @@ $source
           listen: false,
         );
         return _QuickMenuSheet(
+          androidUi: Provider.of<AndroidUiService>(context, listen: false),
           tabsEnabled: tabsService.enabled,
           isChatPage: _isChatUrl(_lastKnownUrl),
           onAndroidSettings: () {
@@ -5726,6 +5756,7 @@ $source
 }
 
 class _QuickMenuSheet extends StatelessWidget {
+  final AndroidUiService androidUi;
   final bool tabsEnabled;
   final bool isChatPage;
   final VoidCallback onAndroidSettings;
@@ -5747,6 +5778,7 @@ class _QuickMenuSheet extends StatelessWidget {
   final VoidCallback onRefresh;
 
   const _QuickMenuSheet({
+    required this.androidUi,
     required this.tabsEnabled,
     required this.isChatPage,
     required this.onAndroidSettings,
@@ -5803,26 +5835,28 @@ class _QuickMenuSheet extends StatelessWidget {
             label: 'Android Settings',
             onTap: onAndroidSettings,
           ),
+          if (androidUi.isQuickMenuItemVisible('moveCog'))
           _QuickMenuItem(
             icon: Icons.open_with,
             label: 'Move Android cog',
             onTap: onMoveCog,
           ),
-          if (tabsEnabled)
+          if (tabsEnabled && androidUi.isQuickMenuItemVisible('chatTabs'))
             _QuickMenuItem(
               icon: Icons.tab,
-              label: 'Android Chat Tabs',
+            label: 'Android Chat Tabs',
               onTap: onChatTabs,
             ),
+          if (androidUi.isQuickMenuItemVisible('commandPalette'))
           _QuickMenuItem(
             icon: Icons.search,
             label: 'Command Palette',
             onTap: onCommandPalette,
           ),
-          if (isChatPage)
+          if (isChatPage && androidUi.isQuickMenuItemVisible('focusMode'))
             _QuickMenuItem(
               icon: Icons.center_focus_strong,
-              label: 'Focus / Immersive Mode',
+            label: 'Focus / Immersive Mode',
               onTap: onFocusMode,
             ),
           _QuickMenuItem(
@@ -5830,37 +5864,40 @@ class _QuickMenuSheet extends StatelessWidget {
             label: 'QOL Options',
             onTap: onSettings,
           ),
+          if (androidUi.isQuickMenuItemVisible('exportChat'))
           _QuickMenuItem(
             icon: Icons.download,
             label: 'Export Chat',
             onTap: onExportChat,
           ),
+          if (androidUi.isQuickMenuItemVisible('blockBot'))
           _QuickMenuItem(
             icon: Icons.block,
             label: 'Block Current Bot',
             onTap: onBlockCurrentBot,
           ),
-          if (isChatPage)
+          if (isChatPage && androidUi.isQuickMenuItemVisible('customPictures'))
             _QuickMenuItem(
               icon: Icons.image_outlined,
-              label: 'Custom Pictures',
+            label: 'Custom Pictures',
               onTap: onChatBackground,
             ),
+          if (androidUi.isQuickMenuItemVisible('reinjectScripts'))
           _QuickMenuItem(
             icon: Icons.code,
             label: 'Re-inject Scripts',
             onTap: onReloadScripts,
           ),
-          if (isChatPage)
+          if (isChatPage && androidUi.isQuickMenuItemVisible('scrollQuick'))
             _QuickMenuItem(
               icon: Icons.touch_app,
-              label: 'Check / unlock chat scrolling',
+            label: 'Check chat scrolling (quick)',
               onTap: onCheckChatScroll,
             ),
-          if (isChatPage)
+          if (isChatPage && androidUi.isQuickMenuItemVisible('scrollDetailed'))
             _QuickMenuItem(
               icon: Icons.swap_vert,
-              label: 'Check / unlock chat scrolling',
+            label: 'Check chat scrolling (detailed)',
               onTap: onCheckUnlockScroll,
             ),
           _QuickMenuItem(
@@ -5868,21 +5905,25 @@ class _QuickMenuSheet extends StatelessWidget {
             label: 'Recover Black Screen',
             onTap: onRecoverWebView,
           ),
+          if (androidUi.isQuickMenuItemVisible('copyAppLog'))
           _QuickMenuItem(
             icon: Icons.copy,
             label: 'Copy App Log',
             onTap: onCopyLog,
           ),
+          if (androidUi.isQuickMenuItemVisible('exportAppLog'))
           _QuickMenuItem(
             icon: Icons.description_outlined,
             label: 'Export App Log',
             onTap: onExportLog,
           ),
+          if (androidUi.isQuickMenuItemVisible('clearAppLog'))
           _QuickMenuItem(
             icon: Icons.delete_sweep_outlined,
             label: 'Clear App Log',
             onTap: onClearLog,
           ),
+          if (androidUi.isQuickMenuItemVisible('refreshPage'))
           _QuickMenuItem(
             icon: Icons.refresh,
             label: 'Refresh Page',

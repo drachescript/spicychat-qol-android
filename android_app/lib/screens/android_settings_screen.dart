@@ -638,6 +638,59 @@ class AndroidSettingsScreen extends StatelessWidget {
               ),
             ),
           ),
+          // DS_ANDROID_COG_CONTROLS_V1: all new settings are Android-only.
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Cog-wheel menu',
+                    style: TextStyle(fontSize: 16),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Choose which shortcuts appear in the Android cog. '
+                    'Android Settings, QoL Options and Recover Black Screen '
+                    'always stay available. These settings do not affect '
+                    'the desktop extension.',
+                    style: TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
+                  const SizedBox(height: 8),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Ask before clearing App Log'),
+                    subtitle: const Text(
+                      'On by default. Show a confirmation before deleting '
+                      'the local diagnostic log.',
+                    ),
+                    value: androidUi.confirmClearAppLog,
+                    onChanged: androidUi.setConfirmClearAppLog,
+                  ),
+                  const Divider(height: 20),
+                  for (final entry in AndroidUiService.quickMenuItems.entries)
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: Text(entry.value),
+                      value: androidUi.isQuickMenuItemVisible(entry.key),
+                      onChanged: (visible) =>
+                          androidUi.setQuickMenuItemVisible(entry.key, visible),
+                    ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: androidUi.showAllQuickMenuItems,
+                      icon: const Icon(Icons.restart_alt),
+                      label: const Text('Show all cog shortcuts'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
           Card(
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             child: Padding(
