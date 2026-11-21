@@ -1,425 +1,226 @@
 # SpicyChat QoL Android
 
-SpicyChat QoL Android is the official Android wrapper for **SpicyChat QoL**.
+**SpicyChat QoL Android** is the Android app for [SpicyChat QoL](https://github.com/drachescript/spicychat-qol-extension). It runs SpicyChat in a Flutter WebView and adds native Android controls, downloads, storage, recovery, and other mobile-specific integration. Most QoL features still come from the shared extension project.
 
-It runs SpicyChat inside a Flutter/WebView app and provides the native Android pieces that a normal browser extension cannot provide reliably on mobile, while the shared QoL JavaScript/CSS remains maintained in the main extension project.
+[![Latest Android release](https://img.shields.io/github/v/release/drachescript/spicychat-qol-android?label=Android%20APK)](https://github.com/drachescript/spicychat-qol-android/releases/latest)
+[![Android Validate](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-validate.yml/badge.svg)](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-validate.yml)
+[![Android Stable Release](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-release.yml/badge.svg)](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-release.yml)
+[![VirusTotal APK Check](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-virustotal.yml/badge.svg)](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-virustotal.yml)
 
-## Repositories
+**[Download latest APK](https://github.com/drachescript/spicychat-qol-android/releases/latest)** · **[Android download page](https://spicychatqol.drache.uk/android/)** · **[VirusTotal checks](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-virustotal.yml)** · **[Changelog](android-CHANGELOG.md)** · **[Report an issue](https://github.com/drachescript/spicychat-qol-extension/issues)**
 
-- **Android wrapper:** https://github.com/drachescript/spicychat-qol-android
-- **Main extension / shared QoL source:** https://github.com/drachescript/spicychat-qol-extension
-- **Website / Android downloads:** https://spicychatqol.drache.uk/android/
-- **Website source:** https://github.com/drachescript/spicychat-qol-website
+## Install
 
-## Bug reports and feature requests
+1. Open the [latest Android release](https://github.com/drachescript/spicychat-qol-android/releases/latest), or use the [project's Android download page](https://spicychatqol.drache.uk/android/).
+2. Download **SpicyChat-QOL-Android-vX.Y.Z.apk** to your Android phone.
+3. Open the APK and allow installation from that source if Android prompts you.
+4. Open the app, sign in to SpicyChat, and configure QoL from its settings.
 
-Android issues are tracked in the main SpicyChat QoL issue tracker so extension-side and Android-wrapper bugs stay in one place:
+The app's package ID is **`uk.drache.spicychatqol`** (minimum Android API 24 / Android 7.0). Older private/test builds with a different application ID are separate apps and do not upgrade in place.
 
-**https://github.com/drachescript/spicychat-qol-extension/issues**
+Download APKs from the linked project release or website. An APK downloaded from elsewhere may not be the same signed build.
 
-Please add the existing **`android`** label when the problem is specific to the APK/WebView wrapper.
+## Features
 
-Useful reports normally include:
+Most features are shared with the [main SpicyChat QoL extension](https://github.com/drachescript/spicychat-qol-extension). Android adds or adapts:
 
-- Android device/model and Android version
-- SpicyChat QoL version
-- Android app version
-- affected SpicyChat page/route
-- expected behavior
-- actual behavior
-- reproduction steps
-- screenshot/video when useful
-- **Copy all support info** / diagnostics from QoL Settings when available
+- **Native controls:** configurable cog position, individual cog-menu shortcut visibility, Focus / Immersive Mode, and mobile settings.
+- **Chat interaction:** Android long-press actions, reliable clipboard/text selection, message editing and mobile composer compatibility.
+- **Downloads and data:** Android file picker, Save As, export/download handling, storage bridges, and backup/import support.
+- **Reliability:** WebView recovery, blank-screen recovery, route handling, renderer diagnostics, and App Log copy/export.
+- **Safer controls:** an optional *Clear App Log?* confirmation, enabled by default.
+- **Mobile navigation:** optional lightweight Android Chat Tabs (experimental and **off by default**).
+- **QoL compatibility:** shared extension updates, optional module loading, native capabilities, and rollback to a previous compatible bundle.
 
-Do not post authentication tokens, API keys, Discord webhook URLs, private chat exports, or other sensitive account data in public issues.
+Some desktop-only features require browser helper tabs or extension background workers and are not available in Android's single-WebView runtime. Android will not pretend an unsupported background action succeeded.
 
-## What lives in this repository
+See [Android release notes](android-CHANGELOG.md) for changes specific to the APK and the [extension features](https://github.com/drachescript/spicychat-qol-extension/blob/main/features.md) for the broader feature catalogue.
 
-This repository contains the **native Android wrapper**, including:
+## Updates: Android APK vs. shared QoL
 
-- Flutter application code
-- Android WebView configuration and recovery logic
-- Android-only settings
-- native storage/file bridges
-- native clipboard support
-- Android file picker / Save As handling
-- Android navigation integration
-- Android chat-tab state
-- Android diagnostics/runtime bridges
-- Android-specific long-press controls
-- Android build/release tooling
-- the bundled known-good QoL fallback used by the APK
+There are **two independent update channels**:
 
-The normal QoL feature source is maintained separately in:
+| Channel | Changes | How to update |
+| --- | --- | --- |
+| **Shared QoL** | Compatible extension JavaScript, CSS, and Settings | App checks roughly every **12 hours**, or use **Android Settings → QoL updates → Check QoL updates now** |
+| **Android APK** | Flutter, WebView, native bridge, Android settings, and built-in app behavior | Check **Android Settings → Android app updates** or install the [latest APK](https://github.com/drachescript/spicychat-qol-android/releases/latest) |
 
-https://github.com/drachescript/spicychat-qol-extension
+A shared QoL update normally **does not** require reinstalling the APK. Downloaded changes take effect after a full page load or app restart rather than interrupting an active chat.
 
-Do not duplicate normal extension feature development in this repository unless the behavior specifically requires Android/Flutter/WebView integration.
+The Android updater validates required files and compatibility before activation. If a bundle is incompatible or corrupted, it can use the previous saved bundle or the APK's bundled fallback. A new native bridge feature still needs a new APK.
 
-## Application identity
+## Build locally on Windows
 
-Public Android application ID:
+**The easiest path is the included `build_android.bat`.** You do **not** need to create a new Android Studio project.
 
-```text
-uk.drache.spicychatqol
-```
+### 1. Install the tools
 
-The JavaScript namespace remains:
+- [Git for Windows](https://git-scm.com/downloads/win)
+- [Flutter SDK](https://docs.flutter.dev/get-started/install/windows/mobile) — the project's tested CI version is **Flutter 3.47.9**
+- [Android Studio](https://developer.android.com/studio) with Android SDK Platform **API 36**, SDK Build-Tools, Command-line Tools, and Platform-Tools
+- **Java 17** (JDK)
+- **Python 3**, for the included toolchain check
 
-```text
-window.DragonScriptQoL
-```
+The tested native build stack is **Gradle 8.14**, **Android Gradle Plugin 8.11.1**, and **Kotlin Gradle Plugin 2.2.20**. Avoid updating Flutter or Gradle independently without validating the complete toolchain.
 
-The JavaScript namespace is intentionally shared with the browser extension so existing QoL data and shared runtime calls remain compatible.
-
-Older private/test APKs that used a different Android application ID are separate apps and cannot be updated in place by this package.
-
-## Versioning
-
-Android uses two version values:
-
-```text
-versionName = public/user-facing version
-versionCode = Android's internal monotonically increasing build number
-```
-
-The public stable version line starts at:
-
-```text
-0.1.0
-```
-
-and uses normal three-part versions through:
-
-```text
-100.99.99
-```
-
-Example:
-
-```yaml
-version: 0.1.0+71
-```
-
-In that example:
-
-- `0.1.0` is the visible Android version.
-- `71` is the Android `versionCode`.
-
-`versionCode` must always increase. It must **not** be reset when the public `versionName` is restarted or changed.
-
-Stable Git tags use:
-
-```text
-v0.1.0
-v0.1.1
-v1.0.0
-...
-v100.99.99
-```
-
-## Update model
-
-The Android app and the QoL extension have separate update lifecycles.
-
-### Extension-only update
-
-Normal QoL JavaScript/CSS/features:
-
-```text
-SpicyChat QoL extension release
-        ↓
-Android-compatible QoL bundle
-        ↓
-website manifest
-        ↓
-installed Android app
-```
-
-A compatible extension-only update should **not require a new APK**.
-
-### Native Android update
-
-Changes to Flutter/native Android behavior, for example:
-
-- WebView configuration
-- Android Settings
-- native clipboard
-- Android file picker
-- native notifications
-- Android chat tabs
-- native bridge APIs
-- APK updater behavior
-
-require a new Android APK release.
-
-The planned stable update endpoint is:
-
-```text
-https://spicychatqol.drache.uk/android/manifest.json
-```
-
-The app will check for updates on launch only when at least **12 hours** have passed since the previous automatic check. A manual **Check for updates** action may bypass that timer.
-
-For native APK updates, the first public updater will direct users to:
-
-https://spicychatqol.drache.uk/android/
-
-A later updater may download the APK in-app, verify its checksum, and hand it to Android's package installer.
-
-## Bundle compatibility
-
-The remote QoL bundle/update channel is designed around a native bridge version.
-
-Conceptually:
-
-```text
-bundle minBridgeVersion <= installed bridgeVersion
-→ bundle may be used
-
-bundle minBridgeVersion > installed bridgeVersion
-→ do not load incompatible bundle
-→ Android APK update required
-```
-
-The APK should always retain:
-
-```text
-downloaded current bundle
-        ↓ fallback
-previous known-good bundle
-        ↓ fallback
-bundle embedded in APK
-```
-
-so a broken or incompatible remote QoL release cannot leave the Android app unusable.
-
-## Building locally
-
-### Requirements
-
-Install:
-
-- Git
-- Flutter SDK
-- Android Studio / Android SDK
-- Android SDK command-line tools
-- Java 17
-
-Then verify the environment:
+Open PowerShell and run:
 
 ```powershell
-flutter doctor
+flutter --version
+flutter doctor -v
 flutter doctor --android-licenses
 ```
 
-For detailed Windows setup instructions, see:
+For screenshots and more detailed setup, read [ANDROID_STUDIO_SETUP_WINDOWS.md](ANDROID_STUDIO_SETUP_WINDOWS.md).
 
-[`ANDROID_STUDIO_SETUP_WINDOWS.md`](ANDROID_STUDIO_SETUP_WINDOWS.md)
+### 2. Get both repositories
 
-### Extension source
-
-Current local builds synchronize shared QoL assets from the separate extension source before compiling the APK.
-
-Clone both repositories locally and make sure `build_android.ps1` points `$ExtensionSourceRoot` at your extension checkout.
-
-Example layout:
-
-```text
-D:\Projects\
-├─ spicychat-qol-android\
-└─ spicychat-qol-extension\
-```
-
-The release/CI workflow will provide the extension checkout automatically when GitHub Actions builds a tagged release.
-
-### Build
-
-From the Android repository root:
-
-```bat
-build_android.bat
-```
-
-or:
+The Android APK bundles a snapshot of the separately maintained extension source. Clone them **beside one another**:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\build_android.ps1
+git clone https://github.com/drachescript/spicychat-qol-extension.git
+git clone https://github.com/drachescript/spicychat-qol-android.git
+cd spicychat-qol-android
 ```
 
-The build performs the extension → Android sync, validates the Android package/activity, builds the release APK, verifies the package identity, generates hashes/update metadata, and places generated artifacts under `output\`.
-
-Generated APKs and release output are intentionally ignored by Git.
-
-## Signing
-
-The public application is signed. Never commit signing credentials.
-
-Local release signing uses:
+Recommended folder layout:
 
 ```text
-android_app\android\upload-keystore.jks
-android_app\android\key.properties
+Projects/
+  spicychat-qol-extension/
+  spicychat-qol-android/
 ```
 
-Both are ignored by Git.
+For a reproducible build, use a compatible published **extension tag** instead of an arbitrary untested development commit. GitHub Actions selects the latest published stable extension release automatically.
 
-`key.properties` uses:
+### 3. Set up signing (signed release builds only)
+
+The project's **release** build script requires your existing release signing files:
+
+```text
+android_app/android/upload-keystore.jks
+android_app/android/key.properties
+```
+
+Example `key.properties` format (placeholders only):
 
 ```properties
-storePassword=...
-keyPassword=...
-keyAlias=...
-storeFile=...
+storePassword=YOUR_KEYSTORE_PASSWORD
+keyPassword=YOUR_KEY_PASSWORD
+keyAlias=YOUR_KEY_ALIAS
+storeFile=../upload-keystore.jks
 ```
 
-Keep secure backups of the signing keystore and credentials. Losing the signing identity can prevent future APKs from updating the installed public app.
+**Never commit either signing file or share the passwords.** To install a locally built APK *over the public app*, you must use the original signing identity. Contributors without that key can compile/test a **debug build** instead; they cannot produce an APK signed as the official release.
 
-GitHub Actions releases should reconstruct the keystore from repository secrets rather than storing it in source control.
+### 4. Build with one double-click
 
+From the Android repository folder, double-click:
 
-### Pinned Android CI toolchain
+**`build_android.bat`**
 
-GitHub Actions intentionally uses **Flutter 3.47.9** (rather than the moving
-`stable` release) together with Gradle **8.14**, Android Gradle Plugin
-**8.11.1**, Kotlin Gradle Plugin **2.2.20**, and Java **17**. Flutter 3.50
-raised its Gradle minimum to 9.3.1, which breaks this tested Gradle 8.x
-project configuration. These versions should be upgraded together after an
-APK test, never implicitly when Flutter publishes a new stable release.
+It finds the sibling extension checkout, synchronizes the shared assets, validates native compatibility, builds a signed release APK, and writes the output and checksums to **`output/`**. This BAT intentionally **does not bump your Android version**.
 
-Run `python tools/check_android_toolchain.py` to verify the checked-in
-configuration. Both GitHub workflows additionally verify the installed
-Flutter version before compiling. A failed toolchain preflight stops the
-release safely before Android signing/build steps; it does not publish a
-partially built APK.
+Alternatively, in PowerShell:
 
-## GitHub release model
-
-The stable Android source branch is:
-
-```text
-main
+```powershell
+.\build_android.ps1 -NoVersionBump
 ```
 
-Normal pushes/PRs may run validation, but stable APK publication should be triggered by an Android version tag:
+If the extension is stored somewhere else, set its path explicitly:
 
-```text
-v0.1.0
+```powershell
+.\build_android.ps1 -NoVersionBump -ExtensionSourceRoot "D:\Projects\spicychat-qol-extension"
 ```
 
-The intended release workflow is:
+Typical outputs include:
 
-```text
-prepare release/version
-        ↓
-commit to main
-        ↓
-create + push version tag
-        ↓
-GitHub Actions
-        ↓
-sync extension source from main
-        ↓
-build signed APK
-        ↓
-verify package
-        ↓
-generate SHA-256/update metadata
-        ↓
-publish GitHub Release
+- `output/SpicyChat-QOL-Android-vX.Y.Z.apk` — versioned signed APK
+- `output/SpicyChat-QOL.apk` — convenient latest copy
+- `output/SHA256SUMS.txt` and APK `.sha256` — checksums
+- `output/update.json` and `output/current-version.txt` — update metadata
+
+If the script stops, fix the reported toolchain, signing, or extension-compatibility error rather than bypassing its safety checks.
+
+### No release signing key? Run a debug build
+
+After syncing assets from a compatible extension checkout, you can build a **debug APK** for personal testing without the official release key:
+
+```powershell
+.\update_android.ps1 -SourceRoot "D:\Projects\spicychat-qol-extension"
+cd android_app
+flutter pub get
+flutter build apk --debug
 ```
 
-Android APK releases are published at:
+The debug APK is in `android_app/build/app/outputs/flutter-apk/`. It is not the official signed release and may not install over your existing public app. Back up app data before experimenting with alternate builds.
 
-https://github.com/drachescript/spicychat-qol-android/releases
+### Troubleshooting builds
 
-## Repository policy
+- **`flutter` not found:** install the SDK, add its `bin` folder to your PATH, and reopen PowerShell.
+- **Missing extension source:** keep the repositories beside one another or pass `-ExtensionSourceRoot` to the PowerShell build script.
+- **Missing keystore / `key.properties`:** signed release builds require the existing private signing credentials; use a debug build for unsigned development.
+- **Wrong Flutter/Gradle versions:** run `python tools/check_android_toolchain.py --check-flutter` and follow [the setup guide](ANDROID_STUDIO_SETUP_WINDOWS.md).
+- **New unsupported QoL module:** update the Android compatibility mapping before building; do not silently bypass the guard.
 
-The Android repository intentionally keeps GitHub Issues disabled.
+## Publishing an Android release
 
-Use the main extension issue tracker instead:
+You don't have to build or upload the signed APK by hand when publishing through GitHub.
 
-https://github.com/drachescript/spicychat-qol-extension/issues
+1. Run **`release_next_android.bat`** to prepare the next visible version in `android_app/pubspec.yaml`. This helper does **not** commit, tag, push, or publish anything.
+2. Review the changes in GitHub Desktop, then commit and push `main`.
+3. [Android Validate](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-validate.yml) checks the commit.
+4. After successful validation, [Android Stable Release](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-release.yml) builds the signed APK using the latest stable extension release, verifies it, creates the version tag if needed, and publishes the GitHub release.
+5. The website is notified of the release; [Android VirusTotal Check](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-virustotal.yml) independently checks the newly published APK.
 
-Pull requests may remain enabled for source contributions.
+**Same-version hotfix:** an appropriately named `vX.Y.Z ...` commit (or the workflow's explicit manual hotfix option) can publish a replacement APK with a higher internal `versionCode` while preserving the visible version. The previous release APK may be kept as `_old`.
 
-The repository `.gitignore` intentionally excludes:
+A documentation-only commit should not trigger an unnecessary APK rebuild or scan. The release workflow verifies that the exact source commit passed validation.
 
-- signing keys and `key.properties`
-- local extension checkout
-- Flutter/Dart build state
-- Gradle caches
-- Android `local.properties`
-- IDE files
-- logs
-- generated APK/release output
-- new local patch backups (`android_patch_backups/`)
+## VirusTotal APK scans
 
-Older patch backups already committed to Git are retained under
-[`archives/android_patch_backups/`](archives/android_patch_backups/) for reference.
-The ignored `archive/` directory remains reserved for generated output.
+**[Latest scan workflow and results](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-virustotal.yml)** · **[Latest APK and attached scan reports](https://github.com/drachescript/spicychat-qol-android/releases/latest)** · **[VirusTotal file lookup](https://www.virustotal.com/gui/home/search)**
 
-The Gradle wrapper files are source and **should be committed**.
+GitHub Actions checks the SHA-256 of the **published signed APK**, then looks up the file on VirusTotal or uploads it when appropriate. APKs above 32 MB use VirusTotal's large-file upload endpoint (up to 650 MB). This uses the repository secret `VIRUSTOTAL_API_KEY`; the secret is never included in the README or reports.
 
-## Android-specific features
+For completed checks, the workflow writes the detection counts and **direct VirusTotal report link** to its run summary. When the API key is configured, it also attempts to attach **`VirusTotal-Android-vX.Y.Z.json`** to that Android release; the JSON contains `reportUrl` for the specific APK hash.
 
-The Android wrapper currently includes Android-specific compatibility/features such as:
+**Important:** a green VirusTotal workflow badge does **not necessarily mean an APK was scanned**. If a release run published no new APK, the workflow legitimately skips scanning. Check the workflow's steps or the attached JSON, and distinguish **completed**, **pending**, **unavailable**, and **not configured**. There is no verified direct report URL to pin here until a scan for the current APK actually completes.
 
-- native WebView recovery and navigation handling
-- internal SpicyChat link routing
-- Android-only app settings
-- configurable default launch page
-- optional pinch-to-zoom
-- optional lightweight Android chat tabs
-- native clipboard support
-- native file saving / file picking
-- generated Blob/data-URL download handling
-- Android-compatible QoL diagnostics/runtime messaging
-- Android-only long-press message actions
-- Android media/autoplay compatibility
-- Android listing/card identity normalization
-- configurable native QoL control placement
+To scan an already published APK, open **[Android VirusTotal Check](https://github.com/drachescript/spicychat-qol-android/actions/workflows/android-virustotal.yml) → Run workflow** and enter a release tag such as `v0.1.47`. No APK rebuild is needed. Uploaded files may be shared with VirusTotal's security community; do not use this scanner for private application data or signing material.
 
-See [`android-CHANGELOG.md`](android-CHANGELOG.md) for Android-specific changes.
+VirusTotal results are security signals, **not a guarantee of safety**. Scanning is intentionally separate from APK publication so an unavailable API cannot block a working release.
 
-## Data and privacy
+## Data, privacy, and support
 
-SpicyChat QoL is designed to keep local QoL data local wherever practical.
+Android's storage/clipboard/download bridges run inside the app. QoL settings, saved lists, backups, and other private data generally remain on the device unless you explicitly enable a feature that transfers them. App Log and Support diagnostics are intended for troubleshooting; review exports before sharing.
 
-Android-native bridges are restricted to the app/SpicyChat context and exist to provide platform functionality such as storage, files, clipboard, navigation, and diagnostics.
+Read [Android privacy information](PRIVACY.md) and the main extension's [privacy](https://github.com/drachescript/spicychat-qol-extension/blob/main/PRIVACY.md) and [permissions](https://github.com/drachescript/spicychat-qol-extension/blob/main/PERMISSIONS.md) documents.
 
-QoL support diagnostics are designed to avoid chat text, memory text, Persona text, API keys, webhook secrets, and similar private content.
+**Bug reports and feature requests:** use the [SpicyChat QoL issue tracker](https://github.com/drachescript/spicychat-qol-extension/issues), adding the `android` label for Android-specific problems. Useful details are device model, Android and APK versions, active QoL version, the affected page, reproduction steps, and a safe Support/App Log excerpt. **Do not publish authentication tokens, API keys, private chats, or keystore data.**
 
-For the extension privacy and permission documentation, see:
+## Project files
 
-- https://github.com/drachescript/spicychat-qol-extension/blob/main/PRIVACY.md
-- https://github.com/drachescript/spicychat-qol-extension/blob/main/PERMISSIONS.md
+- `android_app/` — Flutter application, Android native code, WebView bridges, and bundled QoL fallback
+- `build_android.bat` / `build_android.ps1` — local full sync and signed APK build
+- `update_android.ps1` — sync and validate shared extension assets
+- `release_next_android.bat` / `.ps1` — prepare the next Android version (no automatic push)
+- `tools/check_android_toolchain.py` — verify the pinned build toolchain
+- `tools/virustotal_scan.py` — check a published signed APK using VirusTotal
+- `.github/workflows/` — validation, signed release, and VirusTotal automation
+- `android-CHANGELOG.md` — Android-specific release history
+- `ANDROID_STUDIO_SETUP_WINDOWS.md` — Windows setup walkthrough
+- `PRIVACY.md` — Android privacy information
 
-## Support the project
+## Developer, community, and testers
 
 SpicyChat QoL is developed by **DragonGRaf** under **DragonScript**.
 
-Optional project support:
+- **Main extension:** https://github.com/drachescript/spicychat-qol-extension
+- **Android repository:** https://github.com/drachescript/spicychat-qol-android
+- **Project website:** https://spicychatqol.drache.uk
+- **Discord community:** https://discord.gg/XTMdWvuVSU
+- **Contact:** `@dragongraf` on Discord
+- **Optional project support:** https://paypal.me/dragongraf
 
-https://paypal.me/dragongraf
-
-The repository also includes `.github/FUNDING.yml` so GitHub can display the Sponsor button.
-
-## Project links
-
-- Website: https://spicychatqol.drache.uk
-- Android: https://spicychatqol.drache.uk/android/
-- Extension repository: https://github.com/drachescript/spicychat-qol-extension
-- Android repository: https://github.com/drachescript/spicychat-qol-android
-- Discord: https://discord.gg/XTMdWvuVSU
-- Contact: `@dragongraf` on Discord
-
-## Testers
-
-Special thanks to everyone testing the Android wrapper, including:
-
-- **jarek1132** — Android testing
-- **Lilith Rose** — Android testing · 🐛 Bug Hunter
-
-Additional project/tester credits are maintained in the main SpicyChat QoL repository.
+Thanks to Android testers **jarek1132** and **Lilith Rose** (Bug Hunter), and everyone who contributes bug reports and feedback. Additional credits are listed in the main extension project.
