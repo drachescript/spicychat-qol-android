@@ -1,0 +1,126 @@
+name: Android VirusTotal Check
+
+on:
+  workflow_run:
+    workflows: ["Android Stable Release"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Existing release tag to scan (for example v0.1.47); leave blank for the version in pubspec.yaml"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-virustotal-${{ github.event.workflow_run.id || inputs.version || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.head_branch == 'main') }}
+    runs-on: ubuntu-latest
+    # VirusTotal is best-effort. It must never turn a published signed APK
+    # into a failed release if the scanning API times out or rate-limits us.
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout validated Android source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Select a newly published signed APK
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_TAG: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$MANUAL_TAG" ]]; then
+            tag="$MANUAL_TAG"
+          else
+            tag="v$(sed -nE 's/^version: ([0-9]+\.[0-9]+\.[0-9]+)\+[0-9]+[[:space:]]*$/\1/p' android_app/pubspec.yaml | head -n1)"
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Invalid Android release version' >&2
+            exit 1
+          fi
+          apk="SpicyChat-QOL-Android-$tag.apk"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+          asset_created="$(jq -r --arg name "$apk" '[.assets[]? | select(.name==$name) | .created_at][0] // empty' <<<"$release_json")"
+          if [[ -z "$asset_created" ]]; then
+            echo "No published APK found for $tag" >> "$GITHUB_STEP_SUMMARY"
+            echo "should_scan=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            run_created="$(jq -r '.workflow_run.created_at' "$GITHUB_EVENT_PATH")"
+            # For a docs-only/unchanged-version run, the release job completes
+            # successfully but publishes no APK. Do not rescan the old asset.
+            if [[ "$asset_created" < "$run_created" ]]; then
+              echo "No newly published APK in this release run; skipping VirusTotal." >> "$GITHUB_STEP_SUMMARY"
+              echo "should_scan=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "should_scan=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "Selected signed APK: $apk"
+
+      - name: Download and verify signed release APK
+        if: steps.select.outputs.should_scan == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+          APK: ${{ steps.select.outputs.apk }}
+        run: |
+          set -euo pipefail
+          mkdir -p vt-apk
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$APK" --pattern "$APK.sha256" --dir vt-apk
+          cd vt-apk
+          sha256sum --check "$APK.sha256"
+
+      - name: Check the APK with VirusTotal
+        if: steps.select.outputs.should_scan == 'true'
+        id: check
+        shell: bash
+        env:
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+          TAG: ${{ steps.select.outputs.tag }}
+          APK: ${{ steps.select.outputs.apk }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet requests==2.32.5
+          python3 tools/virustotal_scan.py "vt-apk/$APK" \
+            --json-out "VirusTotal-Android-$TAG.json" \
+            --summary-out "VirusTotal-Android-$TAG.md" \
+            --wait-seconds 300
+          cat "VirusTotal-Android-$TAG.md" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$VIRUSTOTAL_API_KEY" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach VirusTotal scan metadata to GitHub release
+        if: steps.check.outputs.configured == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+        run: |
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --clobber "VirusTotal-Android-$TAG.json"
