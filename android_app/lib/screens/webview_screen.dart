@@ -81,6 +81,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   String? _lastSpaRouteUrl;
   String? _lastInjectedDocumentToken;
   String? _injectionInProgressToken;
+  // DS_ANDROID_STARTUP_INJECTION_RECOVERY_V1: one-shot per navigation/commit.
+  Timer? _startupFallbackTimer;
+  int _startupFallbackSerial = 0;
+  bool _startupFallbackRunning = false;
+  bool _startupFallbackRetryAvailable = true;
+  bool _startupProgressSignalArmed = false;
+  bool _lastInjectionVerified = false;
   int _blankHealthFailures = 0;
   int _routeHealthGeneration = 0;
   int _visualGuardGeneration = 0;
@@ -180,6 +187,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _healthTimer?.cancel();
+    _cancelStartupInjectionFallback();
     _rendererExitReminder?.cancel();
     _androidSaveStayBackRepairTimer?.cancel();
     unawaited(_appLog.log('WebView', 'WebView screen disposed; nav=$_navigationSequence; lastCause=$_lastNavigationCause; url=$_lastKnownUrl'));
@@ -220,6 +228,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       // Only a real in-progress load/recovery needs another visual sweep.
       if (_isLoading || _recoveringWebView) {
         _scheduleVisualGuardForCurrentPage('app-resumed');
+      }
+      if ((_isLoading || !_lastInjectionVerified) &&
+          !_rendererExitNeedsManualRecovery) {
+        _armStartupInjectionFallback('app-resumed',
+            delay: const Duration(seconds: 4));
       }
     } else {
       _lastBackgroundAt ??= DateTime.now();
@@ -293,6 +306,108 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         ],
       ));
     });
+  }
+
+  // DS_ANDROID_STARTUP_INJECTION_RECOVERY_V1: bounded, event-driven fallback.
+  // This never recreates a renderer, reloads a chat, or reads user content.
+  void _cancelStartupInjectionFallback() {
+    _startupFallbackTimer?.cancel();
+    _startupFallbackTimer = null;
+    _startupFallbackSerial++;
+  }
+
+  void _armStartupInjectionFallback(
+    String trigger, {
+    Duration delay = const Duration(seconds: 14),
+    bool retry = false,
+  }) {
+    if (!mounted || _rendererExitNeedsManualRecovery) return;
+    if (!retry) _startupFallbackRetryAvailable = true;
+    _startupFallbackTimer?.cancel();
+    final serial = ++_startupFallbackSerial;
+    _startupFallbackTimer = Timer(delay, () {
+      _startupFallbackTimer = null;
+      unawaited(_recoverMissedLoadStop(serial, trigger));
+    });
+  }
+
+  Future<void> _recoverMissedLoadStop(int serial, String trigger) async {
+    final controller = _webController;
+    if (!mounted || !_appIsResumed || _recoveringWebView ||
+        _rendererExitNeedsManualRecovery || _startupFallbackRunning ||
+        serial != _startupFallbackSerial || controller == null) {
+      return;
+    }
+    // A page commit may represent a new document even with a stale
+    // _lastInjectedDocumentToken. The page-global token decides deduplication.
+    _startupFallbackRunning = true;
+    var needsLaterCheck = false;
+    try {
+      final raw = await controller.evaluateJavascript(source: r'''(() => JSON.stringify({
+        href: String(location.href || ''),
+        ready: document.readyState,
+        hasBody: !!document.body
+      }))()''').timeout(const Duration(seconds: 3));
+      final decoded = raw is String ? jsonDecode(raw) : raw;
+      if (decoded is! Map || decoded['hasBody'] != true ||
+          (decoded['ready'] != 'interactive' && decoded['ready'] != 'complete')) {
+        needsLaterCheck = true;
+        return;
+      }
+      final href = (decoded['href'] ?? '').toString();
+      final parsed = Uri.tryParse(href);
+      if (parsed == null || !_isSpicyChat(parsed)) return;
+      if (!mounted || !_appIsResumed || serial != _startupFallbackSerial ||
+          _webController != controller || _rendererExitNeedsManualRecovery) {
+        return;
+      }
+      final verified = await _injectScripts(controller);
+      needsLaterCheck = !verified;
+      if (!mounted || serial != _startupFallbackSerial ||
+          _webController != controller || _rendererExitNeedsManualRecovery) {
+        return;
+      }
+      _lastKnownUrl = href;
+      _loadStartedAt = null;
+      _lastLoadStopAt = DateTime.now();
+      _blankHealthFailures = 0;
+      if (_isLoading || _progress < 1) {
+        setState(() {
+          _isLoading = false;
+          _progress = 1;
+        });
+      }
+      _restorePendingAndroidTabScroll(controller);
+      _scheduleHealthCheck('startup-fallback', delay: const Duration(seconds: 5));
+      _scheduleVisualGuardForCurrentPage('startup-fallback');
+      _scheduleActiveAndroidTabTitleRefresh();
+      unawaited(_appLog.log(
+        'Injection',
+        'Ready document recovered without onLoadStop; trigger=$trigger; '
+        'qolVerified=$verified; nav=$_navigationSequence; '
+        'route=${_isChatUrl(href) ? "chat" : "other"}',
+        level: verified ? 'INFO' : 'WARN',
+      ));
+    } catch (error, stackTrace) {
+      if (_shouldPersistDiagnostic('startup-fallback-error',
+          cooldown: const Duration(seconds: 30))) {
+        unawaited(_appLog.log(
+          'Injection', 'Startup fallback could not verify ready document',
+          level: 'WARN', error: error, stackTrace: stackTrace,
+        ));
+      }
+    } finally {
+      _startupFallbackRunning = false;
+      // At most one delayed recheck if the renderer is still loading or if
+      // QoL is settling. Never re-evaluate a bundle marked for this document.
+      if (needsLaterCheck && _startupFallbackRetryAvailable && mounted &&
+          _appIsResumed && !_rendererExitNeedsManualRecovery &&
+          serial == _startupFallbackSerial) {
+        _startupFallbackRetryAvailable = false;
+        _armStartupInjectionFallback('settle-$trigger',
+            delay: const Duration(seconds: 9), retry: true);
+      }
+    }
   }
 
   void _scheduleHealthCheck(
@@ -812,6 +927,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   Widget build(BuildContext context) {
     final androidTabs = context.watch<AndroidTabsService>();
     final androidUi = context.watch<AndroidUiService>();
+    // Callback identity follows the actual keyed WebView, not Dart controller
+    // wrapper equality (which can differ across flutter_inappwebview events).
+    final callbackWebViewKey = _webViewKey;
     final currentUri = Uri.tryParse(_lastKnownUrl);
     final useSpicyChatTopBarGear =
         androidUi.controlsInSpicyChatTopBar &&
@@ -972,6 +1090,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   );
                 },
                 onWebViewCreated: (controller) {
+                  if (!mounted || _webViewKey != callbackWebViewKey) return;
                   _webController = controller;
                   _nativeWebViewsCreated++;
                   unawaited(_appLog.log('Navigation',
@@ -981,7 +1100,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   _lastInjectedDocumentToken = null;
                   _injectionInProgressToken = null;
                   _lastProgressPercent = -1;
+                  _startupProgressSignalArmed = false;
+                  _lastInjectionVerified = false;
                   _registerJsHandlers(controller);
+                  _armStartupInjectionFallback('webview-created');
                   unawaited(
                     _appLog.log(
                       'WebView',
@@ -990,7 +1112,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   );
                 },
                 onLoadStart: (controller, url) {
-                  if (!mounted || _webController != controller ||
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
                       _rendererExitNeedsManualRecovery) {
                     return;
                   }
@@ -1004,6 +1126,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                       'url=${url ?? _lastKnownUrl}'));
                   _rendererUnresponsiveSince = null;
                   _lastProgressPercent = -1;
+                  _startupProgressSignalArmed = false;
+                  _armStartupInjectionFallback('load-start');
                   _lastSpaRouteUrl = null;
                   _lastSpaRouteAt = null;
                   if (url != null) {
@@ -1041,10 +1165,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onLoadStop: (controller, url) async {
-                  if (!mounted || _webController != controller ||
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
                       _rendererExitNeedsManualRecovery) {
                     return;
                   }
+                  _cancelStartupInjectionFallback();
                   unawaited(_appLog.log('Navigation',
                       'Load stop #$_navigationSequence; cause=$_lastNavigationCause; '
                       'url=${url ?? _lastKnownUrl}'));
@@ -1068,8 +1193,17 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   // Android can fire onLoadStop several times for the same
                   // document. _injectScripts now skips duplicate documents.
                   try {
-                    await _injectScripts(controller);
+                    final verified = await _injectScripts(controller);
+                    if (!verified) {
+                      _armStartupInjectionFallback('post-load-not-ready',
+                          delay: const Duration(seconds: 5));
+                      unawaited(_appLog.log('Injection',
+                        'QoL not ready after load stop; one bounded verification '
+                        'attempt is scheduled', level: 'WARN'));
+                    }
                   } catch (e, stackTrace) {
+                    _armStartupInjectionFallback('post-load-exception',
+                        delay: const Duration(seconds: 5));
                     unawaited(
                       _appLog.log(
                         'Injection',
@@ -1104,7 +1238,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onUpdateVisitedHistory: (controller, url, androidIsReload) {
-                  if (!mounted || _webController != controller ||
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
                       _rendererExitNeedsManualRecovery) {
                     return;
                   }
@@ -1190,10 +1324,30 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                   _scrollByUrl[_lastKnownUrl] = _lastScrollY;
                 },
+                onPageCommitVisible: (controller, url) {
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
+                      _rendererExitNeedsManualRecovery) {
+                    return;
+                  }
+                  if (url != null && _isSpicyChat(url)) {
+                    _armStartupInjectionFallback('page-commit',
+                        delay: const Duration(seconds: 3));
+                  }
+                },
                 onProgressChanged: (controller, progress) {
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
+                      _rendererExitNeedsManualRecovery) {
+                    return;
+                  }
                   // Chromium often emits the same progress value twice.
                   if (progress == _lastProgressPercent) return;
                   _lastProgressPercent = progress;
+                  if (progress >= 95 && _isLoading &&
+                      !_startupProgressSignalArmed) {
+                    _startupProgressSignalArmed = true;
+                    _armStartupInjectionFallback('progress-ready',
+                        delay: const Duration(seconds: 2));
+                  }
 
                   final next = progress / 100;
                   final meaningfulStep =
@@ -1205,7 +1359,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onReceivedError: (controller, request, error) {
-                  if (_webController != controller) {
+                  if (_webViewKey != callbackWebViewKey) {
                     return;
                   }
                   final category = _nativeNetworkCategory(error.type.toString());
@@ -1223,7 +1377,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onReceivedHttpError: (controller, request, errorResponse) {
-                  if (_webController != controller) {
+                  if (_webViewKey != callbackWebViewKey) {
                     return;
                   }
                   final status = errorResponse.statusCode;
@@ -1241,7 +1395,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onRenderProcessUnresponsive: (controller, url) async {
-                  if (!mounted || _webController != controller) {
+                  if (!mounted || _webViewKey != callbackWebViewKey) {
                     return null;
                   }
                   _rendererUnresponsiveSince ??= DateTime.now();
@@ -1262,7 +1416,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessResponsive: (controller, url) async {
-                  if (!mounted || _webController != controller) {
+                  if (!mounted || _webViewKey != callbackWebViewKey) {
                     return null;
                   }
                   // DS_ANDROID_V072_RECOVERY_CAPTURE: native WebView can
@@ -1292,7 +1446,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessGone: (controller, detail) {
-                  if (!mounted || _webController != controller ||
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
                       _rendererExitNeedsManualRecovery) {
                     return;
                   }
@@ -4063,9 +4217,62 @@ $source
       }
     }
   }
-  Future<void> _injectScripts(InAppWebViewController controller) async {
+  // DS_ANDROID_STARTUP_INJECTION_RECOVERY_V1: a successful JS evaluation
+  // is not evidence that the QoL runtime, main scheduler and bridge started.
+  // Only bounded settling checks; no interval, DOM scan, or reinjection.
+  Future<bool> _verifyQolReadiness(
+    InAppWebViewController controller,
+    String token, {
+    bool allowSettling = false,
+  }) async {
+    final attempts = allowSettling ? 3 : 1;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      try {
+        final raw = await controller.evaluateJavascript(source: r'''(() => JSON.stringify({
+          token: String(window.__spicyChatQolAndroidDocumentToken || ''),
+          injected: window.__spicyChatQolAndroidInjected ===
+            window.__spicyChatQolAndroidDocumentToken,
+          bridge: typeof window.__dsAndroidDispatchRuntimeMessage === 'function',
+          qol: !!window.DragonScriptQoL,
+          diagnostic: window.DragonScriptQoL?.__diagnosticProtocolInstalled === true,
+          main: typeof window.DragonScriptQoL?.getLoadedChatMessageCount === 'function',
+          // v0.2.94 exposes a reliable end-to-end startup stage. Older
+          // v0.2.93 falls back to the diagnostic + main-runtime check.
+          startupStage: String(window.DragonScriptQoL?.runtimeStartup?.stage || ''),
+          hasStartup: typeof window.DragonScriptQoL?.getRuntimeStartup === 'function'
+        }))()''').timeout(const Duration(seconds: 3));
+        final decoded = raw is String ? jsonDecode(raw) : raw;
+        if (decoded is Map && decoded['token'] == token) {
+          _lastInjectionBridgeReady = decoded['bridge'] == true;
+          _lastInjectionQolPresent = decoded['qol'] == true;
+          final runtimeReady = decoded['hasStartup'] == true
+              ? decoded['startupStage'] == 'ready'
+              : decoded['diagnostic'] == true && decoded['main'] == true;
+          if (decoded['injected'] == true &&
+              _lastInjectionBridgeReady == true &&
+              _lastInjectionQolPresent == true && runtimeReady) {
+            _lastInjectionVerified = true;
+            return true;
+          }
+        } else {
+          _lastInjectionBridgeReady = false;
+          _lastInjectionQolPresent = false;
+        }
+      } catch (_) {
+        _lastInjectionBridgeReady = null;
+        _lastInjectionQolPresent = null;
+      }
+      if (attempt + 1 < attempts) {
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+      }
+    }
+    _lastInjectionVerified = false;
+    return false;
+  }
+
+  Future<bool> _injectScripts(InAppWebViewController controller) async {
     final url = await controller.getUrl();
-    if (url == null || !_isSpicyChat(url)) return;
+    if (url == null || !_isSpicyChat(url)) return false;
 
     // A page-global document token survives SPA navigation but disappears on
     // a true reload/new document. This prevents repeated evaluation of the
@@ -4084,7 +4291,8 @@ $source
         const token = window.__spicyChatQolAndroidDocumentToken;
         return JSON.stringify({
           token,
-          alreadyInjected: window.__spicyChatQolAndroidInjected === token
+          alreadyInjected: window.__spicyChatQolAndroidInjected === token,
+          attemptStarted: window.__spicyChatQolAndroidInjectionAttempted === token
         });
       })()''',
     );
@@ -4103,12 +4311,16 @@ $source
     }
 
     if (tokenInfo?['alreadyInjected'] == true ||
-        _lastInjectedDocumentToken == token ||
-        _injectionInProgressToken == token) {
-      return;
+        tokenInfo?['attemptStarted'] == true ||
+        _lastInjectedDocumentToken == token) {
+      // A partial bundle attempt may already have installed observers.
+      // Never run it twice in one document, even when readiness failed.
+      return _verifyQolReadiness(controller, token, allowSettling: true);
     }
+    if (_injectionInProgressToken == token) return false;
 
     _injectionInProgressToken = token;
+    _lastInjectionVerified = false;
     final started = DateTime.now();
     final bridgeClock = Stopwatch()..start();
     try {
@@ -4142,6 +4354,18 @@ $source
       await _installAndroidViewportWidthGuard(controller);
       await _installAndroidListingIdentityHelper(controller);
       _lastInjectionPreflightMs = preflightClock.elapsedMilliseconds;
+
+      // Mark the injection ATTEMPT before evaluating QoL scripts.
+      // If evaluation fails midway, never repeat this bundle on a live chat.
+      final attemptMark = await controller.evaluateJavascript(source: r'''(() => {
+        const expected = __EXPECTED__;
+        if (window.__spicyChatQolAndroidDocumentToken !== expected) return false;
+        window.__spicyChatQolAndroidInjectionAttempted = expected;
+        return true;
+      })()'''.replaceFirst('__EXPECTED__', jsonEncode(token)));
+      if (attemptMark != true && attemptMark != 'true') {
+        throw StateError('WebView document changed before QoL injection');
+      }
 
       // Timing only. Preserve the extension's original script order.
       final cssStart = DateTime.now();
@@ -4213,30 +4437,21 @@ $source
         );
       }
 
-      await controller.evaluateJavascript(
-        source:
-            "window.__spicyChatQolAndroidInjected = ${jsonEncode(token)};",
-      );
-
+      // Refuse to mark another document injected if navigation changed while
+      // the long bundle was being evaluated.
+      final mark = await controller.evaluateJavascript(source: r'''(() => {
+        const expected = __EXPECTED__;
+        if (window.__spicyChatQolAndroidDocumentToken !== expected) return false;
+        window.__spicyChatQolAndroidInjected = expected;
+        return true;
+      })()'''.replaceFirst('__EXPECTED__', jsonEncode(token)));
+      if (mark != true && mark != 'true') {
+        throw StateError('WebView document changed during QoL injection');
+      }
       _lastInjectedDocumentToken = token;
       final readinessClock = Stopwatch()..start();
-      // One response after injection; no readiness polling and no extra
-      // full QoL execution. This handshake is document-specific.
-      try {
-        final answer = await controller.evaluateJavascript(source: r'''(() => JSON.stringify({
-          token: String(window.__spicyChatQolAndroidDocumentToken || ''),
-          bridge: typeof window.__dsAndroidDispatchRuntimeMessage === 'function',
-          qol: !!window.DragonScriptQoL
-        }))()''').timeout(const Duration(milliseconds: 1200));
-        final decoded = answer is String ? jsonDecode(answer) : answer;
-        if (decoded is Map && decoded['token'] == token) {
-          _lastInjectionBridgeReady = decoded['bridge'] == true;
-          _lastInjectionQolPresent = decoded['qol'] == true;
-        }
-      } catch (_) {
-        _lastInjectionBridgeReady = null;
-        _lastInjectionQolPresent = null;
-      }
+      final verified = await _verifyQolReadiness(controller, token,
+          allowSettling: true);
       _lastInjectionReadyMs = readinessClock.elapsedMilliseconds;
       final elapsed = DateTime.now().difference(started).inMilliseconds;
       // This value is diagnostic-only and is never persisted in website storage.
@@ -4262,7 +4477,8 @@ $source
       unawaited(
         _appLog.log(
           'Injection',
-          'QoL bundle injected once for document=$token in ${elapsed}ms '
+          'QoL bundle ${verified ? "ready" : "evaluated but NOT READY"} '
+          'for document=$token in ${elapsed}ms '
           '(bridge=${_lastInjectionBridgeMs ?? -1}ms, '
           'preflight=${_lastInjectionPreflightMs ?? -1}ms, '
           'css=${cssMs}ms, js=${jsMs}ms, '
@@ -4270,8 +4486,10 @@ $source
           'bridgeReady=${_lastInjectionBridgeReady ?? "unknown"}, '
           'qolPresent=${_lastInjectionQolPresent ?? "unknown"}); '
           'route=${_isChatUrl(_lastKnownUrl) ? "chat" : "other"}',
+          level: verified ? 'INFO' : 'WARN',
         ),
       );
+      return verified;
     } finally {
       if (_injectionInProgressToken == token) {
         _injectionInProgressToken = null;
@@ -5104,12 +5322,14 @@ $source
         await controller?.stopLoading();
       } catch (_) {}
 
+      _cancelStartupInjectionFallback();
       _webController = null;
       _blankHealthFailures = 0;
       _loadStartedAt = null;
       _lastLoadStopAt = null;
       _lastInjectedDocumentToken = null;
       _injectionInProgressToken = null;
+      _lastInjectionVerified = false;
       _lastProgressPercent = -1;
       _visualGuardGeneration++;
       _initialWebUri = WebUri(target);
@@ -5952,14 +6172,32 @@ $source
         onReloadScripts: () async {
           final messenger = ScaffoldMessenger.of(context);
           Navigator.pop(sheetContext);
-          if (_webController != null) {
-            await _injectScripts(_webController!);
-            messenger.showSnackBar(
-              const SnackBar(
-                content: Text('Scripts re-injected'),
-                duration: Duration(seconds: 1),
-              ),
-            );
+          final controller = _webController;
+          if (controller == null || _rendererExitNeedsManualRecovery) {
+            messenger.showSnackBar(const SnackBar(
+              content: Text('Scripts unavailable: WebView is not ready'),
+            ));
+            return;
+          }
+          try {
+            final verified = await _injectScripts(controller);
+            if (!mounted) return;
+            messenger.showSnackBar(SnackBar(
+              content: Text(verified
+                  ? 'QoL scripts ready (verified)'
+                  : 'QoL scripts not ready; see App Log for details'),
+              duration: const Duration(seconds: 3),
+            ));
+          } catch (error, stackTrace) {
+            unawaited(_appLog.log('Injection',
+              'Manual QoL script verification failed',
+              level: 'ERROR', error: error, stackTrace: stackTrace));
+            if (mounted) {
+              messenger.showSnackBar(const SnackBar(
+                content: Text('QoL injection failed; see App Log'),
+                duration: Duration(seconds: 3),
+              ));
+            }
           }
         },
         onCheckChatScroll: () {
