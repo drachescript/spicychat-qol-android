@@ -656,6 +656,97 @@
     if (sawLocalSettingChange) schedulePatchPush(localRevision || now());
   });
 
+  // DS_ANDROID_QOL_293_CLOUD_AUDIT: Cloud-only read-only inspection; no sync writes.
+  // Manual, read-only Cloud usage report. Android's app-owned sync shim
+  // receives DS_QOL_SYNC_* messages before the downloaded extension runtime.
+  // Keep this action in the app bridge and never expose account tokens or IDs.
+  async function inspectCloudStorageAndroid() {
+    const { state, auth } = await getStateAndAuth();
+    if (!state.accountId || !auth.token) return {
+      ok: false, error: "not_linked",
+      message: "Link this device before checking cloud storage."
+    };
+    const NAMES = ["blockedBots", "favoriteBots", "laterBots", "notInterestedBots", "openedChats"];
+    const values = new Map();
+    let cursor = 0, revision = 0, pages = 0, complete = false;
+    try {
+      for (; pages < 40; pages++) {
+        const result = await api(`/v1/sync?since=${encodeURIComponent(cursor)}`, { token: auth.token });
+        for (const [key, value] of Object.entries(result.changes || {})) values.set(key, value);
+        for (const key of result.deletedKeys || []) values.delete(key);
+        revision = Math.max(revision, Number(result.revision || 0));
+        if (!result.hasMore) { complete = true; pages++; break; }
+        const next = Number(result.maxReturnedRevision || 0);
+        if (!Number.isFinite(next) || next <= cursor)
+          throw Error("Cloud audit pagination did not advance. No estimate was produced.");
+        cursor = next;
+      }
+      if (!complete) throw Error("Cloud audit exceeded the safe 40-page limit. No partial estimate was reported.");
+      const encoder = new TextEncoder();
+      const byteSize = value => encoder.encode(value).byteLength;
+      const lists = {}, best = {}, devices = {};
+      for (const name of NAMES) {
+        lists[name] = { cloudParts: 0, recordedOperations: 0, active: 0, removals: 0,
+          devices: 0, payloadBytes: 0, local: 0, pendingParts: 0, direction: "off" };
+        best[name] = new Map();
+        devices[name] = new Set();
+      }
+      let payloadBytes = 0, settingCount = 0, settingBytes = 0, otherKeys = 0;
+      for (const [key, value] of values) {
+        const size = byteSize(JSON.stringify(key) + ":" + JSON.stringify(value));
+        payloadBytes += size;
+        const match = /^qolDataV1_(blockedBots|favoriteBots|laterBots|notInterestedBots|openedChats)_([a-f0-9]{32})_(\d{2})$/.exec(key);
+        if (!match || Number(match[3]) > 31) {
+          if (key.startsWith("qolDataV1_")) otherKeys++;
+          else { settingCount++; settingBytes += size; }
+          continue;
+        }
+        const scope = match[1], summary = lists[scope];
+        summary.cloudParts++;
+        summary.payloadBytes += size;
+        devices[scope].add(match[2]);
+        if (!Array.isArray(value?.entries)) continue;
+        for (const row of value.entries) {
+          if (!Array.isArray(row) || typeof row[0] !== "string") continue;
+          const id = row[0];
+          if (!(/^[0-9a-f-]{20,80}$/.test(id) ||
+                (scope === "blockedBots" && /^name:[^\x00-\x1f]{1,120}$/.test(id)))) continue;
+          const op = [Number(row[1]) || 0, Number(row[2]) === 1 ? 1 : 0];
+          const old = best[scope].get(id);
+          if (!old || op[0] > old[0] || (op[0] === old[0] && op[1] > old[1]))
+            best[scope].set(id, op);
+          summary.recordedOperations++;
+        }
+      }
+      const localKeys = [...NAMES, "qolSyncDevicePrefsV1", "qolSyncListLedgerV1"];
+      const local = await storageGet(localKeys);
+      const prefs = local.qolSyncDevicePrefsV1 || {};
+      const ledger = local.qolSyncListLedgerV1 || {};
+      let pendingParts = 0;
+      for (const scope of NAMES) {
+        const summary = lists[scope], localValue = local[scope];
+        summary.devices = devices[scope].size;
+        const ops = [...best[scope].values()];
+        summary.active = ops.filter(op => op[1] === 1).length;
+        summary.removals = ops.length - summary.active;
+        const ids = scope === "openedChats" ? localValue : localValue?.ids;
+        summary.local = new Set(Array.isArray(ids) ? ids : []).size;
+        if (scope === "blockedBots" && Array.isArray(localValue?.names))
+          summary.local += new Set(localValue.names).size;
+        summary.direction = String(prefs.listModes?.[scope] || "off");
+        summary.pendingParts = new Set(ledger.dirty?.[scope] || []).size;
+        pendingParts += summary.pendingParts;
+      }
+      return { ok: true, revision, pages, keyCount: values.size,
+        settingCount, settingBytes, listPayloadBytes: payloadBytes - settingBytes,
+        estimatedPayloadBytes: payloadBytes, otherKeys,
+        localLedgerBytes: byteSize(JSON.stringify(ledger)),
+        pendingParts, lists, at: Date.now(), estimateOnly: true };
+    } catch (error) {
+      return { ok: false, error: "cloud_audit_failed", message: safeErrorMessage(error) };
+    }
+  }
+
   async function handleAndroidSyncMessage(message) {
     const type = String(message?.type || "");
     if (!type.startsWith("DS_QOL_SYNC_")) {
@@ -664,6 +755,7 @@
 
     switch (type) {
       case "DS_QOL_SYNC_STATUS": return status();
+      case "DS_QOL_SYNC_INSPECT_CLOUD": return queued(() => inspectCloudStorageAndroid());
       case "DS_QOL_SYNC_CREATE_ACCOUNT": return queued(() => createAccount(message.meta || {}));
       case "DS_QOL_SYNC_LINK_ACCOUNT": return queued(() => linkAccount(message.code, message.meta || {}));
       case "DS_QOL_SYNC_CREATE_LINK_CODE": return queued(() => createLinkCode());
