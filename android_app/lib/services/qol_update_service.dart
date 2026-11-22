@@ -73,11 +73,88 @@ class QolUpdateService extends ChangeNotifier {
     'content/selection-memory.js',
     'content/rulebook-diagnostics.js',
     'content/saved-snippets.js',
+    // v0.2.92: already-known eager features now delivered on demand.
+    'content/chat-backgrounds.js',
+    'content/chat-bookmarks.js',
+    'content/command-palette.js',
+    'content/generation-profiles.js',
+    'content/model-quick-access.js',
+    'content/chat-topbar.js',
+    'content/premium-notifications.js',
+    'content/ad-banners.js',
+    'content/reply-instructions.js',
+    'content/chat-tags.js',
+    'content/native-rating-helpers.js',
+    'content/formatting-toolbar.js',
+    'content/alternate-dialogue.js',
+    'content/failed-message-helper.js',
+    'content/pagination-tools.js',
+    'content/bot-editor-actions.js',
+    'content/bot-editor-memory.js',
+    'content/bot-organizer.js',
+    'content/scroll-to-top.js',
+    'content/translation.js',
+    'content/lorebook-tags.js',
+    'content/chat-history-navigator.js',
   };
   static const Set<String> androidUnavailableOptionalModules = <String>{
     'content/bulk-chat-research.js',
     'content/archive-community-themes.js',
+    // Background/popup/helper-tab features are unavailable in one WebView.
+    'content/chat-lorebook-manager.js',
+    'content/report-link-collector.js',
   };
+
+
+  // DS_ANDROID_FLEXIBLE_OPTIONAL_V1: A newly published optional module is
+  // eligible only if the pinned upstream manifest and loader declare it, its
+  // SHA-256 verified asset is present, and its APIs can run in one WebView.
+  // This screening is conservative; unknown modules may be skipped safely.
+  static final List<RegExp> _unsupportedOptionalApiPatterns = <RegExp>[
+    RegExp(r'\b(?:chrome|browser)\s*\.\s*(?:tabs|windows|downloads|scripting|webRequest|declarativeNetRequest|debugger|proxy|offscreen|alarms|identity|cookies|bookmarks|history|sessions|management|contextMenus)\b'),
+    RegExp(r'\b(?:chrome|browser)\s*\.\s*runtime\s*\.\s*(?:sendMessage|onMessage|connect|onConnect|sendNativeMessage)\b'),
+    RegExp(r'\b(?:importScripts|eval)\s*\('),
+    RegExp(r'\bnew\s+(?:Worker|SharedWorker|Function)\s*\('),
+    RegExp(r'\b(?:navigator|window)\s*\.\s*serviceWorker\b'),
+    RegExp(r'\bimport\s*\('),
+  ];
+
+  static String? optionalModuleRejectionReason(String relative, String source) {
+    if (androidUnavailableOptionalModules.contains(relative)) {
+      return 'requires desktop background or browser tabs';
+    }
+    if (!RegExp(r'^content/[A-Za-z0-9_./-]+\.js$').hasMatch(relative) ||
+        relative.contains('..') || relative.contains('//')) {
+      return 'invalid optional module path';
+    }
+    if (source.isEmpty || source.length > 2 * 1024 * 1024 ||
+        source.contains('\u0000')) {
+      return 'empty, oversized, or invalid module source';
+    }
+    // Known modules preserve existing Android-specific compatibility shims.
+    if (androidSupportedOptionalModules.contains(relative)) return null;
+    for (final pattern in _unsupportedOptionalApiPatterns) {
+      if (pattern.hasMatch(source)) {
+        return 'uses desktop-only or unsupported module APIs';
+      }
+    }
+    return null;
+  }
+
+  final Set<String> _declaredOptionalModules = <String>{};
+  final Map<String, String> _skippedOptionalModules = <String, String>{};
+
+  bool isVerifiedOptionalModulePath(String relative) =>
+      hasDownloadedBundle &&
+      _declaredOptionalModules.contains(relative) &&
+      _webResources.contains(relative);
+
+  void noteOptionalModuleSkipped(String relative, String reason) {
+    // Bound App Log metadata; never include JS, user content, or URLs.
+    if (_skippedOptionalModules.containsKey(relative)) return;
+    if (_skippedOptionalModules.length >= 32) return;
+    _skippedOptionalModules[relative] = reason;
+  }
 
   // DS_ANDROID_V145_287_ARCHIVE_PRESET_NATIVE: public title-only Archive
   // blocking data. No account information, titles, blocked lists or chats are
@@ -200,7 +277,7 @@ class QolUpdateService extends ChangeNotifier {
     }
   }
 
-  static void _checkOptionalLoaderCompatibility(
+  static Set<String> _checkOptionalLoaderCompatibility(
     Map<String, dynamic> manifest,
     String? loaderSource,
   ) {
@@ -223,7 +300,7 @@ class QolUpdateService extends ChangeNotifier {
     }
     // Older published bundles without an optional loader remain compatible.
     if (!scripts.contains('content/on-demand-modules.js')) {
-      return;
+      return <String>{};
     }
 
     const importAnchor =
@@ -265,17 +342,17 @@ class QolUpdateService extends ChangeNotifier {
     final seen = <String>{};
     for (final entry in entries) {
       final path = entry.group(1)!;
-      if (!seen.add(path) || !resourcePaths.contains(path)) {
+      if (!seen.add(path) || !resourcePaths.contains(path) ||
+          path.contains('..') || path.contains('//')) {
         throw StateError('Invalid or unregistered QoL optional module: $path');
       }
-      if (!androidSupportedOptionalModules.contains(path) &&
-          !androidUnavailableOptionalModules.contains(path)) {
-        throw StateError('Unsupported QoL module $path. Update the Android APK to use this QoL release; your existing bundle is preserved.');
-      }
     }
-    if (seen.isEmpty) {
+    if (seen.isEmpty ||
+        RegExp(r'"[^"]+"\s*:').allMatches(block.group(1)!).length !=
+            seen.length) {
       throw StateError('QoL optional-module map was empty or changed format.');
     }
+    return seen;
   }
 
   static const _repoApi =
@@ -288,6 +365,8 @@ class QolUpdateService extends ChangeNotifier {
   static const _androidOptionsSupportFiles = <String>[
     'features.md',
     'CHANGELOG.md',
+    // v0.2.92: loaded by Settings JS, not listed as a script in options.html.
+    'settings/features/options-creator-backups.js',
   ];
 
   static List<String> _optionDependenciesFromHtml(String html) {
@@ -358,7 +437,9 @@ class QolUpdateService extends ChangeNotifier {
         'channel=$updateChannel; sha=$shortSha; '
         'hashes=${_activeHasHashes ? "verified" : "not-downloaded"}; '
         'supportedOptional=${androidSupportedOptionalModules.length}; '
-        'desktopOnly=${androidUnavailableOptionalModules.join(",")}';
+        'desktopOnly=${androidUnavailableOptionalModules.join(",")}; '
+        'skippedOptional=${_skippedOptionalModules.length}; '
+        'skipReasons=${_skippedOptionalModules.entries.map((entry) => '${entry.key}: ${entry.value}').join('; ')}';
   }
   bool get experimentalChannel => _experimentalChannel;
   String get updateChannel => _experimentalChannel
@@ -497,7 +578,28 @@ class QolUpdateService extends ChangeNotifier {
           ? await File(_pathFor(current, 'content/on-demand-modules.js'))
               .readAsString()
           : null;
-      _checkOptionalLoaderCompatibility(currentManifest, currentLoader);
+      final declaredOptional =
+          _checkOptionalLoaderCompatibility(currentManifest, currentLoader);
+      final skippedOptional = <String, String>{};
+      for (final relative in declaredOptional) {
+        // Known supported modules were already hash-verified above.
+        if (androidSupportedOptionalModules.contains(relative)) continue;
+        final reason = androidUnavailableOptionalModules.contains(relative)
+            ? 'requires desktop background or browser tabs'
+            : optionalModuleRejectionReason(
+                relative,
+                await File(_pathFor(current, relative)).readAsString(),
+              );
+        if (reason != null && skippedOptional.length < 32) {
+          skippedOptional[relative] = reason;
+        }
+      }
+      _declaredOptionalModules
+        ..clear()
+        ..addAll(declaredOptional);
+      _skippedOptionalModules
+        ..clear()
+        ..addAll(skippedOptional);
 
       _activeVersion = (map['version'] ?? '').toString().trim();
       _activeSha = sha;
@@ -523,6 +625,8 @@ class QolUpdateService extends ChangeNotifier {
     _runtimeJs = const [];
     _runtimeCss = const [];
     _webResources = const [];
+    _declaredOptionalModules.clear();
+    _skippedOptionalModules.clear();
   }
 
   List<String> _stringList(dynamic value) {

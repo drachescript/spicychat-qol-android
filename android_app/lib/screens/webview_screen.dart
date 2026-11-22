@@ -2575,6 +2575,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     // DS_ANDROID_V143_LAZY_OPTIONAL_MODULES: evaluate only known, downloaded
     // modules in the same WebView world as QoL. Never expose their source to
     // the website as a file URL. Reject requests across document reloads.
+    // DS_ANDROID_FLEXIBLE_OPTIONAL_V1: capability-screened optional modules.
     controller.addJavaScriptHandler(
       handlerName: 'dsLoadOptionalQolModule',
       callback: (args) async {
@@ -2607,7 +2608,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   ? 'This module requires desktop background/browser tabs: $relative'
                   : allowed
                       ? 'Android module asset unavailable: $relative. Check the active QoL update or APK fallback.'
-                      : 'Unsupported Android optional module: $relative. An Android APK update may be required.'};
+                      : 'Android optional module unavailable or failed capability checks: $relative.'};
           }
           if (!mounted || _webController != controller ||
               !await _isCurrentUrlTrusted(controller)) {

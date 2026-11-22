@@ -464,8 +464,10 @@ if ($ContentScripts -contains 'content/on-demand-modules.js') {
     if (-not $ModulesBlock.Success -or -not $AllowedBlock.Success -or -not $DesktopBlock.Success) {
         Fail 'Cannot audit QoL optional-module map against Android runtime policy.'
     }
-    if (-not $BundleSource.Contains('QolUpdateService.androidSupportedOptionalModules.contains(relative)')) {
-        Fail 'Android optional-module runtime does not use the updater policy.'
+    if (-not $BundleSource.Contains('QolUpdateService.optionalModuleRejectionReason(relative, source)') -or
+        -not $BundleSource.Contains('qolUpdates.isVerifiedOptionalModulePath(relative)') -or
+        -not $UpdaterSource.Contains('DS_ANDROID_FLEXIBLE_OPTIONAL_V1')) {
+        Fail 'Android optional-module runtime capability policy is missing.'
     }
     $Modules = [regex]::Matches($ModulesBlock.Groups['items'].Value,
         '"[^"]+"\s*:\s*"(?<relative>content/[^"]+\.js)"')
@@ -506,8 +508,10 @@ if ($ContentScripts -contains 'content/on-demand-modules.js') {
             }
             continue
         }
+        # DS_ANDROID_FLEXIBLE_OPTIONAL_V1: New declared modules are screened
+        # against native APIs after verified download, not blocked at build time.
         if ($UpdaterAllowed -notcontains $RelativeModule) {
-            Fail "New/renamed QoL module lacks Android mapping: $RelativeModule"
+            Write-Host "New optional QoL module: $RelativeModule (runtime capability-screened)" -ForegroundColor Yellow
         }
     }
     Write-Host "Android lazy-module compatibility verified ($($Modules.Count) upstream modules)." -ForegroundColor Green
@@ -681,6 +685,19 @@ if ($OptionsPage) {
     )
     [void]$RequiredOptionScripts.Add("options.js")
     [void]$RequiredOptionScripts.Add("feature-registry.js")
+
+    # v0.2.92: Creator Backups uses a runtime script tag instead of an HTML tag.
+    # Keep the deferred source in the APK's bundled fallback. This does not
+    # modify upstream QoL and it is still checked like every other dependency.
+    $CreatorLazySource = Join-Path $ResolvedSource 'settings\options-lazy-tab-cleanup.js'
+    if ($OptionsScriptSources -notcontains 'settings/features/options-creator-backups.js' -and
+        (Test-Path -LiteralPath $CreatorLazySource) -and
+        (Read-Utf8Text $CreatorLazySource).Contains('ensureCreatorBackupModuleLoaded')) {
+        $OptionsScriptSources = Ordered-Unique @(
+            @($OptionsScriptSources) + @('settings/features/options-creator-backups.js')
+        )
+        [void]$RequiredOptionScripts.Add('options-creator-backups.js')
+    }
 
     $RequiredOptionStyles = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase

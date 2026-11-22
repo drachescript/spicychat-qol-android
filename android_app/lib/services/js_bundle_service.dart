@@ -168,7 +168,15 @@ class JsBundleService extends ChangeNotifier {
   // The desktop-only Archive Community Themes feature needs a browser worker.
   // Its saved settings are left untouched on Android.
   Future<String?> readAndroidOptionalModule(String relative) async {
-    if (!QolUpdateService.androidSupportedOptionalModules.contains(relative)) {
+    // DS_ANDROID_FLEXIBLE_OPTIONAL_V1: downloaded unknown modules must be
+    // declared by the verified loader, not merely present in web resources.
+    if (QolUpdateService.androidUnavailableOptionalModules.contains(relative)) {
+      qolUpdates.noteOptionalModuleSkipped(relative, 'desktop-only module');
+      return null;
+    }
+    if (qolUpdates.hasDownloadedBundle) {
+      if (!qolUpdates.isVerifiedOptionalModulePath(relative)) return null;
+    } else if (!QolUpdateService.androidSupportedOptionalModules.contains(relative)) {
       return null;
     }
     String? source;
@@ -190,6 +198,12 @@ class JsBundleService extends ChangeNotifier {
       }
     }
     if (source == null || source.isEmpty || source.length > 2 * 1024 * 1024) {
+      return null;
+    }
+    final rejected =
+        QolUpdateService.optionalModuleRejectionReason(relative, source);
+    if (rejected != null) {
+      qolUpdates.noteOptionalModuleSkipped(relative, rejected);
       return null;
     }
     return _androidDesktopOnlySource(relative, source);
@@ -223,6 +237,7 @@ class JsBundleService extends ChangeNotifier {
     // These modules manage helper/browser tabs, or open another window as a
     // required part of the feature. Do not run them on Android at all.
     if (file.endsWith('/chat-lorebook-manager.js') ||
+        file.endsWith('/report-link-collector.js') ||
         file.endsWith('/auto-afk.js') ||
         file.endsWith('/list-fill.js') ||
         // DS_ANDROID_20261116_DESKTOP_RESEARCH_GUARD: no helper tabs or browser download verification.
@@ -279,9 +294,11 @@ class JsBundleService extends ChangeNotifier {
     });
   }
   function ensure(name) {
-    // Archive's remote matching requires a desktop background service worker.
-    if (window.__spicyChatQolAndroidApp &&
-        name === "archive-community-themes") return Promise.resolve(false);
+    // These require a desktop service worker, helper tabs or popup controls.
+    if (window.__spicyChatQolAndroidApp && [
+        "archive-community-themes", "chat-lorebook-manager",
+        "report-link-collector"
+    ].includes(name)) return Promise.resolve(false);
 ''')
           .replaceFirst(importAnchor, r'''
     const operation = window.__spicyChatQolAndroidApp
@@ -289,7 +306,7 @@ class JsBundleService extends ChangeNotifier {
       : import(chrome.runtime.getURL(path));
     const promise = operation.then(() => {''')
           .replaceFirst(listAnchor,
-              '    return list.filter(name => name !== "archive-community-themes");');
+              '    return list.filter(name => !["archive-community-themes", "chat-lorebook-manager", "report-link-collector"].includes(name));');
     }
 
     // QoL's common platform layer already hides the other desktop-only
@@ -303,11 +320,12 @@ class JsBundleService extends ChangeNotifier {
     showQuickNotInterestedButtons: ["helperTabs"],
     enableChatLorebookManager: ["helperTabs"],
     showBulkChatResearchExport: ["helperTabs", "backgroundWorkers"],
-    archiveCommunityThemesEnabled: ["backgroundWorkers"],''';
+    archiveCommunityThemesEnabled: ["backgroundWorkers"],
+    enableReportLinkCollector: ["backgroundWorkers"],''';
     const featureAnchor =
         '    "quick-dislike": { requires: ["helperTabs"], mode: "all" },';
     const featureRule =
-        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },\n    "archive-community-themes": { requires: ["backgroundWorkers"], mode: "all" },';
+        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },\n    "archive-community-themes": { requires: ["backgroundWorkers"], mode: "all" },\n    "report-link-collector": { requires: ["backgroundWorkers"], mode: "all" },';
     const actionAnchor =
         '    bulkLessLikeBlockedBots: ["bulkOperations", "helperTabs"],';
     const actionRules = '''
@@ -1228,6 +1246,35 @@ $earlyMainSource
     }
 
     var html = htmlSource;
+
+    // v0.2.92: Creator Backups moved from an eager options.html script tag to
+    // a JS-created deferred script. Android Settings is an inlined HTML page,
+    // with no working settings/ URL on the WebView origin. Embed this single
+    // verified support file before options.js when it is absent from HTML.
+    // The desktop loader detects the registered functions and never fetches it.
+    final creatorBackupTag = RegExp(
+      r'''<script\b[^>]*\bsrc=["']settings/features/options-creator-backups\.js["']''',
+      caseSensitive: false,
+    );
+    if (!creatorBackupTag.hasMatch(html) &&
+        html.contains('settings/options-lazy-tab-cleanup.js')) {
+      final source = await loadOptional(
+        'settings/features/options-creator-backups.js',
+        'assets/options/options-creator-backups.js',
+      );
+      if (source == null || source.trim().isEmpty) {
+        throw StateError('Android Creator Backup Settings dependency missing.');
+      }
+      const marker = '<script src="options.js"></script>';
+      if (!html.contains(marker)) {
+        throw StateError('Android Options entry script is missing.');
+      }
+      html = html.replaceFirst(
+        marker,
+        '<script data-ds-options-source="settings/features/options-creator-backups.js">'
+        '${_safeScript(source)}</script>\n$marker',
+      );
+    }
 
     if (!html.contains('name="viewport"')) {
       html = html.replaceFirst(
