@@ -329,6 +329,8 @@ class QolUpdateService extends ChangeNotifier {
   String _activeSha = '';
   bool _experimentalChannel = false;
   String? _selectedReleaseVersion;
+  // DS_ANDROID_V291_HASH_METRICS: verification still runs; this is timing only.
+  String _lastHashVerificationTiming = 'not-measured';
   bool _activeHasHashes = false;
   List<String> _runtimeJs = const [];
   List<String> _runtimeCss = const [];
@@ -341,6 +343,7 @@ class QolUpdateService extends ChangeNotifier {
   String? get errorMessage => _errorMessage;
   DateTime? get lastCheckedAt => _lastCheckedAt;
   String get activeVersion => _activeVersion;
+  String get lastHashVerificationTiming => _lastHashVerificationTiming;
   String get activeSha => _activeSha;
   // DS_ANDROID_V289_COMPAT_REPORT: no private URLs or chat content.
   // Only used when explicitly copying or exporting the local App Log.
@@ -400,6 +403,9 @@ class QolUpdateService extends ChangeNotifier {
   }
 
   Future<void> _loadActiveMetadata() async {
+    final validationClock = Stopwatch()..start();
+    var fileChecks = 0;
+    _lastHashVerificationTiming = 'not-measured';
     final current = _currentDir;
     if (current == null || !await current.exists()) {
       _clearActiveMetadata();
@@ -464,6 +470,7 @@ class QolUpdateService extends ChangeNotifier {
           _clearActiveMetadata();
           return;
         }
+        fileChecks++;
         // Old v1 downloads are readable, but all newly downloaded v2
         // bundles must have every asset verified byte for byte.
         if (requiresHashes || hashes.isNotEmpty) {
@@ -495,10 +502,16 @@ class QolUpdateService extends ChangeNotifier {
       _activeVersion = (map['version'] ?? '').toString().trim();
       _activeSha = sha;
       _activeHasHashes = requiresHashes;
+      _lastHashVerificationTiming = 'files=$fileChecks; '
+          'sha256=${requiresHashes || hashes.isNotEmpty}; '
+          'elapsedMs=${validationClock.elapsedMilliseconds}; '
+          'result=valid';
       _runtimeJs = runtimeJs;
       _runtimeCss = runtimeCss;
       _webResources = webResources;
     } catch (_) {
+      _lastHashVerificationTiming = 'files=$fileChecks; '
+          'elapsedMs=${validationClock.elapsedMilliseconds}; result=invalid';
       _clearActiveMetadata();
     }
   }

@@ -90,6 +90,24 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   bool _nativeSaveBusy = false;
   DateTime? _lastBackgroundAt;
   int _navigationSequence = 0;
+  // DS_ANDROID_V291_NATIVE_METRICS: bounded event counters; no polling or chat data.
+  int _nativeWebViewsCreated = 0;
+  int _nativeRendererExits = 0;
+  int _nativeBackgroundRendererExits = 0;
+  int _nativeConfirmedCrashes = 0;
+  int _nativeRecoveryRequests = 0;
+  int _nativeBridgeUnready = 0;
+  int _nativeBridgeStale = 0;
+  int _nativeBridgeTimeouts = 0;
+  int _nativeNetworkFailures = 0;
+  int _nativeDnsFailures = 0;
+  int _nativeResizeObserverWarnings = 0;
+  int? _lastInjectionBridgeMs;
+  int? _lastInjectionPreflightMs;
+  int? _lastInjectionReadyMs;
+  bool? _lastInjectionBridgeReady;
+  bool? _lastInjectionQolPresent;
+
   String _lastNavigationCause = 'initial';
   // DS_ANDROID_PERF59_DIAGNOSTICS: time renderer stalls without extra probes.
   DateTime? _rendererUnresponsiveSince;
@@ -290,6 +308,30 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       }
       await _runWebViewHealthCheck(trigger: trigger);
     });
+  }
+
+  // DS_ANDROID_V291_NETWORK_CATEGORY: never log query strings or auth URLs.
+  static String _nativeNetworkCategory(String name) {
+    final value = name.toLowerCase();
+    if (value.contains('host_lookup') || value.contains('dns') ||
+        value.contains('name_not_resolved')) {
+      return 'dns';
+    }
+    if (value.contains('timeout') || value.contains('timed_out')) {
+      return 'timeout';
+    }
+    if (value.contains('cancel') || value.contains('abort')) {
+      return 'cancelled';
+    }
+    if (value.contains('auth') || value.contains('certificate') ||
+        value.contains('ssl')) {
+      return 'tls-auth';
+    }
+    if (value.contains('connect') || value.contains('unreachable') ||
+        value.contains('internet_disconnected')) {
+      return 'connection';
+    }
+    return 'other';
   }
 
   bool _shouldPersistDiagnostic(
@@ -931,6 +973,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onWebViewCreated: (controller) {
                   _webController = controller;
+                  _nativeWebViewsCreated++;
                   unawaited(_appLog.log('Navigation',
                       'Native WebView created; nav=$_navigationSequence; '
                       'lastCause=$_lastNavigationCause; resumed=$_appIsResumed; '
@@ -947,6 +990,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   );
                 },
                 onLoadStart: (controller, url) {
+                  if (!mounted || _webController != controller ||
+                      _rendererExitNeedsManualRecovery) {
+                    return;
+                  }
                   _loadStartedAt = DateTime.now();
                   _navigationSequence++;
                   _lastNavigationCause = _recoveringWebView
@@ -994,6 +1041,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onLoadStop: (controller, url) async {
+                  if (!mounted || _webController != controller ||
+                      _rendererExitNeedsManualRecovery) {
+                    return;
+                  }
                   unawaited(_appLog.log('Navigation',
                       'Load stop #$_navigationSequence; cause=$_lastNavigationCause; '
                       'url=${url ?? _lastKnownUrl}'));
@@ -1053,6 +1104,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onUpdateVisitedHistory: (controller, url, androidIsReload) {
+                  if (!mounted || _webController != controller ||
+                      _rendererExitNeedsManualRecovery) {
+                    return;
+                  }
                   final route = url?.toString() ?? _lastKnownUrl;
                   final previousRoute = _lastKnownUrl;
                   final previousScroll =
@@ -1150,32 +1205,45 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   }
                 },
                 onReceivedError: (controller, request, error) {
-                  final key =
-                      'resource:${request.url.host}:${error.type.toString()}';
+                  if (_webController != controller) {
+                    return;
+                  }
+                  final category = _nativeNetworkCategory(error.type.toString());
+                  _nativeNetworkFailures++;
+                  if (category == 'dns') {
+                    _nativeDnsFailures++;
+                  }
+                  final host = request.url.host;
+                  final key = 'resource:$host:$category';
                   if (_shouldPersistDiagnostic(key)) {
-                    unawaited(
-                      _appLog.log(
-                        'WebViewError',
-                        'Resource error: ${request.url} | ${error.type} | ${error.description}',
-                        level: 'WARN',
-                      ),
-                    );
+                    unawaited(_appLog.log('WebViewError',
+                      'Resource failure category=$category host=$host '
+                      'mainFrame=${request.isForMainFrame} '
+                      '(no automatic page reload)', level: 'WARN'));
                   }
                 },
                 onReceivedHttpError: (controller, request, errorResponse) {
-                  final key =
-                      'http:${request.url.host}:${request.url.path}:${errorResponse.statusCode}';
+                  if (_webController != controller) {
+                    return;
+                  }
+                  final status = errorResponse.statusCode;
+                  final category = status == 401 || status == 403
+                      ? 'authentication' : status == 429
+                      ? 'rate-limit' : status != null && status >= 500
+                      ? 'server' : 'http';
+                  final host = request.url.host;
+                  final key = 'http:$host:$status';
                   if (_shouldPersistDiagnostic(key)) {
-                    unawaited(
-                      _appLog.log(
-                        'WebViewHttp',
-                        'HTTP error: ${request.url} | status=${errorResponse.statusCode}',
-                        level: 'WARN',
-                      ),
-                    );
+                    unawaited(_appLog.log('WebViewHttp',
+                      'HTTP failure category=$category host=$host '
+                      'status=$status mainFrame=${request.isForMainFrame} '
+                      '(no automatic page reload)', level: 'WARN'));
                   }
                 },
                 onRenderProcessUnresponsive: (controller, url) async {
+                  if (!mounted || _webController != controller) {
+                    return null;
+                  }
                   _rendererUnresponsiveSince ??= DateTime.now();
                   if (_shouldPersistDiagnostic(
                     'renderer-unresponsive',
@@ -1194,6 +1262,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessResponsive: (controller, url) async {
+                  if (!mounted || _webController != controller) {
+                    return null;
+                  }
                   // DS_ANDROID_V072_RECOVERY_CAPTURE: native WebView can
                   // issue responsive callbacks without a paired start. Such
                   // events are not timed stalls and need no snapshot/log.
@@ -1221,19 +1292,34 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return null;
                 },
                 onRenderProcessGone: (controller, detail) {
+                  if (!mounted || _webController != controller ||
+                      _rendererExitNeedsManualRecovery) {
+                    return;
+                  }
                   _rendererUnresponsiveSince = null;
                   _rendererExitNeedsManualRecovery = true;
+                  _nativeRendererExits++;
+                  if (!_appIsResumed) {
+                    _nativeBackgroundRendererExits++;
+                  }
+                  if (detail.didCrash) {
+                    _nativeConfirmedCrashes++;
+                  }
+                  final reason = detail.didCrash
+                      ? 'confirmed-crash' : !_appIsResumed
+                      ? 'background-termination' : 'renderer-terminated';
                   unawaited(_appLog.log(
                     'Renderer',
-                    'Android WebView renderer exited; '
+                    'Android WebView renderer exit reason=$reason; '
                     'didCrash=${detail.didCrash}; '
                     'priority=${detail.rendererPriorityAtExit}; '
                     'appVisible=$_appIsResumed; '
-                    'manual recovery required (no automatic reload)',
-                    level: 'ERROR',
+                    'manual recovery required (healthy pages never reloaded)',
+                    level: detail.didCrash ? 'ERROR' : 'WARN',
                   ));
-                  // Foreground: show a non-destructive native notice.
-                  // Background: defer all UI until the Activity is visible.
+                  // The renderer is confirmed unusable, but an active chat may
+                  // have an unsaved draft; require consent before recreation.
+                  // A background exit shows no UI until the Activity resumes.
                   _showRendererExitNotice();
                 },
                 // Extension helpers sometimes use target="_blank" or window.open()
@@ -1340,6 +1426,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   return NavigationActionPolicy.ALLOW;
                 },
                 onConsoleMessage: (controller, consoleMessage) {
+                  if (!mounted || _webController != controller) {
+                    return;
+                  }
                   final message = consoleMessage.message;
                   final level = consoleMessage.messageLevel.toString();
                   if (kDebugMode) {
@@ -1357,6 +1446,29 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                         'logrocket-react does not work with this version of React',
                       );
                   if (noisySiteConsole) return;
+                  if (message.contains('SyntaxError')) {
+                    if (_shouldPersistDiagnostic('native-js-syntax',
+                        cooldown: const Duration(minutes: 2))) {
+                      final category = message.contains('Invalid or unexpected token')
+                          ? 'invalid-or-unexpected-token' : 'other-syntax-error';
+                      unawaited(_appLog.log('JavaScriptSyntax',
+                          'JavaScript syntax error category=$category; '
+                          'source metadata unavailable from console callback',
+                          level: 'ERROR'));
+                    }
+                    return;
+                  }
+                  if (message.contains('ResizeObserver loop limit exceeded') ||
+                      message.contains('ResizeObserver loop completed with undelivered notifications')) {
+                    _nativeResizeObserverWarnings++;
+                    if (_nativeResizeObserverWarnings == 1 ||
+                        _nativeResizeObserverWarnings % 50 == 0) {
+                      unawaited(_appLog.log('NativeLayout',
+                          'Repeated ResizeObserver warnings (observed=$_nativeResizeObserverWarnings); '
+                          'cause unknown, no observer was suppressed', level: 'WARN'));
+                    }
+                    return;
+                  }
 
                   if (lower.contains('error') ||
                       lower.contains('warning') ||
@@ -1986,59 +2098,60 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (controller == null || !mounted) return;
 
     try {
+      // DS_ANDROID_V291_COMMAND_PALETTE_JS: raw string must contain valid JS.
       final rawResult = await controller.evaluateJavascript(
         source: r'''(async () => {
           const visiblePalette = () => !!document.querySelector(
             '#ds-command-palette:not([hidden]), ' +
             '.ds-command-palette:not([hidden]), ' +
             '[data-ds-command-palette]:not([hidden]), ' +
-            '[role=\"dialog\"][data-ds-palette-open=\"1\"]'
+            '[role="dialog"][data-ds-palette-open="1"]'
           );
 
           if (visiblePalette()) {
-            return JSON.stringify({ ok: true, via: \"already-open\" });
+            return JSON.stringify({ ok: true, via: "already-open" });
           }
 
           const DS = window.DragonScriptQoL;
           const directAttempts = [
-            [\"DS.openCommandPalette\", () => DS?.openCommandPalette?.()],
-            [\"DS.showCommandPalette\", () => DS?.showCommandPalette?.()],
-            [\"DS.commandPalette.open\", () => DS?.commandPalette?.open?.()],
-            [\"DS.commandPalette.show\", () => DS?.commandPalette?.show?.()]
+            ["DS.openCommandPalette", () => DS?.openCommandPalette?.()],
+            ["DS.showCommandPalette", () => DS?.showCommandPalette?.()],
+            ["DS.commandPalette.open", () => DS?.commandPalette?.open?.()],
+            ["DS.commandPalette.show", () => DS?.commandPalette?.show?.()]
           ];
 
           for (const [name, fn] of directAttempts) {
             try {
-              if (typeof fn !== \"function\") continue;
+              if (typeof fn !== "function") continue;
               const result = fn();
-              if (result && typeof result.then === \"function\") await result;
+              if (result && typeof result.then === "function") await result;
               await new Promise(resolve => setTimeout(resolve, 30));
               if (visiblePalette()) return JSON.stringify({ ok: true, via: name });
             } catch {}
           }
 
           const shortcuts = [
-            { key: \"k\", code: \"KeyK\", ctrlKey: true, metaKey: false, shiftKey: false, altKey: false },
-            { key: \"k\", code: \"KeyK\", ctrlKey: true, metaKey: false, shiftKey: true, altKey: false },
-            { key: \"k\", code: \"KeyK\", ctrlKey: false, metaKey: false, shiftKey: false, altKey: true },
-            { key: \"k\", code: \"KeyK\", ctrlKey: false, metaKey: true, shiftKey: false, altKey: false },
-            { key: \"k\", code: \"KeyK\", ctrlKey: false, metaKey: true, shiftKey: true, altKey: false }
+            { key: "k", code: "KeyK", ctrlKey: true, metaKey: false, shiftKey: false, altKey: false },
+            { key: "k", code: "KeyK", ctrlKey: true, metaKey: false, shiftKey: true, altKey: false },
+            { key: "k", code: "KeyK", ctrlKey: false, metaKey: false, shiftKey: false, altKey: true },
+            { key: "k", code: "KeyK", ctrlKey: false, metaKey: true, shiftKey: false, altKey: false },
+            { key: "k", code: "KeyK", ctrlKey: false, metaKey: true, shiftKey: true, altKey: false }
           ];
 
           for (const init of shortcuts) {
             try {
-              document.dispatchEvent(new KeyboardEvent(\"keydown\", { ...init, bubbles: true, cancelable: true }));
-              window.dispatchEvent(new KeyboardEvent(\"keydown\", { ...init, bubbles: true, cancelable: true }));
+              document.dispatchEvent(new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true }));
+              window.dispatchEvent(new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true }));
               await new Promise(resolve => setTimeout(resolve, 45));
-              if (visiblePalette()) return JSON.stringify({ ok: true, via: \"shortcut\" });
+              if (visiblePalette()) return JSON.stringify({ ok: true, via: "shortcut" });
             } catch {}
           }
 
           try {
-            window.dispatchEvent(new CustomEvent(\"spicychat-qol:open-command-palette\"));
-            document.dispatchEvent(new CustomEvent(\"spicychat-qol:open-command-palette\"));
+            window.dispatchEvent(new CustomEvent("spicychat-qol:open-command-palette"));
+            document.dispatchEvent(new CustomEvent("spicychat-qol:open-command-palette"));
             await new Promise(resolve => setTimeout(resolve, 50));
-            if (visiblePalette()) return JSON.stringify({ ok: true, via: \"custom-event\" });
+            if (visiblePalette()) return JSON.stringify({ ok: true, via: "custom-event" });
           } catch {}
 
           return JSON.stringify({ ok: false });
@@ -2146,14 +2259,27 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   Future<dynamic> _sendAndroidMainTabMessage(dynamic message) async {
     final controller = _webController;
-    if (controller == null) return null;
+    if (controller == null || _rendererExitNeedsManualRecovery) {
+      return null;
+    }
 
     try {
       if (!await _isCurrentUrlTrusted(controller)) return null;
+      // DS_ANDROID_V291_NATIVE_BRIDGE_EPOCH: don't report startup as a QoL
+      // failure before this document has finished its one-time injection.
+      final expectedToken = _lastInjectedDocumentToken;
+      if (expectedToken == null || _injectionInProgressToken != null) {
+        _nativeBridgeUnready++;
+        return null;
+      }
 
       final encodedMessage = jsonEncode(message);
       final rawResultFuture = controller.evaluateJavascript(
         source: '''(async () => {
+          const expectedToken = ${jsonEncode(expectedToken)};
+          if (window.__spicyChatQolAndroidDocumentToken !== expectedToken) {
+            return JSON.stringify({ ok: false, error: 'document-stale' });
+          }
           const dispatch = window.__dsAndroidDispatchRuntimeMessage;
           if (typeof dispatch !== "function") {
             return JSON.stringify({
@@ -2182,6 +2308,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
           try {
             const response = await dispatch($encodedMessage, sender);
+            if (window.__spicyChatQolAndroidDocumentToken !== expectedToken) {
+              return JSON.stringify({ ok: false, error: 'document-stale' });
+            }
             return JSON.stringify({
               ok: true,
               response: response === undefined ? null : response
@@ -2204,6 +2333,12 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
               ? await rawResultFuture.timeout(const Duration(milliseconds: 4500))
               : await rawResultFuture;
 
+      // A disposed/replaced WebView must never answer an active Options page.
+      if (!mounted || _webController != controller ||
+          expectedToken != _lastInjectedDocumentToken) {
+        _nativeBridgeStale++;
+        return null;
+      }
       // Android WebView can return either JSON text or a JSON-quoted
       // string containing JSON. Decode no more than twice and never treat a
       // failed dispatch as a successful full QoL runtime response.
@@ -2228,6 +2363,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       // Options constructs an explicitly labeled partial result instead.
       return null;
     } catch (e, stackTrace) {
+      if (e is TimeoutException) {
+        _nativeBridgeTimeouts++;
+      }
       if (_shouldPersistDiagnostic('android-options-main-runtime-message')) {
         unawaited(
           _appLog.log(
@@ -3971,6 +4109,7 @@ $source
 
     _injectionInProgressToken = token;
     final started = DateTime.now();
+    final bridgeClock = Stopwatch()..start();
     try {
       // Publish Android wrapper identity/capabilities before any normal QoL
       // script executes. The real WebView UA is also left intact.
@@ -3997,9 +4136,11 @@ $source
           } catch {}
         })();''',
       );
-
+      _lastInjectionBridgeMs = bridgeClock.elapsedMilliseconds;
+      final preflightClock = Stopwatch()..start();
       await _installAndroidViewportWidthGuard(controller);
       await _installAndroidListingIdentityHelper(controller);
+      _lastInjectionPreflightMs = preflightClock.elapsedMilliseconds;
 
       // Timing only. Preserve the extension's original script order.
       final cssStart = DateTime.now();
@@ -4077,12 +4218,36 @@ $source
       );
 
       _lastInjectedDocumentToken = token;
+      final readinessClock = Stopwatch()..start();
+      // One response after injection; no readiness polling and no extra
+      // full QoL execution. This handshake is document-specific.
+      try {
+        final answer = await controller.evaluateJavascript(source: r'''(() => JSON.stringify({
+          token: String(window.__spicyChatQolAndroidDocumentToken || ''),
+          bridge: typeof window.__dsAndroidDispatchRuntimeMessage === 'function',
+          qol: !!window.DragonScriptQoL
+        }))()''').timeout(const Duration(milliseconds: 1200));
+        final decoded = answer is String ? jsonDecode(answer) : answer;
+        if (decoded is Map && decoded['token'] == token) {
+          _lastInjectionBridgeReady = decoded['bridge'] == true;
+          _lastInjectionQolPresent = decoded['qol'] == true;
+        }
+      } catch (_) {
+        _lastInjectionBridgeReady = null;
+        _lastInjectionQolPresent = null;
+      }
+      _lastInjectionReadyMs = readinessClock.elapsedMilliseconds;
       final elapsed = DateTime.now().difference(started).inMilliseconds;
       // This value is diagnostic-only and is never persisted in website storage.
       final timing = <String, dynamic>{
         'totalMs': elapsed,
         'cssMs': cssMs,
         'jsMs': jsMs,
+        'bridgeMs': _lastInjectionBridgeMs,
+        'preflightMs': _lastInjectionPreflightMs,
+        'readinessMs': _lastInjectionReadyMs,
+        'bridgeReady': _lastInjectionBridgeReady,
+        'qolPresent': _lastInjectionQolPresent,
         'sourceChars': widget.bundleService.jsBundle.length,
         'version': widget.bundleService.extensionVersion,
       };
@@ -4097,7 +4262,13 @@ $source
         _appLog.log(
           'Injection',
           'QoL bundle injected once for document=$token in ${elapsed}ms '
-          '(css=${cssMs}ms, js=${jsMs}ms); url=$url',
+          '(bridge=${_lastInjectionBridgeMs ?? -1}ms, '
+          'preflight=${_lastInjectionPreflightMs ?? -1}ms, '
+          'css=${cssMs}ms, js=${jsMs}ms, '
+          'readiness=${_lastInjectionReadyMs ?? -1}ms, '
+          'bridgeReady=${_lastInjectionBridgeReady ?? "unknown"}, '
+          'qolPresent=${_lastInjectionQolPresent ?? "unknown"}); '
+          'route=${_isChatUrl(_lastKnownUrl) ? "chat" : "other"}',
         ),
       );
     } finally {
@@ -4895,6 +5066,7 @@ $source
       ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
     }
     _recoveringWebView = true;
+    _nativeRecoveryRequests++;
     _lastRecoveryAt = DateTime.now();
     _routeHealthGeneration++;
 
@@ -4911,14 +5083,17 @@ $source
       }
     }
 
-    if (!target.startsWith('https://')) {
+    final recoveryUri = Uri.tryParse(target);
+    if (recoveryUri == null || recoveryUri.scheme != 'https' ||
+        (!_isSpicyChat(recoveryUri) && !_isAuthDomain(recoveryUri))) {
       target = 'https://spicychat.ai/';
     }
 
     unawaited(
       _appLog.log(
         'Recovery',
-        'Recreating WebView because of $reason; target=$target',
+        'Recreating WebView because of $reason; '
+        'route=${_isChatUrl(target) ? "chat" : "other"}',
         level: 'WARN',
       ),
     );
@@ -5000,7 +5175,25 @@ $source
       loader = 'probe-unavailable';
     }
     await _appLog.log('QolCompatibility',
-        '${updates.androidCompatibilityReport}; loader=$loader');
+        '${updates.androidCompatibilityReport}; loader=$loader; '
+        'assetLoad=${widget.bundleService.lastAssetLoadTiming}; '
+        'hashVerification=${updates.lastHashVerificationTiming}');
+    await _appLog.log('NativeLifecycle',
+        'webViewsCreated=$_nativeWebViewsCreated; '
+        'rendererExits=$_nativeRendererExits; '
+        'backgroundRendererExits=$_nativeBackgroundRendererExits; '
+        'confirmedCrashes=$_nativeConfirmedCrashes; '
+        'recoveryAttempts=$_nativeRecoveryRequests; '
+        'bridgeUnready=$_nativeBridgeUnready; '
+        'bridgeStale=$_nativeBridgeStale; '
+        'bridgeTimeouts=$_nativeBridgeTimeouts; '
+        'networkFailures=$_nativeNetworkFailures; dnsFailures=$_nativeDnsFailures; '
+        'resizeObserverWarnings=$_nativeResizeObserverWarnings; '
+        'lastInjectionBridgeMs=${_lastInjectionBridgeMs?.toString() ?? "not-measured"}; '
+        'lastInjectionPreflightMs=${_lastInjectionPreflightMs?.toString() ?? "not-measured"}; '
+        'lastInjectionReadyMs=${_lastInjectionReadyMs?.toString() ?? "not-measured"}; '
+        'bridgeReady=${_lastInjectionBridgeReady?.toString() ?? "not-measured"}; '
+        'qolPresent=${_lastInjectionQolPresent?.toString() ?? "not-measured"}');
   }
 
   Future<void> _copyDiagnosticLog() async {

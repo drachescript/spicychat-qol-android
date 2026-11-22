@@ -263,11 +263,13 @@
         return Promise.resolve(response);
       }
       if (message?.type === "DS_OPEN_OPTIONS") {
-        window.flutter_inappwebview
+        // DS_ANDROID_V291_OPEN_OPTIONS_PROMISE: return a result for both API
+        // callers instead of silently returning undefined to Promise clients.
+        const operation = window.flutter_inappwebview
           .callHandler("openOptions")
-          .then(() => { if (callback) callback({ ok: true }); })
-          .catch(() => { if (callback) callback({ ok: false }); });
-        return;
+          .then(() => ({ ok: true }), () => ({ ok: false }));
+        if (typeof callback === "function") operation.then(callback);
+        return operation;
       }
 
       // DS_ANDROID_V145_287_RUNTIME_PROMISE: support Chrome's Promise-returning

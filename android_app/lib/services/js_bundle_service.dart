@@ -15,6 +15,8 @@ class JsBundleService extends ChangeNotifier {
   // DS_ANDROID_V065_EARLY_ACCOUNT_OBSERVER: refreshed with every verified QoL bundle.
   String _earlyCardTokenMainScript = '';
   String _extensionVersion = bundledExtensionVersion;
+  // DS_ANDROID_V291_ASSET_TIMING: stage costs are only sampled when assets load.
+  String _lastAssetLoadTiming = 'not-measured';
   String _optionsHtml = '';
   final Map<String, String> _optionsSupportText = {};
 
@@ -24,6 +26,7 @@ class JsBundleService extends ChangeNotifier {
   String get jsBundle => _jsBundle;
   String get earlyCardTokenMainScript => _earlyCardTokenMainScript;
   String get extensionVersion => _extensionVersion;
+  String get lastAssetLoadTiming => _lastAssetLoadTiming;
   String get optionsHtml => _optionsHtml;
 
   static const _androidMainWorldBridgeFiles = [
@@ -766,6 +769,8 @@ class JsBundleService extends ChangeNotifier {
 ''';
 
   Future<void> loadAssets() async {
+    final loadClock = Stopwatch()..start();
+    final cssClock = Stopwatch()..start();
     final remoteActive = qolUpdates.hasDownloadedBundle;
 
     // Load *all* styles in extension-manifest order. Since v0.2.44 QoL
@@ -813,6 +818,8 @@ class JsBundleService extends ChangeNotifier {
         : _bundledJsFiles.any((p) => p.endsWith('/memory-packs.js'));
     if (hasMemoryPacks) cssChunks.add(_androidV067MemoryPackMobileCss);
     _cssContent = cssChunks.join('\n\n');
+    final cssReadMs = cssClock.elapsedMilliseconds;
+    final earlyClock = Stopwatch()..start();
 
     _extensionVersion = remoteActive && qolUpdates.activeVersion.isNotEmpty
         ? qolUpdates.activeVersion
@@ -833,6 +840,8 @@ class JsBundleService extends ChangeNotifier {
 $earlyMainSource
 })();''';
 
+    final earlyReadMs = earlyClock.elapsedMilliseconds;
+    final runtimeClock = Stopwatch()..start();
     final bridge = await rootBundle.loadString('assets/js/bridge.js');
     final buffer = StringBuffer()
       ..writeln('// SpicyChat QOL Android bundled injection')
@@ -1177,7 +1186,14 @@ $earlyMainSource
         ..writeln(_androidV067MemoryPackViewportScript);
     }
     _jsBundle = buffer.toString();
+    final runtimeReadMs = runtimeClock.elapsedMilliseconds;
+    final optionsClock = Stopwatch()..start();
     await _loadOptions(remoteActive: remoteActive);
+    final optionsReadMs = optionsClock.elapsedMilliseconds;
+    _lastAssetLoadTiming = 'source=${remoteActive ? "downloaded" : "APK"}; '
+        'cssReadMs=$cssReadMs; earlyAssetReadMs=$earlyReadMs; '
+        'runtimeReadAndAssemblyMs=$runtimeReadMs; '
+        'optionsReadMs=$optionsReadMs; totalLoadMs=${loadClock.elapsedMilliseconds}';
     notifyListeners();
   }
 
