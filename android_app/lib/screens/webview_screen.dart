@@ -2411,23 +2411,214 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     }
   }
 
+  // DS_ANDROID_DIAGNOSTIC_RELAY_V1: Android-owned, passive browser Long Task
+  // counters for listing routes only. One observer per document, no DOM scan.
+  Future<void> _installAndroidListingLongTaskMetrics(
+    InAppWebViewController controller,
+  ) async {
+    try {
+      await controller.evaluateJavascript(source: r'''(() => {
+        if (window.__dsAndroidListingLongTaskMetrics) return;
+        const rows = Object.fromEntries(["home", "favorites", "recommendations"]
+          .map(name => [name, { count: 0, totalMs: 0, maxMs: 0, lastMs: 0 }]));
+        const state = { supported: false, rows };
+        window.__dsAndroidListingLongTaskMetrics = {
+          snapshot() {
+            return {
+              supported: state.supported,
+              scope: "visible-browser-main-thread-not-qol-causation",
+              at: Date.now(),
+              home: { ...rows.home },
+              favorites: { ...rows.favorites },
+              recommendations: { ...rows.recommendations }
+            };
+          }
+        };
+        if (typeof PerformanceObserver !== "function" ||
+            !PerformanceObserver.supportedEntryTypes?.includes?.("longtask")) return;
+        function routeType() {
+          const path = String(location.pathname || "/")
+            .replace(/^\/[a-z]{2}(?=\/|$)/i, "") || "/";
+          if (path === "/") return "home";
+          if (path === "/favorite-bots" || path.startsWith("/favorite-bots/"))
+            return "favorites";
+          if (path === "/recommended-bots" || path.startsWith("/recommended-bots/"))
+            return "recommendations";
+          return "";
+        }
+        try {
+          const observer = new PerformanceObserver(list => {
+            if (document.visibilityState !== "visible") return;
+            const kind = routeType();
+            if (!kind) return;
+            const row = rows[kind];
+            for (const entry of list.getEntries()) {
+              const ms = Number(entry.duration || 0);
+              if (!Number.isFinite(ms) || ms < 50) continue;
+              row.count = Math.min(2147483647, row.count + 1);
+              row.totalMs = Math.round(Math.min(2147483647, row.totalMs + ms));
+              row.maxMs = Math.max(row.maxMs, Math.round(ms));
+              row.lastMs = Math.round(ms);
+            }
+          });
+          observer.observe({ type: "longtask" });
+          state.supported = true;
+        } catch (_) { /* Unsupported WebView; no fatal effect. */ }
+      })()''');
+    } catch (_) {
+      // Measurements are optional. A diagnostic feature cannot stop QoL.
+    }
+  }
+
+  // DS_ANDROID_DIAGNOSTIC_RELAY_V1: resolve diagnostic Promises through the
+  // WebView plugin's asynchronous API instead of evaluateJavascript. Keep
+  // failures categorical and never place user content or error stacks in UI.
+  Future<dynamic> _sendAndroidDiagnosticMessage(
+    InAppWebViewController controller,
+    String expectedToken,
+    String encodedMessage,
+    String type,
+  ) async {
+    final expectedWebView = _webViewKey;
+    try {
+      final result = await controller.callAsyncJavaScript(
+        functionBody: '''  const expectedToken = __EXPECTED_TOKEN__;
+  const message = __ENCODED_MESSAGE__;
+  if (window.__spicyChatQolAndroidDocumentToken !== expectedToken) {
+    return { ok: false, error: "document-stale" };
+  }
+  const dispatch = window.__dsAndroidDispatchRuntimeMessage;
+  if (typeof dispatch !== "function") {
+    return { ok: false, error: "runtime-dispatch-unavailable" };
+  }
+  const sender = {
+    id: "spicychat-qol-android",
+    url: location.href,
+    tab: { id: 1, index: 0, windowId: 1, active: true, pinned: false,
+      discarded: false, status: "complete", url: location.href,
+      title: document.title || "SpicyChat", __spicyChatQolAndroidSynthetic: true }
+  };
+  try {
+    const response = await dispatch(message, sender);
+    if (window.__spicyChatQolAndroidDocumentToken !== expectedToken) {
+      return { ok: false, error: "document-stale" };
+    }
+    if (response == null) {
+      return { ok: false, error: "diagnostic-handler-no-response" };
+    }
+    if (response?.ok === false) {
+      return { ok: false, error: "diagnostic-handler-failed" };
+    }
+    if (message?.type === "DS_GET_PAGE_DIAGNOSTICS" &&
+        response?.ok === true && typeof response === "object") {
+      const summary = window.__dsAndroidListingLongTaskMetrics?.snapshot?.();
+      if (summary) response.androidRouteLongTasks = summary;
+    }
+    return { ok: true, response };
+  } catch (_) {
+    return { ok: false, error: "diagnostic-dispatch-exception" };
+  }
+'''.replaceAll('__EXPECTED_TOKEN__', jsonEncode(expectedToken))
+          .replaceAll('__ENCODED_MESSAGE__', encodedMessage),
+      ).timeout(type == 'DS_GET_PAGE_DIAGNOSTICS_LIGHT'
+          ? const Duration(milliseconds: 3200)
+          : const Duration(milliseconds: 6500));
+
+      if (!mounted || _webViewKey != expectedWebView ||
+          _rendererExitNeedsManualRecovery ||
+          _lastInjectedDocumentToken != expectedToken) {
+        _nativeBridgeStale++;
+        return <String, dynamic>{'ok': false, 'error': 'webview-stale'};
+      }
+      if (result == null) {
+        return <String, dynamic>{'ok': false, 'error': 'async-result-missing'};
+      }
+      if (result.error != null) {
+        return <String, dynamic>{'ok': false, 'error': 'async-javascript-error'};
+      }
+      dynamic decoded = result.value;
+      for (var i = 0; i < 2 && decoded is String; i++) {
+        try {
+          decoded = jsonDecode(decoded);
+        } catch (_) {
+          break;
+        }
+      }
+      if (decoded is! Map) {
+        return <String, dynamic>{'ok': false, 'error': 'async-result-invalid'};
+      }
+      if (decoded['ok'] != true) {
+        final error = (decoded['error'] ?? '').toString();
+        const allowed = <String>{
+          'document-stale', 'runtime-dispatch-unavailable',
+          'diagnostic-handler-no-response', 'diagnostic-handler-failed',
+          'diagnostic-dispatch-exception'
+        };
+        if (error == 'document-stale') _nativeBridgeStale++;
+        return <String, dynamic>{
+          'ok': false,
+          'error': allowed.contains(error) ? error : 'diagnostic-dispatch-failed',
+        };
+      }
+      final response = decoded['response'];
+      if (response is! Map || response['ok'] != true) {
+        return <String, dynamic>{'ok': false, 'error': 'diagnostic-response-invalid'};
+      }
+      if (type == 'DS_GET_PAGE_DIAGNOSTICS') {
+        final summary = response['androidRouteLongTasks'];
+        if (summary is Map) {
+          String display(String route) {
+            final row = summary[route];
+            if (row is! Map) return '$route=unavailable';
+            return '$route=${row['count'] ?? 0} tasks, '
+                'max=${row['maxMs'] ?? 0}ms, sum=${row['totalMs'] ?? 0}ms';
+          }
+          unawaited(_appLog.log('AndroidDiagnostics',
+              'Visible browser Long Tasks (not QoL attribution): '
+              '${display('home')}; ${display('favorites')}; '
+              '${display('recommendations')}; '
+              'supported=${summary['supported'] == true}'));
+        }
+      }
+      return response;
+    } on TimeoutException {
+      _nativeBridgeTimeouts++;
+      return <String, dynamic>{'ok': false, 'error': 'diagnostic-bridge-timeout'};
+    } catch (_) {
+      return <String, dynamic>{'ok': false, 'error': 'diagnostic-native-exception'};
+    }
+  }
+
   Future<dynamic> _sendAndroidMainTabMessage(dynamic message) async {
     final controller = _webController;
+    final diagnosticType = message is Map
+        ? (message['type'] ?? '').toString() : '';
+    final isDiagnostic = diagnosticType == 'DS_GET_PAGE_DIAGNOSTICS' ||
+        diagnosticType == 'DS_GET_PAGE_DIAGNOSTICS_LIGHT';
     if (controller == null || _rendererExitNeedsManualRecovery) {
-      return null;
+      return isDiagnostic ? <String, dynamic>{'ok': false,
+          'error': 'webview-unavailable'} : null;
     }
 
     try {
-      if (!await _isCurrentUrlTrusted(controller)) return null;
+      if (!await _isCurrentUrlTrusted(controller)) {
+        return isDiagnostic ? <String, dynamic>{'ok': false,
+            'error': 'untrusted-route'} : null;
+      }
       // DS_ANDROID_V291_NATIVE_BRIDGE_EPOCH: don't report startup as a QoL
       // failure before this document has finished its one-time injection.
       final expectedToken = _lastInjectedDocumentToken;
       if (expectedToken == null || _injectionInProgressToken != null) {
         _nativeBridgeUnready++;
-        return null;
+        return isDiagnostic ? <String, dynamic>{'ok': false,
+            'error': 'injection-not-complete'} : null;
       }
 
       final encodedMessage = jsonEncode(message);
+      if (isDiagnostic) {
+        return await _sendAndroidDiagnosticMessage(
+            controller, expectedToken, encodedMessage, diagnosticType);
+      }
       final rawResultFuture = controller.evaluateJavascript(
         source: '''(async () => {
           const expectedToken = ${jsonEncode(expectedToken)};
@@ -4375,6 +4566,7 @@ $source
       final cssMs = DateTime.now().difference(cssStart).inMilliseconds;
       final jsStart = DateTime.now();
       await controller.evaluateJavascript(source: widget.bundleService.jsBundle);
+      await _installAndroidListingLongTaskMetrics(controller);
       final jsMs = DateTime.now().difference(jsStart).inMilliseconds;
 
       // Shared Focus Mode uses desktop-oriented ancestor targeting. Install a

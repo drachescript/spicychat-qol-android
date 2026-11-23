@@ -69,6 +69,13 @@ class AndroidUpdateService extends ChangeNotifier {
 
   static const String _lastCheckedKey =
       'ds_android_native_update_last_checked_ms';
+  // DS_ANDROID_VERIFIED_APK_CACHE_CLEANUP_V1: isolated updater-only keys.
+  static const String _pendingApkInstallerPathKey =
+      'ds_android_updater_apk_installer_path';
+  static const String _pendingApkInstallerCodeKey =
+      'ds_android_updater_apk_installer_code';
+  static const String _pendingApkInstallerVersionKey =
+      'ds_android_updater_apk_installer_version';
 
   static const MethodChannel _appInfoChannel =
       MethodChannel('uk.drache.spicychatqol/app_info');
@@ -193,8 +200,45 @@ class AndroidUpdateService extends ChangeNotifier {
       );
     }
 
+    await _cleanupConfirmedInstallerApk();
     _initialized = true;
     notifyListeners();
+  }
+
+  // DS_ANDROID_VERIFIED_APK_CACHE_CLEANUP_V1: never touch user Downloads,
+  // extension files or an APK before Android confirms an installed version.
+  Future<void> _cleanupConfirmedInstallerApk() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    final path = prefs.getString(_pendingApkInstallerPathKey);
+    if (path == null || path.isEmpty) return;
+    final code = prefs.getInt(_pendingApkInstallerCodeKey) ?? 0;
+    final version = prefs.getString(_pendingApkInstallerVersionKey) ?? '';
+    final installed = code > 0 && _currentVersionCode >= code ||
+        (code <= 0 && version.isNotEmpty &&
+         _currentVersionName != 'unknown' &&
+         _compareVersions(_currentVersionName, version) >= 0);
+    if (!installed) return;
+
+    try {
+      final cache = await getTemporaryDirectory();
+      final file = File(path);
+      final name = file.uri.pathSegments.isNotEmpty
+          ? file.uri.pathSegments.last : '';
+      final allowed = RegExp(r'^SpicyChat-QOL-Android-[A-Za-z0-9._-]+\.apk$');
+      if (file.parent.absolute.path == cache.absolute.path &&
+          allowed.hasMatch(name) && await file.exists()) {
+        await file.delete();
+        unawaited(_appLog.log('AndroidUpdate',
+            'Removed installed, app-owned APK installer from temporary cache'));
+      }
+      // Clear only our own pending marker. Never clear chat or QoL storage.
+      await prefs.remove(_pendingApkInstallerPathKey);
+      await prefs.remove(_pendingApkInstallerCodeKey);
+      await prefs.remove(_pendingApkInstallerVersionKey);
+    } catch (_) {
+      // Cache cleanup is optional; it must not block app startup.
+    }
   }
 
   Future<bool> maybeCheckAutomatically() async {
@@ -578,6 +622,14 @@ class AndroidUpdateService extends ChangeNotifier {
     }
 
     try {
+      // Persist handoff BEFORE Android's installer can terminate this app.
+      // No deletion unless next launch confirms target version installed.
+      final prefs = _prefs;
+      if (prefs != null) {
+        await prefs.setString(_pendingApkInstallerPathKey, file.path);
+        await prefs.setInt(_pendingApkInstallerCodeKey, info.versionCode ?? 0);
+        await prefs.setString(_pendingApkInstallerVersionKey, info.versionName);
+      }
       final raw = await _appInfoChannel.invokeMapMethod<String, dynamic>(
         'installApk',
         <String, dynamic>{

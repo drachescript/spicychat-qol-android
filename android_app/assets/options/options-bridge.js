@@ -301,6 +301,26 @@
   // at most one explicitly requested full snapshot. Old shared bundles that
   // predate the light protocol get one legacy full request. Never keep
   // retrying a heavy snapshot while the Android renderer is struggling.
+  // DS_ANDROID_DIAGNOSTIC_RELAY_V1: keep native failure categories visible.
+  function androidDiagnosticFailure(raw) {
+    let result = raw;
+    if (typeof result === "string") {
+      try { result = JSON.parse(result); } catch { return "diagnostic-response-invalid"; }
+    }
+    const code = result && typeof result === "object" && result.ok === false
+      ? String(result.error || "diagnostic-dispatch-failed") : "diagnostic-no-response";
+    const known = new Set([
+      "webview-unavailable", "untrusted-route", "injection-not-complete",
+      "document-stale", "webview-stale", "runtime-dispatch-unavailable",
+      "diagnostic-handler-no-response", "diagnostic-handler-failed",
+      "diagnostic-dispatch-exception", "diagnostic-dispatch-failed",
+      "diagnostic-bridge-timeout", "diagnostic-native-exception",
+      "async-result-missing", "async-result-invalid", "async-javascript-error",
+      "diagnostic-response-invalid", "diagnostic-no-response"
+    ]);
+    return known.has(code) ? code : "diagnostic-dispatch-failed";
+  }
+
   async function queryAndroidPageDiagnosticsWithRetry() {
     const rawLight = await sendAndroidMainTabMessage({
       type: "DS_GET_PAGE_DIAGNOSTICS_LIGHT"
@@ -321,22 +341,26 @@
       (Number(version[1]) > 0 || Number(version[2]) > 2 ||
         (Number(version[2]) === 2 && Number(version[3]) >= 72));
     if (!lightweight && supportsLight) {
-      return { full: null, lightweight: null, status: "light-probe-unreachable" };
+      return { full: null, lightweight: null,
+        status: "light-probe-unreachable",
+        error: androidDiagnosticFailure(rawLight) };
     }
     if (lightweight && !lightweight.runtimeReady) {
       return { full: null, lightweight, status: "runtime-initializing" };
     }
 
-    const full = normalizePageDiagnostics(await sendAndroidMainTabMessage({
+    const rawFull = await sendAndroidMainTabMessage({
       type: "DS_GET_PAGE_DIAGNOSTICS"
-    }));
+    });
+    const full = normalizePageDiagnostics(rawFull);
     if (full?.ok === true && full.androidPartialDiagnostics !== true &&
         full.sampleKind !== "lightweight-no-dom") {
       return { full, lightweight, status: "full-runtime-snapshot" };
     }
     return {
       full: null, lightweight,
-      status: lightweight ? "full-snapshot-unreachable" : "legacy-runtime-unreachable"
+      status: lightweight ? "full-snapshot-unreachable" : "legacy-runtime-unreachable",
+      error: androidDiagnosticFailure(rawFull)
     };
   }
 
@@ -402,6 +426,7 @@
             ok: true,
             // Neither a timeout nor a partial sample implies QoL is disabled.
             runtimeAvailable: !!liveDiagnostics,
+            runtimeError: result?.error || "",
             runtimeProbeAvailable: !!result?.lightweight,
             runtimeStatus: result?.status || "snapshot-unavailable",
             runtimeProbeReady: result?.lightweight?.runtimeReady ?? null,
