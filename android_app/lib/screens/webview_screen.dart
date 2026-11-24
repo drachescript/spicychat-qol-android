@@ -188,7 +188,6 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     WidgetsBinding.instance.removeObserver(this);
     _healthTimer?.cancel();
     _cancelStartupInjectionFallback();
-    _rendererExitReminder?.cancel();
     _androidSaveStayBackRepairTimer?.cancel();
     unawaited(_appLog.log('WebView', 'WebView screen disposed; nav=$_navigationSequence; lastCause=$_lastNavigationCause; url=$_lastKnownUrl'));
     super.dispose();
@@ -204,6 +203,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     if (_appIsResumed == wasResumed) {
       return;
     }
+    if (mounted && _rendererExitNeedsManualRecovery) {
+      setState(() {});
+    }
     final elapsed = _lastBackgroundAt == null ? -1 :
         DateTime.now().difference(_lastBackgroundAt!).inMilliseconds;
     final quickResume = _appIsResumed && elapsed >= 0 && elapsed < 20000 &&
@@ -217,9 +219,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           'nav=$_navigationSequence; loading=$_isLoading; '
           'url=$_lastKnownUrl'));
       _lastBackgroundAt = null;
-      if (_rendererExitNeedsManualRecovery) {
-        _showRendererExitNotice();
-      } else if (!quickResume) {
+      if (!_rendererExitBlocksCurrentWebView && !quickResume) {
         _scheduleHealthCheck('app-resumed', delay: const Duration(seconds: 3));
       }
       if (!quickResume) {
@@ -229,8 +229,8 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       if (_isLoading || _recoveringWebView) {
         _scheduleVisualGuardForCurrentPage('app-resumed');
       }
-      if ((_isLoading || !_lastInjectionVerified) &&
-          !_rendererExitNeedsManualRecovery) {
+      if ((_isLoading || !_lastInjectionVerified || _rendererReplacementPending) &&
+          !_rendererExitBlocksCurrentWebView) {
         _armStartupInjectionFallback('app-resumed',
             delay: const Duration(seconds: 4));
       }
@@ -248,64 +248,115 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
   }
 
 
-  // DS_ANDROID_V143_MANUAL_RENDERER_RECOVERY: never recreate a chat merely
-  // because Android backgrounds this Activity or a probe times out.
+  // DS_ANDROID_RENDERER_NOTICE_DISMISS_V1: renderer death, dismissal, and
+  // replacement verification are independent. A failed probe never reloads.
   bool _rendererExitNeedsManualRecovery = false;
-  bool _rendererExitNoticeShown = false;
-  DateTime? _rendererExitNextNoticeAfter;
-  Timer? _rendererExitReminder;
+  Key? _rendererExitedWebViewKey;
+  Key? _rendererReplacementProbeKey;
+  bool _rendererExitNoticeDismissed = false;
 
-  void _showRendererExitNotice() {
-    if (!mounted || !_appIsResumed || !_rendererExitNeedsManualRecovery ||
-        _rendererExitNoticeShown) {
-      return;
-    }
-    final next = _rendererExitNextNoticeAfter;
-    if (next != null && DateTime.now().isBefore(next)) {
-      return;
-    }
-    _rendererExitNoticeShown = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_appIsResumed || !_rendererExitNeedsManualRecovery) {
-        _rendererExitNoticeShown = false;
-        return;
-      }
-      final messenger = ScaffoldMessenger.of(context);
-      messenger.showMaterialBanner(MaterialBanner(
-        content: const Text(
-          'Android stopped the SpicyChat WebView renderer. Your page will not '
-          'reload without your approval. Recover when you are ready.',
+  bool get _rendererExitBlocksCurrentWebView =>
+      _rendererExitNeedsManualRecovery && _rendererExitedWebViewKey == _webViewKey;
+
+  bool get _rendererReplacementPending =>
+      _rendererExitNeedsManualRecovery && _rendererExitedWebViewKey != _webViewKey;
+
+  bool get _showRendererWarning => _appIsResumed &&
+      _rendererExitBlocksCurrentWebView && !_rendererExitNoticeDismissed;
+
+  // Keep the notice in this screen, not the app-wide ScaffoldMessenger.
+  // This prevents a queued banner from appearing over Android/QoL Settings.
+  Widget _buildRendererExitNotice() {
+    final exitedKey = _rendererExitedWebViewKey;
+    return MaterialBanner(
+      content: const Text(
+        'Android stopped the SpicyChat WebView renderer. Your page will not '
+        'reload without your approval. Recover when you are ready.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            if (!mounted || !_rendererExitBlocksCurrentWebView ||
+                _rendererExitedWebViewKey != exitedKey) {
+              return;
+            }
+            unawaited(_recoverWebView(
+              reason: 'user approved recovery after renderer exit',
+              useController: false,
+            ));
+          },
+          child: const Text('Recover'),
         ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              messenger.hideCurrentMaterialBanner();
-              unawaited(_recoverWebView(
-                reason: 'user approved recovery after renderer exit',
-                useController: false,
-              ));
-            },
-            child: const Text('Recover'),
-          ),
-          TextButton(
-            onPressed: () {
-              messenger.hideCurrentMaterialBanner();
-              _rendererExitNoticeShown = false;
-              _rendererExitNextNoticeAfter =
-                  DateTime.now().add(const Duration(minutes: 5));
-              _rendererExitReminder?.cancel();
-              _rendererExitReminder = Timer(const Duration(minutes: 5, milliseconds: 150), () {
-                if (mounted && _appIsResumed &&
-                    _rendererExitNeedsManualRecovery) {
-                  _showRendererExitNotice();
-                }
-              });
-            },
-            child: const Text('Later'),
-          ),
-        ],
-      ));
+        TextButton(
+          onPressed: () {
+            if (!mounted || !_rendererExitBlocksCurrentWebView ||
+                _rendererExitedWebViewKey != exitedKey) {
+              return;
+            }
+            setState(() {
+              _rendererExitNoticeDismissed = true;
+            });
+            unawaited(_appLog.log('Renderer',
+              'Renderer warning dismissed; manual recovery remains required'));
+          },
+          child: const Text('Dismiss'),
+        ),
+      ],
+    );
+  }
+
+  // Only a responsive replacement may clear the previous confirmed exit.
+  // A late result from the old or subsequently crashed WebView cannot do so.
+  void _confirmRendererReplacement(Key key) {
+    if (!mounted || _webViewKey != key || !_rendererReplacementPending) {
+      return;
+    }
+    setState(() {
+      _rendererExitNeedsManualRecovery = false;
+      _rendererExitedWebViewKey = null;
+      _rendererReplacementProbeKey = null;
+      _rendererExitNoticeDismissed = false;
     });
+    unawaited(_appLog.log('Renderer',
+      'Replacement WebView responded; previous renderer recovery state cleared'));
+  }
+
+  Future<void> _verifyRendererReplacement(
+    InAppWebViewController controller, Key key,
+  ) async {
+    if (!mounted || _webViewKey != key || !_rendererReplacementPending ||
+        _rendererReplacementProbeKey == key) {
+      return;
+    }
+    _rendererReplacementProbeKey = key;
+    try {
+      // Read only document readiness and the actual origin; no DOM traversal.
+      final raw = await controller.evaluateJavascript(source: r'''(() => JSON.stringify({
+        href: String(location.href || ''),
+        ready: document.readyState,
+        hasBody: !!document.body
+      }))()''').timeout(const Duration(seconds: 3));
+      dynamic decoded = raw;
+      for (var i = 0; i < 2 && decoded is String; i++) {
+        decoded = jsonDecode(decoded);
+      }
+      if (decoded is Map && decoded['hasBody'] == true &&
+          (decoded['ready'] == 'interactive' || decoded['ready'] == 'complete')) {
+        final uri = Uri.tryParse((decoded['href'] ?? '').toString());
+        if (uri != null && uri.scheme == 'https' &&
+            (_isSpicyChat(uri) || _isAuthDomain(uri))) {
+          _confirmRendererReplacement(key);
+          return;
+        }
+      }
+    } catch (_) {
+      // An unavailable/busy renderer is not evidence of another renderer exit.
+    }
+    if (mounted && _webViewKey == key && _rendererReplacementPending &&
+        _appIsResumed && _startupFallbackTimer == null) {
+      _armStartupInjectionFallback('renderer-replacement-verification',
+          delay: const Duration(seconds: 5));
+    }
   }
 
   // DS_ANDROID_STARTUP_INJECTION_RECOVERY_V1: bounded, event-driven fallback.
@@ -321,7 +372,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
     Duration delay = const Duration(seconds: 14),
     bool retry = false,
   }) {
-    if (!mounted || _rendererExitNeedsManualRecovery) return;
+    if (!mounted || _rendererExitBlocksCurrentWebView) return;
     if (!retry) _startupFallbackRetryAvailable = true;
     _startupFallbackTimer?.cancel();
     final serial = ++_startupFallbackSerial;
@@ -333,8 +384,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
 
   Future<void> _recoverMissedLoadStop(int serial, String trigger) async {
     final controller = _webController;
+    final recoveryKey = _webViewKey;
     if (!mounted || !_appIsResumed || _recoveringWebView ||
-        _rendererExitNeedsManualRecovery || _startupFallbackRunning ||
+        _rendererExitBlocksCurrentWebView || _startupFallbackRunning ||
         serial != _startupFallbackSerial || controller == null) {
       return;
     }
@@ -356,15 +408,23 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       }
       final href = (decoded['href'] ?? '').toString();
       final parsed = Uri.tryParse(href);
-      if (parsed == null || !_isSpicyChat(parsed)) return;
+      if (parsed == null || parsed.scheme != 'https' ||
+          (!_isSpicyChat(parsed) && !_isAuthDomain(parsed))) {
+        return;
+      }
       if (!mounted || !_appIsResumed || serial != _startupFallbackSerial ||
-          _webController != controller || _rendererExitNeedsManualRecovery) {
+          _webViewKey != recoveryKey || _webController != controller ||
+          _rendererExitBlocksCurrentWebView) {
+        return;
+      }
+      _confirmRendererReplacement(recoveryKey);
+      if (!_isSpicyChat(parsed)) {
         return;
       }
       final verified = await _injectScripts(controller);
       needsLaterCheck = !verified;
       if (!mounted || serial != _startupFallbackSerial ||
-          _webController != controller || _rendererExitNeedsManualRecovery) {
+          _webController != controller || _rendererExitBlocksCurrentWebView) {
         return;
       }
       _lastKnownUrl = href;
@@ -389,6 +449,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         level: verified ? 'INFO' : 'WARN',
       ));
     } catch (error, stackTrace) {
+      if (_webViewKey == recoveryKey && _rendererReplacementPending) {
+        needsLaterCheck = true;
+      }
       if (_shouldPersistDiagnostic('startup-fallback-error',
           cooldown: const Duration(seconds: 30))) {
         unawaited(_appLog.log(
@@ -401,7 +464,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
       // At most one delayed recheck if the renderer is still loading or if
       // QoL is settling. Never re-evaluate a bundle marked for this document.
       if (needsLaterCheck && _startupFallbackRetryAvailable && mounted &&
-          _appIsResumed && !_rendererExitNeedsManualRecovery &&
+          _appIsResumed && !_rendererExitBlocksCurrentWebView &&
           serial == _startupFallbackSerial) {
         _startupFallbackRetryAvailable = false;
         _armStartupInjectionFallback('settle-$trigger',
@@ -967,7 +1030,11 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
               Navigator.of(context).pop();
             }
           },
-          child: Stack(
+          child: Column(
+            children: [
+              if (_showRendererWarning) _buildRendererExitNotice(),
+              Expanded(
+                child: Stack(
             children: [
               InAppWebView(
                 key: _webViewKey,
@@ -1113,7 +1180,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onLoadStart: (controller, url) {
                   if (!mounted || _webViewKey != callbackWebViewKey ||
-                      _rendererExitNeedsManualRecovery) {
+                      _rendererExitBlocksCurrentWebView) {
                     return;
                   }
                   _loadStartedAt = DateTime.now();
@@ -1166,10 +1233,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onLoadStop: (controller, url) async {
                   if (!mounted || _webViewKey != callbackWebViewKey ||
-                      _rendererExitNeedsManualRecovery) {
+                      _rendererExitBlocksCurrentWebView) {
                     return;
                   }
                   _cancelStartupInjectionFallback();
+                  if (_rendererReplacementPending) {
+                    unawaited(_verifyRendererReplacement(controller, callbackWebViewKey));
+                  }
                   unawaited(_appLog.log('Navigation',
                       'Load stop #$_navigationSequence; cause=$_lastNavigationCause; '
                       'url=${url ?? _lastKnownUrl}'));
@@ -1194,6 +1264,13 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   // document. _injectScripts now skips duplicate documents.
                   try {
                     final verified = await _injectScripts(controller);
+                    if (!mounted || _webViewKey != callbackWebViewKey ||
+                        _rendererExitBlocksCurrentWebView) {
+                      return;
+                    }
+                    if (verified) {
+                      _confirmRendererReplacement(callbackWebViewKey);
+                    }
                     if (!verified) {
                       _armStartupInjectionFallback('post-load-not-ready',
                           delay: const Duration(seconds: 5));
@@ -1202,6 +1279,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                         'attempt is scheduled', level: 'WARN'));
                     }
                   } catch (e, stackTrace) {
+                    if (!mounted || _webViewKey != callbackWebViewKey ||
+                        _rendererExitBlocksCurrentWebView) {
+                      return;
+                    }
                     _armStartupInjectionFallback('post-load-exception',
                         delay: const Duration(seconds: 5));
                     unawaited(
@@ -1215,6 +1296,10 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     );
                   }
 
+                  if (!mounted || _webViewKey != callbackWebViewKey ||
+                      _rendererExitBlocksCurrentWebView) {
+                    return;
+                  }
                   final duplicateDocumentStop =
                       injectedTokenAtStop != null &&
                       injectedTokenAtStop == _lastInjectedDocumentToken;
@@ -1239,7 +1324,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onUpdateVisitedHistory: (controller, url, androidIsReload) {
                   if (!mounted || _webViewKey != callbackWebViewKey ||
-                      _rendererExitNeedsManualRecovery) {
+                      _rendererExitBlocksCurrentWebView) {
                     return;
                   }
                   final route = url?.toString() ?? _lastKnownUrl;
@@ -1326,7 +1411,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onPageCommitVisible: (controller, url) {
                   if (!mounted || _webViewKey != callbackWebViewKey ||
-                      _rendererExitNeedsManualRecovery) {
+                      _rendererExitBlocksCurrentWebView) {
                     return;
                   }
                   if (url != null && _isSpicyChat(url)) {
@@ -1336,7 +1421,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onProgressChanged: (controller, progress) {
                   if (!mounted || _webViewKey != callbackWebViewKey ||
-                      _rendererExitNeedsManualRecovery) {
+                      _rendererExitBlocksCurrentWebView) {
                     return;
                   }
                   // Chromium often emits the same progress value twice.
@@ -1447,11 +1532,17 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                 },
                 onRenderProcessGone: (controller, detail) {
                   if (!mounted || _webViewKey != callbackWebViewKey ||
-                      _rendererExitNeedsManualRecovery) {
+                      _rendererExitBlocksCurrentWebView) {
                     return;
                   }
                   _rendererUnresponsiveSince = null;
-                  _rendererExitNeedsManualRecovery = true;
+                  _cancelStartupInjectionFallback();
+                  setState(() {
+                    _rendererExitNeedsManualRecovery = true;
+                    _rendererExitedWebViewKey = callbackWebViewKey;
+                    _rendererReplacementProbeKey = null;
+                    _rendererExitNoticeDismissed = false;
+                  });
                   _nativeRendererExits++;
                   if (!_appIsResumed) {
                     _nativeBackgroundRendererExits++;
@@ -1474,7 +1565,6 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                   // The renderer is confirmed unusable, but an active chat may
                   // have an unsaved draft; require consent before recreation.
                   // A background exit shows no UI until the Activity resumes.
-                  _showRendererExitNotice();
                 },
                 // Extension helpers sometimes use target="_blank" or window.open()
                 // for bot/profile links. Android WebView treats those as a new
@@ -1689,6 +1779,9 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     minHeight: 3,
                   ),
                 ),
+            ],
+                ),
+              ),
             ],
           ),
         ),
@@ -2525,7 +2618,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
           : const Duration(milliseconds: 6500));
 
       if (!mounted || _webViewKey != expectedWebView ||
-          _rendererExitNeedsManualRecovery ||
+          _rendererExitBlocksCurrentWebView ||
           _lastInjectedDocumentToken != expectedToken) {
         _nativeBridgeStale++;
         return <String, dynamic>{'ok': false, 'error': 'webview-stale'};
@@ -2595,7 +2688,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
         ? (message['type'] ?? '').toString() : '';
     final isDiagnostic = diagnosticType == 'DS_GET_PAGE_DIAGNOSTICS' ||
         diagnosticType == 'DS_GET_PAGE_DIAGNOSTICS_LIGHT';
-    if (controller == null || _rendererExitNeedsManualRecovery) {
+    if (controller == null || _rendererExitBlocksCurrentWebView) {
       return isDiagnostic ? <String, dynamic>{'ok': false,
           'error': 'webview-unavailable'} : null;
     }
@@ -5287,7 +5380,7 @@ $source
     if (!mounted ||
         !_appIsResumed ||
         _recoveringWebView ||
-        _rendererExitNeedsManualRecovery ||
+        _rendererExitBlocksCurrentWebView ||
         controller == null ||
         // A periodic probe should not compete with a confirmed stall or
         // the one-time full script injection on a freshly loaded document.
@@ -5468,21 +5561,16 @@ $source
       return;
     }
 
-    if (_rendererExitNeedsManualRecovery) {
-      _rendererExitNeedsManualRecovery = false;
-      _rendererExitNextNoticeAfter = null;
-      _rendererExitNoticeShown = false;
-      _rendererExitReminder?.cancel();
-      _rendererExitReminder = null;
-      ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
-    }
+    // Do not clear a confirmed exit until a replacement actually responds.
+    // The dead controller is not queried or stopped during manual recovery.
     _recoveringWebView = true;
     _nativeRecoveryRequests++;
     _lastRecoveryAt = DateTime.now();
     _routeHealthGeneration++;
 
     var target = _lastKnownUrl;
-    final controller = useController ? _webController : null;
+    final controller = useController && !_rendererExitNeedsManualRecovery
+        ? _webController : null;
     if (controller != null) {
       try {
         final current = await controller.getUrl();
@@ -5529,6 +5617,7 @@ $source
       if (mounted) {
         setState(() {
           _webViewKey = UniqueKey();
+          _rendererReplacementProbeKey = null;
           _isLoading = true;
           _progress = 0;
         });
@@ -6365,7 +6454,7 @@ $source
           final messenger = ScaffoldMessenger.of(context);
           Navigator.pop(sheetContext);
           final controller = _webController;
-          if (controller == null || _rendererExitNeedsManualRecovery) {
+          if (controller == null || _rendererExitBlocksCurrentWebView) {
             messenger.showSnackBar(const SnackBar(
               content: Text('Scripts unavailable: WebView is not ready'),
             ));
@@ -6418,7 +6507,14 @@ $source
         },
         onRefresh: () {
           Navigator.pop(sheetContext);
-          _webController?.reload();
+          if (_rendererExitNeedsManualRecovery) {
+            unawaited(_recoverWebView(
+              reason: 'manual refresh after renderer exit',
+              useController: false,
+            ));
+          } else {
+            _webController?.reload();
+          }
         },
       );
         },
