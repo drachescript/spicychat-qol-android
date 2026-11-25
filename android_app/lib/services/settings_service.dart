@@ -8,6 +8,32 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/settings.dart';
 
+// DS_ANDROID_QOL_299_RECORD_COUNTS_V1: worker-isolate count-only snapshot.
+Map<String, int> _countQolRecords(Map<String, Object?> snapshots) {
+  final result = <String, int>{};
+  for (final entry in snapshots.entries) {
+    final raw = entry.value;
+    if (raw == null) {
+      result[entry.key] = 0;
+      continue;
+    }
+    final decoded = raw is String ? jsonDecode(raw) : raw;
+    if (decoded is! Map) {
+      throw const FormatException('Unsupported saved-record store');
+    }
+    final meta = decoded['meta'];
+    final records = meta is Map ? meta : decoded;
+    final ids = <String>{};
+    for (final record in records.entries) {
+      if (record.value is! Map) continue;
+      final id = record.key.toString().trim();
+      if (id.isNotEmpty) ids.add(id);
+    }
+    result[entry.key] = ids.length;
+  }
+  return result;
+}
+
 /// Persistent storage backing the Android chrome.storage.local bridge.
 ///
 /// Small values stay in SharedPreferences. Larger JSON/string values use one
@@ -31,6 +57,12 @@ class SettingsService extends ChangeNotifier {
   final Map<String, String> _largeStringValues = <String, String>{};
   final Map<String, Object?> _memoryFallback = <String, Object?>{};
   AppSettings _settings = AppSettings();
+  // DS_ANDROID_QOL_299_RECORD_COUNTS_V1: cache only counts and current raw
+  // references; writes/removals invalidate the affected key, never stored data.
+  static const _countableQolStores = <String>{
+    'botArchive', 'botAvailability', 'lorebookStatus',
+  };
+  final _qolCountCache = <String, (Object?, int)>{};
 
   AppSettings get settings => _settings;
   bool get persistentStorageAvailable => _prefs != null;
@@ -273,6 +305,7 @@ class SettingsService extends ChangeNotifier {
   }
 
   Future<void> _setRaw(String key, Object? value) async {
+    _qolCountCache.remove(key);
     if (value == null) {
       await _removeRaw(key);
       return;
@@ -298,6 +331,7 @@ class SettingsService extends ChangeNotifier {
   }
 
   Future<void> _removeRaw(String key) async {
+    _qolCountCache.remove(key);
     _memoryFallback.remove(key);
     await _removeLargeValue(key);
     try {
@@ -345,6 +379,52 @@ class SettingsService extends ChangeNotifier {
     }
 
     return result;
+  }
+
+  // DS_ANDROID_QOL_299_RECORD_COUNTS_V1: no storage writes or migrations.
+  // Read the raw native snapshot, count on a worker isolate and return numbers
+  // only. Android stores JSON blobs, not the desktop IndexedDB record index.
+  Future<Map<String, int>> storageLargeRecordStats(dynamic keys) async {
+    final requested = (_requestedKeys(keys) ?? _countableQolStores.toList())
+        .where(_countableQolStores.contains).toSet();
+    final counts = <String, int>{};
+    final pending = <String, Object?>{};
+    for (final key in requested) {
+      // An unreadable/missing backing store must not be reported as empty.
+      final prefs = _prefs;
+      final dir = _largeStorageDir;
+      if (prefs == null || dir == null) {
+        throw StateError('Native record storage unavailable');
+      }
+      final Object? raw;
+      if (_largeStringValues.containsKey(key)) {
+        raw = _largeStringValues[key];
+      } else {
+        if (await _largeFileForKey(key)!.exists() &&
+            !_largeStringValues.containsKey(key)) {
+          throw StateError('Saved-record file unavailable');
+        }
+        raw = _largeStringValues[key] ?? prefs.get(key) ?? _memoryFallback[key];
+      }
+      final cached = _qolCountCache[key];
+      if (cached != null && identical(cached.$1, raw)) {
+        counts[key] = cached.$2;
+      } else {
+        pending[key] = raw;
+      }
+    }
+    if (pending.isNotEmpty) {
+      final fresh = await compute(_countQolRecords, pending);
+      for (final entry in fresh.entries) {
+        final raw = pending[entry.key];
+        // Do not cache a count if the underlying value changed while counting.
+        if (identical(_rawGet(entry.key), raw)) {
+          _qolCountCache[entry.key] = (raw, entry.value);
+        }
+        counts[entry.key] = entry.value;
+      }
+    }
+    return counts;
   }
 
   Future<List<String>> storageGetKeys() async {

@@ -383,6 +383,22 @@ class _OptionsScreenState extends State<OptionsScreen> {
 
         try {
           final decoded = jsonDecode(args.first.toString());
+          // DS_ANDROID_QOL_299_RECORD_COUNTS_V1: native storage overview.
+          // Does not need a live content WebView or transfer any saved records.
+          if (decoded is Map && decoded['type'] == 'DS_LARGE_STORAGE_STATS') {
+            try {
+              final stats = await settingsService.storageLargeRecordStats(
+                decoded['keys'],
+              );
+              return <String, dynamic>{'ok': true, 'stats': stats};
+            } catch (_) {
+              return <String, dynamic>{
+                'ok': false,
+                'stats': <String, int>{},
+                'error': 'Android saved-record counts unavailable',
+              };
+            }
+          }
           return await widget.onSendMainTabMessage(decoded);
         } catch (e) {
           debugPrint('[Options] main runtime message error: $e');
