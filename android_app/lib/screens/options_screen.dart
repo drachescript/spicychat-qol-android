@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
@@ -11,6 +12,7 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/settings_service.dart';
+import '../services/app_log_service.dart';
 import '../services/js_bundle_service.dart';
 
 /// Displays the extension's real options.html inside the Android app.
@@ -42,6 +44,7 @@ class _OptionsScreenState extends State<OptionsScreen> {
   double _progress = 0;
   bool _storageChanged = false;
   bool _nativeSaveBusy = false;
+  DateTime? _lastNativeStorageSample;
 
   @override
   void dispose() {
@@ -248,13 +251,27 @@ class _OptionsScreenState extends State<OptionsScreen> {
     controller.addJavaScriptHandler(
       handlerName: 'optionsStorageGet',
       callback: (args) async {
+        // DS_ANDROID_031_RELIABILITY_V1: measure native execution, not JS wait.
+        final clock = Stopwatch()..start();
         try {
           final rawKeys = args.isNotEmpty ? args.first?.toString() : null;
           final keys = rawKeys == null || rawKeys.isEmpty
               ? null
               : jsonDecode(rawKeys);
+          final readStart = clock.elapsedMilliseconds;
           final result = await settingsService.storageGet(keys);
-          return jsonEncode(result);
+          final encodeStart = clock.elapsedMilliseconds;
+          final response = jsonEncode(result);
+          final total = clock.elapsedMilliseconds;
+          final now = DateTime.now();
+          final previous = _lastNativeStorageSample;
+          if (total >= 100 && (previous == null || now.difference(previous) >= const Duration(seconds: 15))) {
+            _lastNativeStorageSample = now;
+            unawaited(AppLogService.instance.log('NativeStorage', 'Options read total=${total}ms '
+                'decodeKeys=${readStart}ms storage=${encodeStart - readStart}ms '
+                'encode=${total - encodeStart}ms keys=${result.length} chars=${response.length}'));
+          }
+          return response;
         } catch (e) {
           debugPrint('[Options] storageGet error: $e');
           return '{}';

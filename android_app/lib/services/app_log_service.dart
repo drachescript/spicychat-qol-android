@@ -30,11 +30,13 @@ class AppLogService {
   final List<String> _pending = <String>[];
   Future<void> _writeChain = Future<void>.value();
 
-  String _stamp() => DateTime.now().toIso8601String();
+  // DS_ANDROID_031_RELIABILITY_V1: correlate native and QoL logs in UTC.
+  final String _sessionId = '$pid-${DateTime.now().toUtc().millisecondsSinceEpoch}';
+  String _stamp() => DateTime.now().toUtc().toIso8601String();
 
   String _line(String level, String area, String message) {
     final clean = message.replaceAll('\r', ' ').replaceAll('\n', r'\n');
-    return '${_stamp()} [$level] [$area] $clean';
+    return '${_stamp()} [$level] [$area] [session=$_sessionId] $clean';
   }
 
   Future<void> init() async {
@@ -169,7 +171,25 @@ class AppLogService {
     if (await file.exists()) {
       parts.add(await file.readAsString());
     }
-    return parts.join();
+    return _redactShareableLog(parts.join());
+  }
+
+  String _redactShareableLog(String text) {
+    var safe = text.replaceAllMapped(
+      RegExp(r'https?://[^\s"<>]+', caseSensitive: false),
+      (match) {
+        final raw = match.group(0)!;
+        final split = raw.indexOf(RegExp(r'[?#]'));
+        return split < 0 ? raw : '${raw.substring(0, split)}?[redacted]';
+      },
+    );
+    safe = safe.replaceAll(RegExp(r'\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b', caseSensitive: false), '[id]');
+    safe = safe.replaceAll(RegExp(r'\bBearer\s+[^\s,;"}]+', caseSensitive: false), 'Bearer [redacted]');
+    safe = safe.replaceAllMapped(
+      RegExp(r'''(["']?(?:authorization|accessToken|refreshToken|deviceToken|accountId|conversationId|idToken|apiKey|token|password|cookie)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)''', caseSensitive: false),
+      (match) => '${match.group(1)}[redacted]',
+    );
+    return safe;
   }
 
   Future<void> clear() async {

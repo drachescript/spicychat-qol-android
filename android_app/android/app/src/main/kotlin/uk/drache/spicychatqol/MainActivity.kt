@@ -32,6 +32,63 @@ class MainActivity : FlutterActivity() {
     @Volatile private var verifiedExportWriteInProgress = false
 
 
+    // DS_ANDROID_031_RELIABILITY_V1: bounded native surface evidence, not a crash detector.
+    private fun sampleWebViewSurface(redraw: Boolean, result: MethodChannel.Result) {
+        val candidates = mutableListOf<android.webkit.WebView>()
+        val pending = java.util.ArrayDeque<android.view.View>()
+        pending.add(window.decorView)
+        var visited = 0
+        while (pending.isNotEmpty() && visited < 512) {
+            val view = pending.removeFirst()
+            visited++
+            if (view is android.webkit.WebView && view.isAttachedToWindow &&
+                view.isShown && view.windowVisibility == android.view.View.VISIBLE) {
+                candidates.add(view)
+            }
+            if (view is android.view.ViewGroup) {
+                for (i in 0 until view.childCount) pending.add(view.getChildAt(i))
+            }
+        }
+        if (candidates.size != 1 || pending.isNotEmpty()) {
+            result.success(mapOf("available" to false, "candidates" to candidates.size,
+                "traversalLimited" to pending.isNotEmpty(), "redrawRequested" to false))
+            return
+        }
+        val view = candidates.single()
+        val rect = android.graphics.Rect()
+        val visible = view.getGlobalVisibleRect(rect)
+        val sample = mutableMapOf<String, Any>(
+            "available" to true, "widthPx" to view.width, "heightPx" to view.height,
+            "measuredWidthPx" to view.measuredWidth, "measuredHeightPx" to view.measuredHeight,
+            "attached" to view.isAttachedToWindow, "shown" to view.isShown,
+            "globalVisible" to visible, "visibleWidthPx" to rect.width(),
+            "visibleHeightPx" to rect.height(), "windowVisibility" to view.windowVisibility,
+            "hardwareAccelerated" to view.isHardwareAccelerated, "redrawRequested" to redraw)
+        if (redraw) {
+            view.requestLayout()
+            view.invalidate()
+        }
+        // A visual-state callback indicates Chromium has reached a drawable state,
+        // not that the compositor actually displayed pixels. Never recreate here.
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var finished = false
+        fun finish(state: String) {
+            if (finished) return
+            finished = true
+            sample["visualState"] = state
+            result.success(sample)
+        }
+        handler.postDelayed({ finish("timeout") }, 1600L)
+        try {
+            view.postVisualStateCallback(android.os.SystemClock.uptimeMillis(),
+                object : android.webkit.WebView.VisualStateCallback() {
+                    override fun onComplete(requestId: Long) {
+                        finish(if (view.isAttachedToWindow) "callback" else "detached")
+                    }
+                })
+        } catch (_: Exception) { finish("unavailable") }
+    }
+
     @Suppress("DEPRECATION")
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -41,6 +98,16 @@ class MainActivity : FlutterActivity() {
             appInfoChannel,
         ).setMethodCallHandler { call, result ->
             when (call.method) {
+                "sampleWebViewSurface" -> {
+                    try {
+                        sampleWebViewSurface(call.argument<Boolean>("redraw") == true, result)
+                    } catch (_: Exception) {
+                        result.success(mapOf("available" to false, "reason" to "native-probe-failed"))
+                    }
+                }
+                "getLorebookJobDirectory" -> {
+                    result.success(File(noBackupFilesDir, "qol_lorebook_jobs_v1").path)
+                }
                 "getAppInfo" -> {
                     try {
                         val packageInfo = packageManager.getPackageInfo(

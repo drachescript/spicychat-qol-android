@@ -98,6 +98,8 @@ class QolUpdateService extends ChangeNotifier {
     'content/chat-history-navigator.js',
   };
   static const Set<String> androidUnavailableOptionalModules = <String>{
+    // DS_ANDROID_031_RELIABILITY_V1: SCT is desktop only; preserve saved preferences.
+    'content/creator-tools-integration.js',
     'content/bulk-chat-research.js',
     'content/archive-community-themes.js',
     // Background/popup/helper-tab features are unavailable in one WebView.
@@ -140,6 +142,8 @@ class QolUpdateService extends ChangeNotifier {
     }
     return null;
   }
+
+  List<String> get androidSkippedOptionalPaths => List<String>.unmodifiable(_skippedOptionalModules.keys);
 
   final Set<String> _declaredOptionalModules = <String>{};
   final Map<String, String> _skippedOptionalModules = <String, String>{};

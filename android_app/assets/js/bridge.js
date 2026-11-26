@@ -272,6 +272,14 @@
         return operation;
       }
 
+      // DS_ANDROID_031_RELIABILITY_V1: private native Lorebook job scope.
+      if (message?.type === "DS_LOREBOOK_IMPORT_JOB") {
+        return window.flutter_inappwebview.callHandler("runtimeMessage", JSON.stringify(message),
+          String(window.__spicyChatQolAndroidDocumentToken || ""))
+          .then(raw => typeof raw === "string" ? JSON.parse(raw) : raw)
+          .catch(() => ({ok:false,error:"Native Lorebook checkpoint unavailable"}))
+          .then(response => { if (typeof callback === "function") callback(response); return response; });
+      }
       // DS_ANDROID_V145_287_RUNTIME_PROMISE: support Chrome's Promise-returning
       // runtime API as well as callback callers. Required for Archive presets.
       return window.flutter_inappwebview

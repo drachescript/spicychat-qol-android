@@ -211,6 +211,15 @@ class JsBundleService extends ChangeNotifier {
 
   static String _androidDesktopOnlySource(String path, String source) {
     final file = path.replaceAll('\\', '/');
+    // DS_ANDROID_031_RELIABILITY_V1: block SCT runtime; keep Options readers
+    // so synced desktop values are not silently reset by Android autosave.
+    if (file.endsWith('/creator-tools-integration.js') &&
+        !file.contains('/feature-panels/')) {
+      return '// Creator Tools (SCT) is unavailable on Android.';
+    }
+    if (file.endsWith('/feature-panels/creator-tools-integration.js')) {
+      return '$source\n;(() => { const card = document.getElementById("creatorToolsIntegrationCard"); if (card) { card.hidden = true; card.style.setProperty("display", "none", "important"); card.querySelectorAll("a").forEach(a => a.remove()); } })();';
+    }
 
     // DS_ANDROID_V289_EXACT_COUNTS_NATIVE_BRIDGE: the existing MAIN-world
     // SpicyChat data bridge can supply counts. Android has no desktop worker
@@ -297,8 +306,8 @@ class JsBundleService extends ChangeNotifier {
     // These require a desktop service worker, helper tabs or popup controls.
     if (window.__spicyChatQolAndroidApp && [
         "archive-community-themes", "chat-lorebook-manager",
-        "report-link-collector"
-    ].includes(name)) return Promise.resolve(false);
+        "report-link-collector", "creator-tools-integration"
+    ].includes(name) || (window.__spicyChatQolAndroidApp && window.__dsAndroidUnavailableOptionalPaths?.includes(MODULES[name]))) return Promise.resolve(false);
 ''')
           .replaceFirst(importAnchor, r'''
     const operation = window.__spicyChatQolAndroidApp
@@ -306,7 +315,7 @@ class JsBundleService extends ChangeNotifier {
       : import(chrome.runtime.getURL(path));
     const promise = operation.then(() => {''')
           .replaceFirst(listAnchor,
-              '    return list.filter(name => !["archive-community-themes", "chat-lorebook-manager", "report-link-collector"].includes(name));');
+              '    return list.filter(name => !["archive-community-themes", "chat-lorebook-manager", "report-link-collector", "creator-tools-integration"].includes(name) && !window.__dsAndroidUnavailableOptionalPaths?.includes(MODULES[name]));');
     }
 
     // QoL's common platform layer already hides the other desktop-only
@@ -321,11 +330,13 @@ class JsBundleService extends ChangeNotifier {
     enableChatLorebookManager: ["helperTabs"],
     showBulkChatResearchExport: ["helperTabs", "backgroundWorkers"],
     archiveCommunityThemesEnabled: ["backgroundWorkers"],
-    enableReportLinkCollector: ["backgroundWorkers"],''';
+    enableReportLinkCollector: ["backgroundWorkers"],
+    creatorToolsIntegrationEnabled: ["backgroundWorkers"],
+    creatorToolsDiagnostics: ["backgroundWorkers"],''';
     const featureAnchor =
         '    "quick-dislike": { requires: ["helperTabs"], mode: "all" },';
     const featureRule =
-        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },\n    "archive-community-themes": { requires: ["backgroundWorkers"], mode: "all" },\n    "report-link-collector": { requires: ["backgroundWorkers"], mode: "all" },';
+        '    "chat-lorebook-manager": { requires: ["helperTabs"], mode: "all" },\n    "bulk-chat-research": { requires: ["helperTabs", "backgroundWorkers"], mode: "all" },\n    "archive-community-themes": { requires: ["backgroundWorkers"], mode: "all" },\n    "report-link-collector": { requires: ["backgroundWorkers"], mode: "all" },\n    "creator-tools-integration": { requires: ["backgroundWorkers"], mode: "all" },';
     const actionAnchor =
         '    bulkLessLikeBlockedBots: ["bulkOperations", "helperTabs"],';
     const actionRules = '''
@@ -867,6 +878,7 @@ $earlyMainSource
       ..writeln(
         'window.__spicyChatQolBundledVersion = ${jsonEncode(_extensionVersion)};',
       )
+      ..writeln('window.__dsAndroidUnavailableOptionalPaths = ${jsonEncode(qolUpdates.androidSkippedOptionalPaths)};')
       ..writeln('// === Android native bridge (APK-owned) ===')
       ..writeln(bridge)
       ..writeln();
