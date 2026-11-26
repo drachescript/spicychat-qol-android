@@ -15,8 +15,13 @@ import sys
 def check(extensions: Path, android: Path) -> list[str]:
     problems: list[str] = []
     manifest = json.loads((extensions / 'manifest.json').read_text(encoding='utf-8-sig'))
-    if not re.fullmatch(r'\d+\.\d+\.\d+', manifest.get('version','')):
-        problems.append('Manifest version is not a numeric three-part release version')
+    canonical_version = manifest.get('version', '')
+    public_version = manifest.get('version_name') or canonical_version
+    if not isinstance(canonical_version, str) or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', canonical_version):
+        problems.append('Manifest version is not a canonical numeric three-part release version')
+    elif (not isinstance(public_version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', public_version)
+          or tuple(map(int, public_version.split('.'))) != tuple(map(int, canonical_version.split('.')))):
+        problems.append('Public QoL version does not match the browser manifest numerically')
     js = [p for group in manifest.get('content_scripts',[]) for p in group.get('js',[])]
     css = [p for group in manifest.get('content_scripts',[]) for p in group.get('css',[])]
     resources = [p for group in manifest.get('web_accessible_resources',[]) for p in group.get('resources',[]) if p.endswith('.js')]
@@ -92,7 +97,7 @@ def check(extensions: Path, android: Path) -> list[str]:
                 problems.append(f'Missing mandatory Android Settings file: {name}')
     dart = (android/'lib/services/js_bundle_service.dart').read_text(encoding='utf-8-sig')
     version_match = re.search(r"bundledExtensionVersion\s*=\s*'([^']+)'", dart)
-    if not version_match or version_match.group(1) != manifest.get('version'):
+    if not version_match or version_match.group(1) != public_version:
         problems.append('Bundled extension version is not synced to current manifest')
     for path in js:
         marker = 'assets/js/' + Path(path).name
