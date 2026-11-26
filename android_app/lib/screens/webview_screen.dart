@@ -4993,6 +4993,9 @@ $source
       await controller.evaluateJavascript(
         source: r'''
           (async () => {
+            // DS_ANDROID_QOL_030_SYNC_INTERVAL_V1: Options may have changed
+            // device sync preferences in its separate WebView.
+            window.__dsQolAndroidRecheckSyncSchedule?.();
             const DS = window.DragonScriptQoL;
             if (!DS) return;
             if (typeof DS.loadState === "function") await DS.loadState();

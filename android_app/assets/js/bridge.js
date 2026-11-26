@@ -669,7 +669,11 @@
   const REVISION_KEY = "dsSettingsRevisionV1";
   const ALARM_NAME = "ds-qol-account-sync-v1";
   // DS_ANDROID_V065_EARLY_ACCOUNT_OBSERVER: keep native sync aligned with shared QoL.
-  const SYNC_INTERVAL_MINUTES = 360;
+  // DS_ANDROID_QOL_030_SYNC_INTERVAL_V1: match shared QoL device preferences.
+  const DEFAULT_SYNC_INTERVAL_MINUTES = 720;
+  const VALID_SYNC_INTERVAL_MINUTES = new Set([180, 360, 720, 1440]);
+  const AUTO_SYNC_QUIET_MS = 15 * 60_000;
+  const AUTO_SYNC_FALLBACK_MS = 180 * 60_000;
   const LIST_EDIT_SETTLE_MS = 90_000;
   let listPublishNotBefore = 0;
   const REQUEST_TIMEOUT_MS = 30000;
@@ -762,6 +766,8 @@
     return {
       schemaVersion: 2,
       mode: VALID_SYNC_MODES.has(requestedMode) ? requestedMode : "two-way",
+      syncIntervalMinutes: VALID_SYNC_INTERVAL_MINUTES.has(Number(source.syncIntervalMinutes))
+        ? Number(source.syncIntervalMinutes) : DEFAULT_SYNC_INTERVAL_MINUTES,
       allowedKeys,
       listModes,
       scopes: Array.isArray(source.scopes) ? [...new Set(source.scopes.map(scope => String(scope || "").trim()).filter(Boolean))] : [],
@@ -1992,23 +1998,79 @@
     // whether anything should be uploaded or downloaded.
     // No native background worker: do not poll sync while a chat is hidden or
     // issue network reads on every quick app switch. Manual sync is unchanged.
+    // One due-time timer, no service-worker emulation or background polling.
+    // The Options WebView only persists preferences; the main WebView owns sync.
+    let autoTimer = null;
+    let autoInFlight = false;
+    let autoRecheckPending = false;
+    let lastAutoCheck = 0;
     let lastAutoAttempt = 0;
+    let lastAutoSuccess = 0;
+    let lastAutoAccount = "";
+    const cancelAutoTimer = () => {
+      if (autoTimer !== null) clearTimeout(autoTimer);
+      autoTimer = null;
+    };
+    const armAutomaticSync = delay => {
+      cancelAutoTimer();
+      if (document.visibilityState !== "visible") return;
+      autoTimer = setTimeout(() => {
+        autoTimer = null;
+        runAutomaticSync();
+      }, Math.max(1200, delay));
+    };
     const runAutomaticSync = () => {
-      if (document.visibilityState !== "visible" ||
-          Date.now() - lastAutoAttempt < 15 * 60_000) return;
-      lastAutoAttempt = Date.now();
+      if (document.visibilityState !== "visible") return;
+      if (autoInFlight) { autoRecheckPending = true; return; }
+      autoInFlight = true;
+      lastAutoCheck = Date.now();
+      let nextDelay = AUTO_SYNC_FALLBACK_MS;
       queued(async () => {
+        if (document.visibilityState !== "visible") return;
         const { state, auth, prefs } = await getSyncContext();
+        if (document.visibilityState !== "visible") return;
+        if (lastAutoAccount !== state.accountId) {
+          lastAutoAccount = state.accountId;
+          lastAutoAttempt = 0;
+          lastAutoSuccess = 0;
+        }
         if (!state.accountId || !auth.token || state.paused || state.automatic === false) return;
         if (["off", "manual"].includes(prefs.mode) && !anyListsActive(prefs)) return;
-        if (Date.now() - Number(state.lastSyncAt || 0) < SYNC_INTERVAL_MINUTES * 60_000) return;
-        await syncNowInternal();
-      }).catch(() => {});
+        const interval = prefs.syncIntervalMinutes * 60_000;
+        const nowMs = Date.now();
+        const last = Math.max(Number(state.lastSyncAt || 0), lastAutoSuccess);
+        const remaining = last > 0 ? interval - Math.max(0, nowMs - last) : 0;
+        if (remaining > 0) { nextDelay = remaining; return; }
+        const quietRemaining = lastAutoAttempt > 0
+          ? AUTO_SYNC_QUIET_MS - Math.max(0, nowMs - lastAutoAttempt) : 0;
+        if (quietRemaining > 0) { nextDelay = quietRemaining; return; }
+        lastAutoAttempt = nowMs;
+        const result = await syncNowInternal();
+        if (result?.ok) {
+          lastAutoSuccess = Date.now();
+          nextDelay = interval;
+        }
+      }).catch(() => {}).finally(() => {
+        autoInFlight = false;
+        const recheck = autoRecheckPending;
+        autoRecheckPending = false;
+        armAutomaticSync(recheck ? 1200 : nextDelay);
+      });
     };
-    setTimeout(runAutomaticSync, 1800);
-    setInterval(runAutomaticSync, SYNC_INTERVAL_MINUTES * 60 * 1000);
-    document.addEventListener("visibilitychange", () => {
+    // Called once when native Options closes/refreshes state. Re-read only
+    // the current device preferences; a forced check never bypasses the
+    // interval, account, visibility, or automatic-sync safeguards.
+    window.__dsQolAndroidRecheckSyncSchedule = () => {
       if (document.visibilityState !== "visible") return;
+      if (autoInFlight) { autoRecheckPending = true; return; }
+      armAutomaticSync(1200);
+    };
+    armAutomaticSync(1800);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") {
+        cancelAutoTimer();
+        return;
+      }
       // A 90-second list-settle timer may have fired while backgrounded.
       // Resume that pending list publish, but do not duplicate the user edit.
       if (pendingListSources.size) {
@@ -2017,7 +2079,7 @@
           queued(() => syncListData()).catch(() => {});
         }, Math.max(1200, listPublishNotBefore - Date.now()));
       }
-      setTimeout(runAutomaticSync, 1200);
+      armAutomaticSync(Math.max(1200, AUTO_SYNC_QUIET_MS - (Date.now() - lastAutoCheck)));
     }, { passive: true });
   }
 })();
