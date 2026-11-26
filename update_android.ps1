@@ -811,7 +811,11 @@ if ($OptionsPage) {
 }
 
 # 6) Register every current content script for Android injection in manifest order.
-Update-BundleList -DartFile $BundleService -ManifestScripts $ContentScripts -ManifestStyles $ContentStyles -ManifestVersion ([string]$Manifest.version)
+$PublicQolVersion = if ($Manifest.version_name) { [string]$Manifest.version_name } else { [string]$Manifest.version }
+if ($PublicQolVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or [version]$PublicQolVersion -ne [version]([string]$Manifest.version)) {
+    Fail "Invalid public QoL version: $PublicQolVersion"
+}
+Update-BundleList -DartFile $BundleService -ManifestScripts $ContentScripts -ManifestStyles $ContentStyles -ManifestVersion $PublicQolVersion
 
 # Guard against the old PowerShell encoding-corruption failure mode.
 $BundleSize = (Get-Item -LiteralPath $BundleService).Length

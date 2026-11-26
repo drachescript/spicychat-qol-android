@@ -279,7 +279,10 @@ jobs:
           QOL_TAG: ${{ steps.qol_source.outputs.tag }}
         run: |
           $manifest = Get-Content 'spicychat-qol-extension/manifest.json' -Raw | ConvertFrom-Json
-          if ($manifest.version -ne $env:QOL_TAG.Substring(1)) { throw 'Tag and manifest version mismatch' }
+          $publicVersion = if ($manifest.version_name) { [string]$manifest.version_name } else { [string]$manifest.version }
+          $canonicalVersion = [string]$manifest.version
+          if ($canonicalVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $publicVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid QoL manifest version' }
+          if ([version]$canonicalVersion -ne [version]$publicVersion -or $publicVersion -ne $env:QOL_TAG.Substring(1)) { throw 'Tag and manifest version mismatch' }
           .\update_android.ps1 -SourceRoot "$env:GITHUB_WORKSPACE\spicychat-qol-extension"
           python tools/validate_qol_bundle.py --extension spicychat-qol-extension --android android_app
 
