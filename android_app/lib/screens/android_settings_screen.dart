@@ -101,7 +101,11 @@ class AndroidSettingsScreen extends StatelessWidget {
     BuildContext context,
     AndroidUpdateService updates,
   ) async {
-    final messenger = ScaffoldMessenger.of(context);
+    // DS_ANDROID_STORAGE_PRESSURE_V1: a snackbar action can outlive the route.
+    // Check mounted before looking up a ScaffoldMessenger, not just after I/O.
+    if (!context.mounted) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
     final ok = updates.hasDownloadedApk
         ? await updates.installDownloadedUpdate()
         : await updates.downloadAndInstallLatestApk();

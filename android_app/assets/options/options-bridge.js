@@ -179,8 +179,8 @@
 
     getBytesInUse(keys, callback) {
       const promise = call("optionsStorageGetBytesInUse", JSON.stringify(keys ?? null))
-        .then(bytes => Number(bytes) || 0)
-        .catch(() => 0);
+        .then(bytes => typeof bytes === "number" && Number.isFinite(bytes) && bytes >= 0 ? bytes : null)
+        .catch(() => null);
       if (callback) promise.then(callback);
       return promise;
     },
@@ -234,10 +234,20 @@
   }
 
   function sendAndroidMainTabMessage(message) {
+    // DS_ANDROID_QOL_032_LARGE_PROTOCOL_V1: decode the serialized native
+    // response only once in the destination WebView, not on the Flutter UI.
+    if (String(message?.type || "").startsWith("DS_SCT_INSPECTOR_")) {
+      return Promise.resolve({ ok: false, status: "unsupported-on-android" });
+    }
     return call(
       "optionsMainTabMessage",
       JSON.stringify(message ?? null)
-    ).catch(() => null);
+    ).then(response => {
+      if (message?.type === "DS_LARGE_STORAGE_GET" && typeof response === "string") {
+        return JSON.parse(response);
+      }
+      return response;
+    }).catch(() => null);
   }
 
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));

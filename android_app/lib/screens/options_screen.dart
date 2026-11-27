@@ -139,12 +139,22 @@ class _OptionsScreenState extends State<OptionsScreen> {
       final encodedBytes = bytes.length > 256 * 1024
           ? await compute(base64Encode, bytes)
           : base64Encode(bytes);
+      // Persist the attempt before opening SAF, so a process death while the
+      // picker is open is distinguishable from an ordinary export failure.
+      await AppLogService.instance.log('NativeExport',
+          'Options export picker requested; expectedBytes=${bytes.length}');
+      await AppLogService.instance.flush();
       final native = await const MethodChannel('uk.drache.spicychatqol/app_info')
           .invokeMapMethod<String, dynamic>('saveVerifiedFile', {
         'filename': filename,
         'mimeType': mime,
         'base64': encodedBytes,
       });
+      unawaited(AppLogService.instance.log('NativeExport',
+          'Options export result: verified=${native?['verified'] == true}; '
+          'canceled=${native?['canceled'] == true}; '
+          'bytes=${native?['bytes'] ?? 0}; '
+          'expectedBytes=${bytes.length}'));
       if (native?['canceled'] == true) return {'ok': false, 'canceled': true};
       final verified = native?['ok'] == true && native?['verified'] == true &&
           native?['bytes'] == bytes.length;
@@ -259,17 +269,16 @@ class _OptionsScreenState extends State<OptionsScreen> {
               ? null
               : jsonDecode(rawKeys);
           final readStart = clock.elapsedMilliseconds;
-          final result = await settingsService.storageGet(keys);
-          final encodeStart = clock.elapsedMilliseconds;
-          final response = jsonEncode(result);
+          // DS_ANDROID_STORAGE_PRESSURE_V1: avoid large decode/encode on UI.
+          final result = await settingsService.storageGetJson(keys);
+          final response = result.response;
           final total = clock.elapsedMilliseconds;
           final now = DateTime.now();
           final previous = _lastNativeStorageSample;
           if (total >= 100 && (previous == null || now.difference(previous) >= const Duration(seconds: 15))) {
             _lastNativeStorageSample = now;
             unawaited(AppLogService.instance.log('NativeStorage', 'Options read total=${total}ms '
-                'decodeKeys=${readStart}ms storage=${encodeStart - readStart}ms '
-                'encode=${total - encodeStart}ms keys=${result.length} chars=${response.length}'));
+                'decodeKeys=${readStart}ms projection=${total - readStart}ms keys=${result.keyCount} chars=${response.length}'));
           }
           return response;
         } catch (e) {
@@ -339,7 +348,7 @@ class _OptionsScreenState extends State<OptionsScreen> {
           return await settingsService.storageGetBytesInUse(keys);
         } catch (e) {
           debugPrint('[Options] storageGetBytesInUse error: $e');
-          return 0;
+          return null;
         }
       },
     );
@@ -400,6 +409,43 @@ class _OptionsScreenState extends State<OptionsScreen> {
 
         try {
           final decoded = jsonDecode(args.first.toString());
+          // DS_ANDROID_QOL_032_LARGE_PROTOCOL_V1: native store operations do
+          // not depend on the main WebView responding to Settings messages.
+          if (decoded is Map) {
+            final type = (decoded['type'] ?? '').toString();
+            if (type.startsWith('DS_SCT_INSPECTOR_')) {
+              return {'ok': false, 'status': 'unsupported-on-android'};
+            }
+            if (type == 'DS_LARGE_STORAGE_GET') {
+              return await settingsService.storageLargeValuesJson(decoded['keys']);
+            }
+            if (type == 'DS_LARGE_STORAGE_SET') {
+              final result = await settingsService.storageLargeReplace(decoded['values']);
+              _storageChanged = true;
+              return result;
+            }
+            if (type == 'DS_LARGE_STORAGE_REMOVE_RECORDS') {
+              final result = await settingsService.storageLargeRemoveRecords(decoded['key'], decoded['ids']);
+              _storageChanged = true;
+              return result;
+            }
+            if (type == 'DS_LARGE_STORAGE_REMOVE') {
+              final result = await settingsService.storageLargeClear(decoded['keys']);
+              _storageChanged = true;
+              return result;
+            }
+          }
+          // DS_ANDROID_RECORD_MERGE_V2: no main WebView relay for native writes.
+          if (decoded is Map && decoded['type'] == 'DS_LARGE_STORAGE_MERGE') {
+            return await settingsService.storageLargeMerge(
+              decoded['key'], decoded['entries'],
+            );
+          }
+          if (decoded is Map && decoded['type'] == 'DS_LARGE_STORAGE_GET_RECORDS') {
+            return jsonDecode(await settingsService.storageLargeRecordsJson(
+              decoded['key'], decoded['ids'],
+            ));
+          }
           // DS_ANDROID_QOL_299_RECORD_COUNTS_V1: native storage overview.
           // Does not need a live content WebView or transfer any saved records.
           if (decoded is Map && decoded['type'] == 'DS_LARGE_STORAGE_STATS') {

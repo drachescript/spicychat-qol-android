@@ -1354,7 +1354,7 @@ class _WebViewScreenState extends State<WebViewScreen> with WidgetsBindingObserv
                     if (verified) {
                       _confirmRendererReplacement(callbackWebViewKey);
                     }
-                    if (!verified) {
+                    if (!verified && _injectionInProgressToken == null) {
                       _armStartupInjectionFallback('post-load-not-ready',
                           delay: const Duration(seconds: 5));
                       unawaited(_appLog.log('Injection',
@@ -3186,16 +3186,16 @@ $source
         try {
           final keys = args.isNotEmpty ? jsonDecode(args[0].toString()) : null;
           final readStart = clock.elapsedMilliseconds;
-          final result = await settingsService.storageGet(keys);
-          final encodeStart = clock.elapsedMilliseconds;
-          final response = jsonEncode(result);
+          // DS_ANDROID_STORAGE_PRESSURE_V1: avoid large decode/encode on UI.
+          final result = await settingsService.storageGetJson(keys);
+          final response = result.response;
           final total = clock.elapsedMilliseconds;
           if (total >= 100 && _shouldPersistDiagnostic('native-storage-get',
               cooldown: const Duration(seconds: 15))) {
             unawaited(_appLog.log('NativeStorage', 'main read total=${total}ms '
                 'trust=${trustedMs}ms decodeKeys=${readStart - trustedMs}ms '
-                'storage=${encodeStart - readStart}ms encode=${total - encodeStart}ms '
-                'keys=${result.length} chars=${response.length}'));
+                'projection=${total - readStart}ms '
+                'keys=${result.keyCount} chars=${response.length}'));
           }
           return response;
         } catch (e) {
@@ -3273,7 +3273,7 @@ $source
     controller.addJavaScriptHandler(
       handlerName: 'storageGetBytesInUse',
       callback: (args) async {
-        if (!await _isCurrentUrlTrusted(controller)) return 0;
+        if (!await _isCurrentUrlTrusted(controller)) return null;
         try {
           final rawKeys = args.isNotEmpty ? args[0].toString() : 'null';
           return await settingsService.storageGetBytesInUse(
@@ -3281,7 +3281,7 @@ $source
           );
         } catch (e) {
           debugPrint('[Bridge] storageGetBytesInUse error: $e');
-          return 0;
+          return null;
         }
       },
     );
@@ -3309,6 +3309,38 @@ $source
           // Android v0.2.49 HTTPS background image bridge: native HTTPS fetch
           // with per-host user consent; other runtime messages are untouched.
           final type = message is Map ? (message['type'] ?? '').toString() : '';
+          // DS_ANDROID_QOL_032_LARGE_PROTOCOL_V1: no monolithic fallback.
+          if (type.startsWith('DS_SCT_INSPECTOR_')) {
+            return jsonEncode({'ok': false, 'status': 'unsupported-on-android'});
+          }
+          if (message is Map) {
+            if (type == 'DS_LARGE_STORAGE_GET') {
+              return await settingsService.storageLargeValuesJson(message['keys']);
+            }
+            if (type == 'DS_LARGE_STORAGE_SET') {
+              return jsonEncode(await settingsService.storageLargeReplace(message['values']));
+            }
+            if (type == 'DS_LARGE_STORAGE_STATS') {
+              return jsonEncode({'ok': true, 'stats': await settingsService.storageLargeRecordStats(message['keys'])});
+            }
+            if (type == 'DS_LARGE_STORAGE_REMOVE_RECORDS') {
+              return jsonEncode(await settingsService.storageLargeRemoveRecords(message['key'], message['ids']));
+            }
+            if (type == 'DS_LARGE_STORAGE_REMOVE') {
+              return jsonEncode(await settingsService.storageLargeClear(message['keys']));
+            }
+          }
+          // DS_ANDROID_RECORD_MERGE_V2: native small-batch writes, same store.
+          if (type == 'DS_LARGE_STORAGE_MERGE' && message is Map) {
+            return jsonEncode(await settingsService.storageLargeMerge(
+              message['key'], message['entries'],
+            ));
+          }
+          if (type == 'DS_LARGE_STORAGE_GET_RECORDS' && message is Map) {
+            return await settingsService.storageLargeRecordsJson(
+              message['key'], message['ids'],
+            );
+          }
           if (type == 'DS_LOREBOOK_IMPORT_JOB' && message is Map<String, dynamic>) {
             final key = _webViewKey;
             final nav = _navigationSequence;

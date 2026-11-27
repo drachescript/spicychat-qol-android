@@ -26,11 +26,55 @@ class MainActivity : FlutterActivity() {
     // DS_ANDROID_V062_VERIFIED_EXPORT: one in-flight SAF document request at a time.
     private val verifiedExportRequestCode = 4719
     private var pendingVerifiedExportResult: MethodChannel.Result? = null
-    private var pendingVerifiedExportBase64: String? = null
+    private var pendingVerifiedExportFile: File? = null
+    private var pendingVerifiedExportDigest: ByteArray? = null
     private var pendingVerifiedExportName = ""
     // DS_ANDROID_V063_EXPORT_WORKER: keep duplicate saves blocked until I/O finishes.
     @Volatile private var verifiedExportWriteInProgress = false
 
+
+    // DS_ANDROID_STAGED_EXPORT_V2: Android may reclaim this Activity while SAF
+    // owns the screen. Retain only an app-private file reference in saved state.
+    // Never retry a write without a matching Activity result from the picker.
+    private fun stagedExportFile(name: String?): File? {
+        if (name == null || !name.matches(Regex("qol-export-[A-Za-z0-9_-]+\\.pending"))) return null
+        val file = File(cacheDir, name)
+        return if (file.isFile && file.canonicalFile.parentFile == cacheDir.canonicalFile &&
+            file.length() in 1L..(24L * 1024 * 1024)) file else null
+    }
+
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        try {
+            pendingVerifiedExportFile = stagedExportFile(savedInstanceState?.getString("qolExportStageV2"))
+            pendingVerifiedExportName = savedInstanceState?.getString("qolExportNameV2").orEmpty()
+            pendingVerifiedExportDigest = savedInstanceState?.getByteArray("qolExportDigestV2")
+            if (pendingVerifiedExportDigest?.size != 32) pendingVerifiedExportFile = null
+        } catch (_: Exception) { pendingVerifiedExportFile = null }
+        super.onCreate(savedInstanceState)
+    }
+
+    override fun onSaveInstanceState(outState: android.os.Bundle) {
+        pendingVerifiedExportFile?.let { outState.putString("qolExportStageV2", it.name) }
+        outState.putString("qolExportNameV2", pendingVerifiedExportName)
+        outState.putByteArray("qolExportDigestV2", pendingVerifiedExportDigest)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun finishStagedExport(reply: MethodChannel.Result?, outcome: Map<String, Any>) {
+        if (reply != null) {
+            reply.success(outcome)
+        } else {
+            // The originating Flutter/JS request no longer exists. Do not mark
+            // any QoL history exported or otherwise fabricate a bridge result.
+            android.util.Log.i("QolNativeExport", "Restored picker result: verified=${outcome["verified"] == true}; bytes=${outcome["bytes"] ?: 0}")
+            if (outcome["canceled"] != true) {
+                android.widget.Toast.makeText(this,
+                    if (outcome["verified"] == true) "Recovered export saved and verified."
+                    else "Interrupted export was not verified. Please export again.",
+                    android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+    }
 
     // DS_ANDROID_031_RELIABILITY_V1: bounded native surface evidence, not a crash detector.
     private fun sampleWebViewSurface(redraw: Boolean, result: MethodChannel.Result) {
@@ -108,6 +152,30 @@ class MainActivity : FlutterActivity() {
                 "getLorebookJobDirectory" -> {
                     result.success(File(noBackupFilesDir, "qol_lorebook_jobs_v1").path)
                 }
+                // DS_ANDROID_STORAGE_PRESSURE_V1: no traces or descriptions;
+                // numeric exit details only, and only this app's main process.
+                "getRecentAppExitReasons" -> {
+                    try {
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                            result.success(emptyList<Map<String, Any>>())
+                        } else {
+                            val manager = getSystemService(android.app.ActivityManager::class.java)
+                            val exits = manager?.getHistoricalProcessExitReasons(packageName, 0, 8)
+                                ?: emptyList()
+                            val rows = exits.filter { it.processName == packageName }
+                                .take(5).map { info ->
+                                    mapOf("pid" to info.pid, "timestampMs" to info.timestamp,
+                                        "reason" to info.reason, "status" to info.status,
+                                        "importance" to info.importance, "pssKb" to info.pss,
+                                        "rssKb" to info.rss)
+                                }
+                            result.success(rows)
+                        }
+                    } catch (_: Exception) {
+                        result.success(emptyList<Map<String, Any>>())
+                    }
+                }
+
                 "getAppInfo" -> {
                     try {
                         val packageInfo = packageManager.getPackageInfo(
@@ -198,7 +266,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "saveVerifiedFile" -> {
-                    if (pendingVerifiedExportResult != null || verifiedExportWriteInProgress || pendingDiagnosticExportResult != null) {
+                    if (pendingVerifiedExportResult != null || pendingVerifiedExportFile != null || verifiedExportWriteInProgress || pendingDiagnosticExportResult != null) {
                         result.success(mapOf("ok" to false, "error" to "save-busy"))
                         return@setMethodCallHandler
                     }
@@ -223,16 +291,63 @@ class MainActivity : FlutterActivity() {
                             type = mime
                             putExtra(Intent.EXTRA_TITLE, filename)
                         }
-                        pendingVerifiedExportBase64 = encoded
-                        pendingVerifiedExportName = filename
-                        pendingVerifiedExportResult = result
+                        // Decode once on a worker and release the large base64
+                        // string before handing the foreground to the picker.
+                        verifiedExportWriteInProgress = true
                         try {
-                            startActivityForResult(documentIntent, verifiedExportRequestCode)
-                        } catch (error: Exception) {
-                            pendingVerifiedExportResult = null
-                            pendingVerifiedExportBase64 = null
-                            pendingVerifiedExportName = ""
-                            result.success(mapOf("ok" to false, "error" to "picker-failed"))
+                            Thread({
+                                var staged: File? = null
+                                try {
+                                    // Only old, app-owned staging files; no user downloads.
+                                    val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+                                    cacheDir.listFiles()?.filter {
+                                        it.name.matches(Regex("qol-export-[A-Za-z0-9_-]+\\.pending")) &&
+                                            it.lastModified() < cutoff
+                                    }?.forEach { it.delete() }
+                                    val file = File.createTempFile("qol-export-", ".pending", cacheDir)
+                                    staged = file
+                                    val bytes = Base64.decode(encoded, Base64.DEFAULT)
+                                    if (bytes.isEmpty() || bytes.size > 24 * 1024 * 1024) {
+                                        throw java.io.IOException("Invalid export size")
+                                    }
+                                    val originalDigest = MessageDigest.getInstance("SHA-256").digest(bytes)
+                                    file.outputStream().use { output ->
+                                        output.write(bytes)
+                                        output.fd.sync()
+                                    }
+                                    runOnUiThread {
+                                        verifiedExportWriteInProgress = false
+                                        if (isFinishing || isDestroyed) {
+                                            file.delete()
+                                            result.success(mapOf("ok" to false, "error" to "activity-closed"))
+                                        } else {
+                                            pendingVerifiedExportFile = file
+                                            pendingVerifiedExportDigest = originalDigest
+                                            pendingVerifiedExportName = filename
+                                            pendingVerifiedExportResult = result
+                                            try {
+                                                startActivityForResult(documentIntent, verifiedExportRequestCode)
+                                            } catch (_: Exception) {
+                                                pendingVerifiedExportResult = null
+                                                pendingVerifiedExportFile = null
+                                                pendingVerifiedExportDigest = null
+                                                pendingVerifiedExportName = ""
+                                                file.delete()
+                                                result.success(mapOf("ok" to false, "error" to "picker-failed"))
+                                            }
+                                        }
+                                    }
+                                } catch (_: Exception) {
+                                    staged?.delete()
+                                    runOnUiThread {
+                                        verifiedExportWriteInProgress = false
+                                        result.success(mapOf("ok" to false, "error" to "stage-failed"))
+                                    }
+                                }
+                            }, "qol-stage-export").start()
+                        } catch (_: Exception) {
+                            verifiedExportWriteInProgress = false
+                            result.success(mapOf("ok" to false, "error" to "stage-worker-failed"))
                         }
                     } catch (error: Exception) {
                         result.success(mapOf("ok" to false, "error" to "invalid-payload"))
@@ -344,18 +459,23 @@ class MainActivity : FlutterActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == verifiedExportRequestCode) {
-            val reply = pendingVerifiedExportResult ?: return
-            val encodedPayload = pendingVerifiedExportBase64
+            val reply = pendingVerifiedExportResult
+            val staged = pendingVerifiedExportFile
+            val originalDigest = pendingVerifiedExportDigest
             val name = pendingVerifiedExportName
             pendingVerifiedExportResult = null
-            pendingVerifiedExportBase64 = null
+            pendingVerifiedExportFile = null
+            pendingVerifiedExportDigest = null
             pendingVerifiedExportName = ""
+            if (reply == null && staged == null) return
             if (resultCode != RESULT_OK || data?.data == null) {
-                reply.success(mapOf("ok" to false, "canceled" to true, "bytes" to 0))
+                staged?.delete()
+                finishStagedExport(reply, mapOf("ok" to false, "canceled" to true, "bytes" to 0))
                 return
             }
-            if (encodedPayload.isNullOrEmpty()) {
-                reply.success(mapOf("ok" to false, "error" to "missing-data", "bytes" to 0))
+            if (staged == null || originalDigest == null || originalDigest.size != 32 || !staged.isFile || staged.length() !in 1L..(24L * 1024 * 1024)) {
+                staged?.delete()
+                finishStagedExport(reply, mapOf("ok" to false, "error" to "missing-data", "bytes" to 0))
                 return
             }
             // DS_ANDROID_V063_EXPORT_WORKER: SAF I/O and verification run off
@@ -365,12 +485,23 @@ class MainActivity : FlutterActivity() {
             try {
                 Thread({
                     val outcome: Map<String, Any> = try {
-                        val expected = Base64.decode(encodedPayload, Base64.DEFAULT)
-                        if (expected.isEmpty() || expected.size > 24 * 1024 * 1024) {
-                            throw java.io.IOException("Invalid export size")
-                        }
+                        val expectedSize = staged.length().toInt()
+                        val expectedDigest = MessageDigest.getInstance("SHA-256")
                         contentResolver.openOutputStream(uri, "wt")?.use { output ->
-                            output.write(expected)
+                            staged.inputStream().use { input ->
+                                val buffer = ByteArray(65536)
+                                var sent = 0
+                                while (true) {
+                                    val n = input.read(buffer)
+                                    if (n < 0) break
+                                    if (n == 0) continue
+                                    sent += n
+                                    if (sent > expectedSize) throw java.io.IOException("Staged file changed")
+                                    expectedDigest.update(buffer, 0, n)
+                                    output.write(buffer, 0, n)
+                                }
+                                if (sent != expectedSize) throw java.io.IOException("Staged file changed")
+                            }
                             output.flush()
                         } ?: throw java.io.IOException("Document provider refused output stream")
                         val digest = MessageDigest.getInstance("SHA-256")
@@ -382,13 +513,14 @@ class MainActivity : FlutterActivity() {
                                 if (n < 0) break
                                 if (n == 0) continue
                                 writtenBytes += n
-                                if (writtenBytes > expected.size) break
+                                if (writtenBytes > expectedSize) break
                                 digest.update(buffer, 0, n)
                             }
                         } ?: throw java.io.IOException("Document provider refused readback")
-                        val verified = writtenBytes == expected.size &&
+                        val verified = writtenBytes == expectedSize &&
+                            MessageDigest.isEqual(originalDigest, expectedDigest.digest()) &&
                             MessageDigest.isEqual(
-                                MessageDigest.getInstance("SHA-256").digest(expected),
+                                originalDigest,
                                 digest.digest(),
                             )
                         if (verified) {
@@ -403,19 +535,21 @@ class MainActivity : FlutterActivity() {
                                 "uri" to uri.toString())
                         } else {
                             mapOf("ok" to false, "error" to "verification-mismatch",
-                                "bytes" to writtenBytes, "expectedBytes" to expected.size)
+                                "bytes" to writtenBytes, "expectedBytes" to expectedSize)
                         }
                     } catch (_: Exception) {
                         mapOf("ok" to false, "error" to "write-or-readback-failed", "bytes" to 0)
                     }
+                    staged.delete()
                     runOnUiThread {
                         verifiedExportWriteInProgress = false
-                        reply.success(outcome)
+                        finishStagedExport(reply, outcome)
                     }
                 }, "qol-verified-file-export").start()
             } catch (_: Exception) {
+                staged.delete()
                 verifiedExportWriteInProgress = false
-                reply.success(mapOf("ok" to false, "error" to "export-worker-failed", "bytes" to 0))
+                finishStagedExport(reply, mapOf("ok" to false, "error" to "export-worker-failed", "bytes" to 0))
             }
             return
         }

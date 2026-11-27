@@ -3,6 +3,7 @@ import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:provider/provider.dart';
 
@@ -21,6 +22,24 @@ void main() async {
   final appLog = AppLogService.instance;
   await appLog.init();
   unawaited(appLog.log('Startup', 'Application process starting'));
+  // DS_ANDROID_STORAGE_PRESSURE_V1: Android's historical process-exit reason
+  // is stronger evidence than inferring OOM from a new process ID.
+  if (defaultTargetPlatform == TargetPlatform.android) {
+    unawaited(() async {
+      try {
+        final rows = await const MethodChannel('uk.drache.spicychatqol/app_info')
+            .invokeListMethod<dynamic>('getRecentAppExitReasons')
+            .timeout(const Duration(seconds: 3));
+        if (rows != null) {
+          for (final row in rows) {
+            await appLog.log('ProcessExit', '$row');
+          }
+        }
+      } catch (_) {
+        await appLog.log('ProcessExit', 'Android exit history unavailable');
+      }
+    }());
+  }
 
   FlutterError.onError = (details) {
     FlutterError.presentError(details);

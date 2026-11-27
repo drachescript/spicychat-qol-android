@@ -218,7 +218,10 @@ class JsBundleService extends ChangeNotifier {
       return '// Creator Tools (SCT) is unavailable on Android.';
     }
     if (file.endsWith('/feature-panels/creator-tools-integration.js')) {
-      return '$source\n;(() => { const card = document.getElementById("creatorToolsIntegrationCard"); if (card) { card.hidden = true; card.style.setProperty("display", "none", "important"); card.querySelectorAll("a").forEach(a => a.remove()); } })();';
+      // DS_ANDROID_QOL_032_LARGE_PROTOCOL_V1: the new panel requests Inspector
+      // status immediately on construction. Do not request it on Android.
+      final localOnly = source.replaceFirst("void request('DS_SCT_INSPECTOR_STATUS');", '');
+      return '$localOnly\n;(() => { const card = document.getElementById("creatorToolsIntegrationCard"); if (card) { card.hidden = true; card.style.setProperty("display", "none", "important"); card.querySelectorAll("a").forEach(a => a.remove()); } })();';
     }
 
     // DS_ANDROID_V289_EXACT_COUNTS_NATIVE_BRIDGE: the existing MAIN-world

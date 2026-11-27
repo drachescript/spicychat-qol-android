@@ -123,8 +123,8 @@
     getBytesInUse(keys, callback) {
       const promise = window.flutter_inappwebview
         .callHandler("storageGetBytesInUse", JSON.stringify(keys ?? null))
-        .then(bytes => Number(bytes) || 0)
-        .catch(() => 0);
+        .then(bytes => typeof bytes === "number" && Number.isFinite(bytes) && bytes >= 0 ? bytes : null)
+        .catch(() => null);
       if (callback) promise.then(callback);
       return promise;
     },
