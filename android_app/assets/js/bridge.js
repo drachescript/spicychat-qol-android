@@ -273,11 +273,12 @@
       }
 
       // DS_ANDROID_031_RELIABILITY_V1: private native Lorebook job scope.
-      if (message?.type === "DS_LOREBOOK_IMPORT_JOB") {
+      if (message?.type === "DS_LOREBOOK_IMPORT_JOB" || ["DS_GENERATION_QUOTA_RESEARCH", "DS_CHAT_EXPORT_CHECKPOINT", "DS_ANDROID_CHAT_EXPORT_STREAM"].includes(message?.type)) { // DS_ANDROID_033_PRIVATE_ENGINE_V1
+        if (window.top !== window) return Promise.resolve({ok:false,error:"Top-level document required"});
         return window.flutter_inappwebview.callHandler("runtimeMessage", JSON.stringify(message),
           String(window.__spicyChatQolAndroidDocumentToken || ""))
           .then(raw => typeof raw === "string" ? JSON.parse(raw) : raw)
-          .catch(() => ({ok:false,error:"Native Lorebook checkpoint unavailable"}))
+          .catch(() => ({ok:false,error:"Native private checkpoint unavailable"}))
           .then(response => { if (typeof callback === "function") callback(response); return response; });
       }
       // DS_ANDROID_V145_287_RUNTIME_PROMISE: support Chrome's Promise-returning

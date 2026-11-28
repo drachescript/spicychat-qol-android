@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -205,6 +207,16 @@ class JsBundleService extends ChangeNotifier {
     if (rejected != null) {
       qolUpdates.noteOptionalModuleSkipped(relative, rejected);
       return null;
+    }
+    // DS_ANDROID_033_PRIVATE_ENGINE_V1: only the exact reviewed exporter is
+    // adapted; unknown/future source keeps the original native fallback.
+    if (relative == 'content/chat-export.js' && _extensionVersion == '0.3.3') {
+      final normalized = source.replaceAll('\r\n', '\n');
+      final bytes = utf8.encode(normalized);
+      final blob = sha1.convert([...utf8.encode('blob ${bytes.length}\u0000'), ...bytes]).toString();
+      if (blob == '6be614c9bc44944f11499f5cafe548652f2b7b8a') {
+        return await rootBundle.loadString('assets/native/chat-export-033.js');
+      }
     }
     return _androidDesktopOnlySource(relative, source);
   }

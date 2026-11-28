@@ -15,6 +15,88 @@ import java.io.File
 import java.security.MessageDigest
 
 class MainActivity : FlutterActivity() {
+    // DS_ANDROID_033_PRIVATE_ENGINE_V1: no worker until quota/export is used.
+    private var qolPrivateStorage: QolPrivateStorage? = null
+
+    override fun onDestroy() {
+        qolPrivateStorage?.shutdown()
+        qolPrivateStorage = null
+        super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            qolPrivateStorage?.trimIfIdle()
+        }
+        super.onTrimMemory(level)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun saveStagedChatExport(call: io.flutter.plugin.common.MethodCall, result: MethodChannel.Result) {
+        val stageName = call.argument<String>("stageName").orEmpty()
+        val file = if (stageName.matches(Regex("qol-export-stream-[0-9a-f]{32}\\.pending"))) stagedExportFile(stageName) else null
+        val bytes = call.argument<Number>("bytes")?.toLong() ?: 0L
+        val hex = call.argument<String>("sha256").orEmpty()
+        if (file == null || bytes != file.length() || !hex.matches(Regex("[0-9a-f]{64}"))) {
+            file?.delete()
+            result.success(mapOf("ok" to false, "error" to "invalid-stream-stage")); return
+        }
+        if (pendingVerifiedExportResult != null || pendingVerifiedExportFile != null || verifiedExportWriteInProgress || pendingDiagnosticExportResult != null) {
+            file.delete(); result.success(mapOf("ok" to false, "error" to "save-busy")); return
+        }
+        val filename = call.argument<String>("filename").orEmpty().replace(Regex("[^A-Za-z0-9._ -]"), "_").trim().take(140).ifEmpty { "chat-export.json" }
+        val requestedMime = call.argument<String>("mimeType").orEmpty().substringBefore(';').trim()
+        val mime = if (requestedMime.matches(Regex("^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$"))) requestedMime else "application/octet-stream"
+        val originalDigest = ByteArray(32) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+        verifiedExportWriteInProgress = true
+        try {
+            Thread({
+                val valid = try {
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    var read = 0L
+                    file.inputStream().use { input ->
+                        val buffer = ByteArray(65536)
+                        while (true) {
+                            val n = input.read(buffer)
+                            if (n < 0) break
+                            if (n == 0) continue
+                            read += n
+                            if (read > bytes) throw java.io.IOException("Stage changed")
+                            digest.update(buffer, 0, n)
+                        }
+                    }
+                    read == bytes && MessageDigest.isEqual(originalDigest, digest.digest())
+                } catch (_: Exception) { false }
+                runOnUiThread {
+                    verifiedExportWriteInProgress = false
+                    if (!valid || isFinishing || isDestroyed) {
+                        file.delete(); result.success(mapOf("ok" to false, "error" to "stream-stage-unverified"))
+                    } else {
+                        pendingVerifiedExportFile = file
+                        pendingVerifiedExportDigest = originalDigest
+                        pendingVerifiedExportName = filename
+                        pendingVerifiedExportResult = result
+                        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = mime
+                            putExtra(Intent.EXTRA_TITLE, filename)
+                        }
+                        try { startActivityForResult(intent, verifiedExportRequestCode) }
+                        catch (_: Exception) {
+                            pendingVerifiedExportFile = null; pendingVerifiedExportDigest = null
+                            pendingVerifiedExportName = ""; pendingVerifiedExportResult = null
+                            file.delete(); result.success(mapOf("ok" to false, "error" to "picker-failed"))
+                        }
+                    }
+                }
+            }, "qol-verify-stream-stage").start()
+        } catch (_: Exception) {
+            verifiedExportWriteInProgress = false; file.delete()
+            result.success(mapOf("ok" to false, "error" to "stage-worker-failed"))
+        }
+    }
+
     private val appInfoChannel = "uk.drache.spicychatqol/app_info"
     private val microphonePermissionRequestCode = 4021
     private var pendingMicrophonePermissionResult: MethodChannel.Result? = null
@@ -40,7 +122,7 @@ class MainActivity : FlutterActivity() {
         if (name == null || !name.matches(Regex("qol-export-[A-Za-z0-9_-]+\\.pending"))) return null
         val file = File(cacheDir, name)
         return if (file.isFile && file.canonicalFile.parentFile == cacheDir.canonicalFile &&
-            file.length() in 1L..(24L * 1024 * 1024)) file else null
+            file.length() in 1L..(256L * 1024 * 1024)) file else null
     }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
@@ -265,6 +347,12 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "qolPrivateStorageRequest" -> {
+                    val engine = qolPrivateStorage ?: QolPrivateStorage(applicationContext).also { qolPrivateStorage = it }
+                    engine.request(call.argument<String>("message").orEmpty(), call.argument<String>("url").orEmpty(), call.argument<Boolean>("settings") == true, result)
+                }
+                "saveStagedChatExport" -> saveStagedChatExport(call, result)
+
                 "saveVerifiedFile" -> {
                     if (pendingVerifiedExportResult != null || pendingVerifiedExportFile != null || verifiedExportWriteInProgress || pendingDiagnosticExportResult != null) {
                         result.success(mapOf("ok" to false, "error" to "save-busy"))
@@ -473,7 +561,7 @@ class MainActivity : FlutterActivity() {
                 finishStagedExport(reply, mapOf("ok" to false, "canceled" to true, "bytes" to 0))
                 return
             }
-            if (staged == null || originalDigest == null || originalDigest.size != 32 || !staged.isFile || staged.length() !in 1L..(24L * 1024 * 1024)) {
+            if (staged == null || originalDigest == null || originalDigest.size != 32 || !staged.isFile || staged.length() !in 1L..(256L * 1024 * 1024)) {
                 staged?.delete()
                 finishStagedExport(reply, mapOf("ok" to false, "error" to "missing-data", "bytes" to 0))
                 return

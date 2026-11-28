@@ -11,6 +11,7 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/settings_service.dart';
+import '../services/android_private_storage.dart';
 import '../services/android_lorebook_jobs.dart';
 import '../services/js_bundle_service.dart';
 import '../services/qol_update_service.dart';
@@ -3309,6 +3310,35 @@ $source
           // Android v0.2.49 HTTPS background image bridge: native HTTPS fetch
           // with per-host user consent; other runtime messages are untouched.
           final type = message is Map ? (message['type'] ?? '').toString() : '';
+          // DS_ANDROID_033_PRIVATE_ENGINE_V1: document-bound quota and chat capture.
+          if (message is Map && const {'DS_GENERATION_QUOTA_RESEARCH', 'DS_CHAT_EXPORT_CHECKPOINT', 'DS_ANDROID_CHAT_EXPORT_STREAM'}.contains(type)) {
+            if (widget.bundleService.extensionVersion != AndroidPrivateStorage.supportedVersion) {
+              return jsonEncode({'ok': false, 'error': 'Private storage contract is not reviewed for this QoL version'});
+            }
+            final key = _webViewKey;
+            final nav = _navigationSequence;
+            final spa = _spaRouteSequence;
+            final token = args.length > 1 ? args[1].toString() : '';
+            final quota = type == 'DS_GENERATION_QUOTA_RESEARCH';
+            bool current() => mounted && key == _webViewKey && nav == _navigationSequence &&
+                (quota || spa == _spaRouteSequence) && _webController == controller &&
+                !_rendererExitBlocksCurrentWebView && token.isNotEmpty &&
+                ((_lastInjectionVerified && token == _lastInjectedDocumentToken) ||
+                 (quota && token == _injectionInProgressToken));
+            if (!current()) return jsonEncode({'ok': false, 'error': 'Current document is not ready'});
+            final live = await controller.getUrl().timeout(const Duration(seconds: 3));
+            final uri = Uri.tryParse(live?.toString() ?? '');
+            if (!current() || uri == null || !AndroidPrivateStorage.trusted(uri) ||
+                (!quota && !AndroidPrivateStorage.matchesChat(uri, message))) {
+              return jsonEncode({'ok': false, 'error': 'Conversation or document changed; data retained'});
+            }
+            if (type == 'DS_ANDROID_CHAT_EXPORT_STREAM') {
+              return jsonEncode(await AndroidPrivateStorage.instance.stream(message, '$token:${uri.path}', current));
+            }
+            final response = await AndroidPrivateStorage.request(message, url: uri.toString(), version: widget.bundleService.extensionVersion);
+            if (!current()) return jsonEncode({'ok': false, 'error': 'Document changed; reopen to verify saved data'});
+            return response;
+          }
           // DS_ANDROID_QOL_032_LARGE_PROTOCOL_V1: no monolithic fallback.
           if (type.startsWith('DS_SCT_INSPECTOR_')) {
             return jsonEncode({'ok': false, 'status': 'unsupported-on-android'});

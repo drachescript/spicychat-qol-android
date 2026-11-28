@@ -12,6 +12,7 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/settings_service.dart';
+import '../services/android_private_storage.dart';
 import '../services/app_log_service.dart';
 import '../services/js_bundle_service.dart';
 
@@ -413,6 +414,11 @@ class _OptionsScreenState extends State<OptionsScreen> {
           // not depend on the main WebView responding to Settings messages.
           if (decoded is Map) {
             final type = (decoded['type'] ?? '').toString();
+            // DS_ANDROID_033_PRIVATE_ENGINE_V1: explicit maintenance in Settings.
+            if (type == 'DS_CHAT_EXPORT_CHECKPOINT') {
+              return jsonDecode(await AndroidPrivateStorage.request(decoded,
+                  url: '', version: widget.extensionVersion, settings: true));
+            }
             if (type.startsWith('DS_SCT_INSPECTOR_')) {
               return {'ok': false, 'status': 'unsupported-on-android'};
             }
